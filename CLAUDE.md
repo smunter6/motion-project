@@ -52,23 +52,31 @@ at natural decision points.
 - EtherCRAB is `no_std`-capable, so the same crate could later target an
   RP2350-based master with an embedded TX/RX transport.
 
-## Current state — Step 1 complete
+## Current state — Steps 1–4 done (2 deferred)
 
-`motion-core` contains the single-axis **trapezoidal velocity profile**:
-- `TrapezoidalProfile::new(start, end, max_velocity, max_acceleration)`
-- `.sample(t) -> TrajectorySample { position, velocity }` — pure, absolute-time,
-  clamped outside `[0, duration]`.
-- `.duration()`, `.target()`, `.phase_at(t) -> MotionPhase`.
-- Handles both trapezoidal and (short-move) triangular cases.
-- Full invariant unit tests (start/end at rest, never exceeds v_max, symmetry,
-  triangular case, negative direction, phase-boundary continuity, phase_at).
-- `src/bin/demo_axis.rs`: samples a 0->100mm move at 250 Hz and prints
-  time/pos/vel/phase.
-
-NOTE: this code was written in an environment WITHOUT a Rust toolchain, so it was
-hand-verified, not compiler-verified. First task in Claude Code: run
-`cargo test` and `cargo run -p motion-core --bin demo_axis` and fix anything the
-compiler flags.
+- `motion-core`: single-axis **trapezoidal velocity profile**,
+  `TrapezoidalProfile::new(start, end, max_speed, max_acceleration,
+  max_deceleration) -> Result<Self, TrajectoryError>` (fallible — validates
+  finiteness and sign, doesn't panic on bad input). Accel/decel are
+  independent rates. `.sample(t)`, `.duration()`, `.target()`, `.phase_at(t)`.
+  17 unit tests. `src/bin/demo_axis.rs` demos one move at 250 Hz.
+- `axis-backend`: the `AxisGroup` trait seam (`exchange()`, one combined
+  cyclic call) + `AxisSetpoint`/`AxisFeedback`/`AxisFault`/`AxisGroupError`.
+- `backend-sim`: `SimAxisGroup`, a software `AxisGroup` that integrates
+  velocity into position each cycle (dt-stepping, not a pass-through).
+- `app`: a continuously-running, multi-axis (`axis0`, `axis1`, `NUM_AXES`)
+  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]`, `status`,
+  `help`, `quit`. Fixed 250 Hz control loop on its own thread, decoupled
+  from blocking stdin by a channel. Each cycle samples the active
+  trajectory (or holds at rest if idle) into an `AxisSetpoint` per axis,
+  calls `SimAxisGroup::exchange` once, and treats the returned feedback as
+  ground truth for position/velocity — a new move's start is the axis's
+  *actual* (backend) position, not the last commanded one. Moves queue
+  (single slot per axis) while an axis is busy, block-until-idle. Axes are
+  fully independent — see Step 2, deferred.
+- Not yet built: `viz` (Step 5), richer sim dynamics (Step 6),
+  `backend-ethercat` (Step 7), coordinated multi-axis moves (Step 2,
+  deferred).
 
 ## Roadmap
 
@@ -79,8 +87,8 @@ compiler flags.
    `app` currently drives axes independently (no coordination) and that's
    staying true until this is revisited. Don't build toward coordinated
    moves as a side effect of Step 3/4/5 work below.
-3. **[next]** `AxisGroup` backend trait (new `axis-backend` crate) + a simple
-   **sim backend** (new `backend-sim` crate). Design settled 2026-07-20:
+3. **[done]** `AxisGroup` backend trait (`axis-backend` crate) + a simple
+   **sim backend** (`backend-sim` crate). Design settled 2026-07-20:
    - `AxisGroup::exchange(&mut self, setpoints: &[AxisSetpoint]) ->
      Result<&[AxisFeedback], AxisGroupError>` — one combined cyclic call, not
      separate write/read. Mirrors EtherCAT's actual single synchronous
@@ -98,10 +106,15 @@ compiler flags.
      dt-stepping (see the `NOTE (dt seam)` comment in `trajectory.rs`), and
      gives a real (if tiny) target-vs-actual gap during accel/decel for
      Step 5's viz to plot, instead of two identical lines until Step 6.
-4. Fixed-timestep run loop: planner -> backend -> feedback. `app`'s control
-   loop already has this shape but currently treats the raw trajectory
-   sample as ground truth; Step 3 lands by making it call
-   `AxisGroup::exchange` each tick and use the returned feedback instead.
+4. **[done]** Fixed-timestep run loop: planner -> backend -> feedback. `app`'s
+   control loop now builds an `AxisSetpoint` per axis each cycle (sampling
+   the active trajectory, or holding at rest if idle), calls
+   `AxisGroup::exchange` once per tick against a `SimAxisGroup`, and treats
+   the returned `AxisFeedback` — not the raw trajectory sample — as each
+   axis's actual position/velocity. A new move's `start` is that actual
+   feedback position, not the last commanded one. Confirmed live: a 0->100mm
+   move now reports "reached 99.999 mm", the small Euler-integration
+   following error `backend-sim`'s design was meant to surface.
 5. Simple **viz** (egui/eframe + egui_plot): 2D axis/tool view + target-vs-actual
    position/velocity plots. Viz is a dev tool, runs on host, not deployed to Pi.
    (WSLg needed to show a window from WSL; or run viz natively on Windows.)

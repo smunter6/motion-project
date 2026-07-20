@@ -3,11 +3,15 @@
 //! fixed-rate control loop running on its own schedule, decoupled from
 //! (blocking) terminal input by a channel.
 //!
-//! There is no backend yet (Step 3 in CLAUDE.md's roadmap) — the loop
-//! samples `motion-core`'s trajectory directly and treats the setpoint as
-//! the actual position. Once a real/sim backend exists behind the
-//! `AxisGroup` seam, this loop's "print the setpoint" step becomes "send
-//! the setpoint to the backend, read actual position back".
+//! Each cycle, the loop samples `motion-core`'s trajectory to get this
+//! cycle's commanded (position, velocity), sends it through a
+//! `backend_sim::SimAxisGroup` via the `AxisGroup` seam, and treats the
+//! returned feedback — not the raw sample — as the axis's actual position.
+//! `SimAxisGroup` integrates velocity into its own position state rather
+//! than snapping to the commanded position, so there's a small, real
+//! (if currently tiny) gap between "commanded" and "actual" — the same seam
+//! `backend-ethercat` will occupy later, unchanged from the loop's point of
+//! view.
 //!
 //! Axes are independent: `move axis0 100` and `move axis1 50` run
 //! concurrently on their own clocks, with no relationship between their
@@ -30,6 +34,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use axis_backend::{AxisGroup, AxisSetpoint};
+use backend_sim::SimAxisGroup;
 use motion_core::{MotionPhase, TrapezoidalProfile};
 
 const CONTROL_RATE_HZ: f64 = 250.0;
@@ -198,7 +204,13 @@ struct PendingMove {
 /// position, its own in-progress move (if any), and its own single-slot
 /// pending queue — nothing here is shared across axes.
 struct AxisRuntime {
+    // Last-known *actual* position/velocity, from backend feedback — not
+    // the raw trajectory sample. Updated once per control cycle after the
+    // backend exchange; `status` reads these directly rather than
+    // resampling, so it reports the same "actual" value the heartbeat
+    // print does.
     position: f64,
+    velocity: f64,
     active: Option<ActiveMove>,
     // Single-slot queue: at most one move waits for the current one to
     // finish. This is the "block until idle" policy — deliberately simple
@@ -213,6 +225,7 @@ impl AxisRuntime {
     fn new() -> Self {
         Self {
             position: 0.0,
+            velocity: 0.0,
             active: None,
             pending: None,
             last_status_print: Instant::now(),
@@ -224,6 +237,7 @@ impl AxisRuntime {
 fn run_control_loop(rx: Receiver<Command>) {
     let dt = Duration::from_secs_f64(1.0 / CONTROL_RATE_HZ);
     let mut axes: Vec<AxisRuntime> = (0..NUM_AXES).map(|_| AxisRuntime::new()).collect();
+    let mut backend = SimAxisGroup::new(NUM_AXES, dt.as_secs_f64());
 
     // Fixed schedule anchored to a single start instant, so ticks don't
     // drift from accumulated sleep-call overhead.
@@ -231,19 +245,8 @@ fn run_control_loop(rx: Receiver<Command>) {
     let mut cycle: u64 = 0;
 
     loop {
+        // 1. If idle and a move is queued, start it now.
         for (i, ax) in axes.iter_mut().enumerate() {
-            // 1. Finish/advance this axis's in-progress move, if any.
-            if let Some(mv) = &ax.active {
-                let elapsed = mv.started_at.elapsed().as_secs_f64();
-                if elapsed >= mv.profile.duration() {
-                    ax.position = mv.profile.target();
-                    println!("  -> {}: reached {:.3} mm", axis_label(i), ax.position);
-                    ax.active = None;
-                    ax.last_phase = None;
-                }
-            }
-
-            // 2. If idle and a move is queued, start it now.
             if ax.active.is_none() {
                 if let Some(p) = ax.pending.take() {
                     match TrapezoidalProfile::new(
@@ -274,7 +277,78 @@ fn run_control_loop(rx: Receiver<Command>) {
             }
         }
 
-        // 3. Drain any commands that arrived since the last tick.
+        // 2. Build this cycle's commanded setpoint for every axis: sample
+        //    the active trajectory if there is one, otherwise hold at the
+        //    axis's last known actual position with zero velocity.
+        let setpoints: Vec<AxisSetpoint> = axes
+            .iter()
+            .map(|ax| match &ax.active {
+                Some(mv) => {
+                    let elapsed = mv.started_at.elapsed().as_secs_f64();
+                    let sample = mv.profile.sample(elapsed);
+                    AxisSetpoint {
+                        position: sample.position,
+                        velocity: sample.velocity,
+                    }
+                }
+                None => AxisSetpoint {
+                    position: ax.position,
+                    velocity: 0.0,
+                },
+            })
+            .collect();
+
+        // 3. One combined cyclic exchange with the backend (sim today, real
+        //    drives later — see axis-backend). setpoints.len() always equals
+        //    NUM_AXES by construction above, so a count mismatch here would
+        //    be a bug in this loop, not bad input — hence expect(), not a
+        //    Result the caller has to handle.
+        let feedback = backend
+            .exchange(&setpoints)
+            .expect("setpoints always match backend's axis count");
+
+        // 4. Fold feedback into each axis's state: update actual
+        //    position/velocity, report any backend fault, and detect
+        //    move completion / phase changes using the *actual* feedback
+        //    position (which may differ, by a tiny discretization amount,
+        //    from the trajectory's idealized target).
+        for (i, ax) in axes.iter_mut().enumerate() {
+            ax.position = feedback[i].position;
+            ax.velocity = feedback[i].velocity;
+
+            if let Some(fault) = feedback[i].fault {
+                println!("  ! {}: backend fault: {fault:?}", axis_label(i));
+            }
+
+            if let Some(mv) = &ax.active {
+                let elapsed = mv.started_at.elapsed().as_secs_f64();
+                let phase = mv.profile.phase_at(elapsed);
+
+                if phase == MotionPhase::Done {
+                    println!("  -> {}: reached {:.3} mm", axis_label(i), ax.position);
+                    ax.active = None;
+                    ax.last_phase = None;
+                } else {
+                    let phase_changed = ax.last_phase != Some(phase);
+                    let now = Instant::now();
+                    if phase_changed
+                        || now.duration_since(ax.last_status_print) >= STATUS_PRINT_PERIOD
+                    {
+                        println!(
+                            "     {}  t={elapsed:>6.3}s  pos={:>9.3} mm  vel={:>8.3} mm/s  {}",
+                            axis_label(i),
+                            ax.position,
+                            ax.velocity,
+                            phase_label(phase)
+                        );
+                        ax.last_status_print = now;
+                    }
+                    ax.last_phase = Some(phase);
+                }
+            }
+        }
+
+        // 5. Drain any commands that arrived since the last tick.
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Command::Move {
@@ -331,34 +405,7 @@ fn run_control_loop(rx: Receiver<Command>) {
             }
         }
 
-        // 4. Sample each active move and print a sparing heartbeat — on
-        //    phase changes always, otherwise at most every
-        //    STATUS_PRINT_PERIOD (250 Hz is far too fast for a terminal).
-        for (i, ax) in axes.iter_mut().enumerate() {
-            if let Some(mv) = &ax.active {
-                let elapsed = mv.started_at.elapsed().as_secs_f64();
-                let sample = mv.profile.sample(elapsed);
-                ax.position = sample.position;
-                let phase = mv.profile.phase_at(elapsed);
-
-                let phase_changed = ax.last_phase != Some(phase);
-                let now = Instant::now();
-                if phase_changed || now.duration_since(ax.last_status_print) >= STATUS_PRINT_PERIOD
-                {
-                    println!(
-                        "     {}  t={elapsed:>6.3}s  pos={:>9.3} mm  vel={:>8.3} mm/s  {}",
-                        axis_label(i),
-                        sample.position,
-                        sample.velocity,
-                        phase_label(phase)
-                    );
-                    ax.last_status_print = now;
-                }
-                ax.last_phase = Some(phase);
-            }
-        }
-
-        // 5. Sleep to the next scheduled tick.
+        // 6. Sleep to the next scheduled tick.
         cycle += 1;
         let next_tick = schedule_start + dt.mul_f64(cycle as f64);
         let now = Instant::now();
@@ -373,12 +420,15 @@ fn print_status(axes: &[AxisRuntime]) {
         match &ax.active {
             Some(mv) => {
                 let elapsed = mv.started_at.elapsed().as_secs_f64();
-                let sample = mv.profile.sample(elapsed);
+                // Position/velocity come from the last backend feedback
+                // (at most one cycle stale), not a fresh sample — matches
+                // what the heartbeat print shows, and what's actually true
+                // for the axis right now, not just what was commanded.
                 println!(
                     "  status: {}: pos={:.3} mm  vel={:.3} mm/s  {}  (target {:.3} mm)",
                     axis_label(i),
-                    sample.position,
-                    sample.velocity,
+                    ax.position,
+                    ax.velocity,
                     phase_label(mv.profile.phase_at(elapsed)),
                     mv.profile.target()
                 );

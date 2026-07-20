@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 motion-core = { path = "../motion-core" }
+axis-backend = { path = "../axis-backend" }
+backend-sim = { path = "../backend-sim" }
