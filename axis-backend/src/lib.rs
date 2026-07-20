@@ -1,0 +1,192 @@
+//! `axis-backend`: the trait seam between the pure motion planner
+//! (`motion-core`) and whatever actually moves the axes — a software
+//! simulation today (`backend-sim`), real EtherCAT servo drives later
+//! (`backend-ethercat`). The run loop that drives all this never knows
+//! which is behind the trait.
+//!
+//! # Why a combined `exchange()`, not separate write/read
+//!
+//! A real EtherCAT cycle is one synchronous transaction: PDOs go out, the
+//! bus processes them, PDOs come back — that's what EtherCRAB's `tx_rx()`
+//! does. Modeling [`AxisGroup`] the same way (one [`exchange`](AxisGroup::exchange)
+//! call per control cycle) means `backend-sim` and `backend-ethercat` share
+//! an identical calling convention; the run loop doesn't change shape when
+//! a real backend replaces the sim one.
+//!
+//! # Why these types don't reuse `motion_core::TrajectorySample`
+//!
+//! [`AxisSetpoint`] looks identical to `TrajectorySample` today (same two
+//! `f64` fields), but they belong to different layers: `TrajectorySample`
+//! is the planner's pure-math output, `AxisSetpoint` is what crosses the
+//! hardware seam. Keeping them distinct means a future planner-side change
+//! (say, an acceleration feed-forward field) or a future backend-side need
+//! (say, a torque limit per cycle) doesn't ripple across the seam just
+//! because one crate depended on the other's type. `axis-backend`
+//! deliberately does not depend on `motion-core`.
+
+use std::fmt;
+
+/// A single control-cycle commanded setpoint for one axis.
+///
+/// Units are engineering units (mm, mm/s for a linear axis), matching
+/// `motion-core`. Conversion to whatever a real drive actually wants
+/// (integer encoder counts) is `backend-ethercat`'s job at its side of this
+/// seam, not this type's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxisSetpoint {
+    pub position: f64,
+    pub velocity: f64,
+}
+
+/// A single control-cycle feedback reading for one axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxisFeedback {
+    pub position: f64,
+    pub velocity: f64,
+    /// A fault this axis is reporting, if any. Present from the start —
+    /// even before any backend can actually raise one — so callers (the run
+    /// loop, eventually viz) build their fault-handling path against a
+    /// backend that simply never uses it, rather than retrofitting fault
+    /// handling once real hardware exists.
+    pub fault: Option<AxisFault>,
+}
+
+/// A fault reported by a backend for one axis.
+///
+/// Deliberately minimal: no backend raises one of these yet. Real
+/// categories (following error exceeded, drive fault, not operational...)
+/// get added when a backend actually needs to report them (richer sim, or
+/// `backend-ethercat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxisFault {
+    Unspecified,
+}
+
+/// Reasons a call to [`AxisGroup::exchange`] itself failed — as opposed to
+/// an individual axis fault (see [`AxisFeedback::fault`]), this is a
+/// problem with the call itself, not with any one axis's motion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxisGroupError {
+    /// `setpoints.len()` didn't match [`AxisGroup::num_axes`].
+    WrongSetpointCount { expected: usize, got: usize },
+}
+
+impl fmt::Display for AxisGroupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AxisGroupError::WrongSetpointCount { expected, got } => {
+                write!(f, "expected {expected} setpoints (one per axis), got {got}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AxisGroupError {}
+
+/// The seam between the motion planner and whatever moves the axes.
+///
+/// Implementations: a software simulation (`backend-sim`), and eventually
+/// real EtherCAT servo drives (`backend-ethercat`). The run loop that owns
+/// an `AxisGroup` never needs to know which.
+pub trait AxisGroup {
+    /// Number of axes this group manages. `setpoints` passed to
+    /// [`exchange`](Self::exchange), and the [`AxisFeedback`] slice it
+    /// returns, always have exactly this many elements, axis-index-ordered.
+    fn num_axes(&self) -> usize;
+
+    /// Perform one control cycle's exchange: send this cycle's setpoints to
+    /// the backend, and read back this cycle's feedback.
+    ///
+    /// A single call rather than separate write/read methods, matching how
+    /// a real fieldbus cycle actually works (see the module docs). The
+    /// returned slice borrows from `self` — implementations are expected to
+    /// hold their feedback in a reusable buffer rather than allocating one
+    /// every cycle at 250 Hz.
+    fn exchange(&mut self, setpoints: &[AxisSetpoint]) -> Result<&[AxisFeedback], AxisGroupError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal in-memory `AxisGroup` used only to check the trait is
+    /// actually usable end-to-end — not a stand-in for `backend-sim`, which
+    /// gets a real (if still trivial) plant model of its own.
+    struct MockAxisGroup {
+        feedback: Vec<AxisFeedback>,
+    }
+
+    impl MockAxisGroup {
+        fn new(num_axes: usize) -> Self {
+            Self {
+                feedback: vec![
+                    AxisFeedback {
+                        position: 0.0,
+                        velocity: 0.0,
+                        fault: None,
+                    };
+                    num_axes
+                ],
+            }
+        }
+    }
+
+    impl AxisGroup for MockAxisGroup {
+        fn num_axes(&self) -> usize {
+            self.feedback.len()
+        }
+
+        fn exchange(
+            &mut self,
+            setpoints: &[AxisSetpoint],
+        ) -> Result<&[AxisFeedback], AxisGroupError> {
+            if setpoints.len() != self.feedback.len() {
+                return Err(AxisGroupError::WrongSetpointCount {
+                    expected: self.feedback.len(),
+                    got: setpoints.len(),
+                });
+            }
+            for (fb, sp) in self.feedback.iter_mut().zip(setpoints) {
+                fb.position = sp.position;
+                fb.velocity = sp.velocity;
+            }
+            Ok(&self.feedback)
+        }
+    }
+
+    #[test]
+    fn exchange_echoes_setpoints_as_feedback() {
+        let mut group = MockAxisGroup::new(2);
+        let setpoints = [
+            AxisSetpoint {
+                position: 10.0,
+                velocity: 1.0,
+            },
+            AxisSetpoint {
+                position: 20.0,
+                velocity: 2.0,
+            },
+        ];
+        let feedback = group.exchange(&setpoints).unwrap();
+        assert_eq!(feedback[0].position, 10.0);
+        assert_eq!(feedback[1].position, 20.0);
+        assert!(feedback.iter().all(|fb| fb.fault.is_none()));
+    }
+
+    #[test]
+    fn exchange_rejects_wrong_setpoint_count() {
+        let mut group = MockAxisGroup::new(2);
+        let setpoints = [AxisSetpoint {
+            position: 0.0,
+            velocity: 0.0,
+        }];
+        let err = group.exchange(&setpoints).unwrap_err();
+        assert_eq!(
+            err,
+            AxisGroupError::WrongSetpointCount {
+                expected: 2,
+                got: 1
+            }
+        );
+    }
+}

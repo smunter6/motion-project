@@ -73,15 +73,42 @@ compiler flags.
 ## Roadmap
 
 1. [done] One axis: trapezoidal trajectory + invariant tests.
-2. **[next]** Two axes + coordination (finish-together time-scaling; the slower
-   axis sets the move time, the faster axis is time-scaled to match). This is
-   where `duration()` starts earning its keep.
-3. `AxisGroup` backend trait + simple integrator-based **sim backend** (this is
-   where the dt-stepping plant model enters).
-4. Fixed-timestep run loop: planner -> backend -> feedback.
+2. **[deferred]** Two axes + coordination (finish-together time-scaling; the
+   slower axis sets the move time, the faster axis is time-scaled to match).
+   This is where `duration()` starts earning its keep. Explicitly on hold —
+   `app` currently drives axes independently (no coordination) and that's
+   staying true until this is revisited. Don't build toward coordinated
+   moves as a side effect of Step 3/4/5 work below.
+3. **[next]** `AxisGroup` backend trait (new `axis-backend` crate) + a simple
+   **sim backend** (new `backend-sim` crate). Design settled 2026-07-20:
+   - `AxisGroup::exchange(&mut self, setpoints: &[AxisSetpoint]) ->
+     Result<&[AxisFeedback], AxisGroupError>` — one combined cyclic call, not
+     separate write/read. Mirrors EtherCAT's actual single synchronous
+     transaction per cycle (EtherCRAB's `tx_rx()`), so `backend-ethercat`
+     (Step 7) won't need the trait reshaped later.
+   - Trait stays in `f64` engineering units (mm, mm/s) — integer encoder-count
+     conversion is `backend-ethercat`'s private business (CLAUDE.md decision
+     #4), not the trait's.
+   - `AxisFeedback` carries `fault: Option<AxisFault>` from day one, even
+     though `backend-sim` won't raise any yet — lets `app`'s fault-handling
+     path get built/exercised before real hardware exists.
+   - `backend-sim`'s first plant model integrates the velocity setpoint into
+     its own position state each cycle (`position += velocity * dt`) rather
+     than a pure pass-through. Still trivial/lag-free, but genuinely stateful
+     dt-stepping (see the `NOTE (dt seam)` comment in `trajectory.rs`), and
+     gives a real (if tiny) target-vs-actual gap during accel/decel for
+     Step 5's viz to plot, instead of two identical lines until Step 6.
+4. Fixed-timestep run loop: planner -> backend -> feedback. `app`'s control
+   loop already has this shape but currently treats the raw trajectory
+   sample as ground truth; Step 3 lands by making it call
+   `AxisGroup::exchange` each tick and use the returned feedback instead.
 5. Simple **viz** (egui/eframe + egui_plot): 2D axis/tool view + target-vs-actual
    position/velocity plots. Viz is a dev tool, runs on host, not deployed to Pi.
    (WSLg needed to show a window from WSL; or run viz natively on Windows.)
+   Open question, deliberately not decided yet: whether `app` and `viz` share
+   the control-loop code (extract to a common crate) or `viz` gets its own
+   copy. Revisit when viz actually starts, not before — no second consumer
+   of the loop exists yet, so extracting now would be speculative.
 6. Richer sim: second-order lag, position/following-error limits, faults;
    S-curve (jerk-limited) profiles.
 7. (Hardware later) `backend-ethercat`: EtherCRAB + CiA 402 state machine +
@@ -89,10 +116,20 @@ compiler flags.
 
 ## Housekeeping notes
 
-- `.gitignore` currently ignores `Cargo.lock` (library convention). FLIP THIS to
-  commit `Cargo.lock` once the `app` binary is added in Step 4 (app = binary).
+- [done] `app` binary crate exists (arrived early, ahead of Step 4/backend-sim —
+  see `app/src/main.rs`); `Cargo.lock` is committed, `.gitignore` no longer
+  excludes it.
 - Workspace layout target:
   motion-core / axis-backend / backend-sim / backend-ethercat / viz / app.
+- **Backlog**: unit tests for `app`'s `parse_command`/`parse_axis` (in
+  `app/src/main.rs`, `#[cfg(test)] mod tests`, same pattern as
+  `trajectory.rs`). Currently only manually smoke-tested via piping stdin.
+  Pure parsing logic, no threading/timing involved — cheap to add whenever
+  we're back in `app`. (Full control-loop integration testing — queuing,
+  per-axis independence — is a separate, harder problem: real `sleep()`s and
+  `println!`-format assertions make it slow/brittle; revisit only if that
+  becomes a recurring pain point, and consider extracting the loop's
+  decision logic to run on fake time first.)
 
 ## How to work in this repo
 

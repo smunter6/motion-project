@@ -2,12 +2,12 @@
 resolver = "2"
 members = [
     "motion-core",
+    "axis-backend",
     "app",
 ]
 
 # As the project grows, new crates get added here:
-#   "axis-backend"      - the trait seam (command axes, read feedback)
-#   "backend-sim"       - software plant model implementing the seam
+#   "backend-sim"       - software plant model implementing the axis-backend seam
 #   "backend-ethercat"  - EtherCRAB + CiA 402 implementation (when hardware arrives)
 #   "viz"               - simple 2D + plot visualization
 #
