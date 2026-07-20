@@ -23,7 +23,8 @@ fn main() {
     let max_deceleration = 200.0; // mm/s^2
 
     let profile =
-        TrapezoidalProfile::new(start, end, max_velocity, max_acceleration, max_deceleration);
+        TrapezoidalProfile::new(start, end, max_velocity, max_acceleration, max_deceleration)
+            .expect("demo move parameters are hardcoded and valid");
 
     // --- Control-loop cadence ------------------------------------------
     let rate_hz = 250.0;

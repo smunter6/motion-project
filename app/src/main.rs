@@ -246,24 +246,30 @@ fn run_control_loop(rx: Receiver<Command>) {
             // 2. If idle and a move is queued, start it now.
             if ax.active.is_none() {
                 if let Some(p) = ax.pending.take() {
-                    let profile = TrapezoidalProfile::new(
+                    match TrapezoidalProfile::new(
                         ax.position,
                         p.target,
                         p.max_velocity,
                         p.max_acceleration,
                         p.max_deceleration,
-                    );
-                    println!(
-                        "  -> {}: starting queued move: {:.3} -> {:.3} mm ({:.3}s)",
-                        axis_label(i),
-                        ax.position,
-                        p.target,
-                        profile.duration()
-                    );
-                    ax.active = Some(ActiveMove {
-                        profile,
-                        started_at: Instant::now(),
-                    });
+                    ) {
+                        Ok(profile) => {
+                            println!(
+                                "  -> {}: starting queued move: {:.3} -> {:.3} mm ({:.3}s)",
+                                axis_label(i),
+                                ax.position,
+                                p.target,
+                                profile.duration()
+                            );
+                            ax.active = Some(ActiveMove {
+                                profile,
+                                started_at: Instant::now(),
+                            });
+                        }
+                        Err(e) => {
+                            println!("  ! {}: queued move rejected: {e}", axis_label(i));
+                        }
+                    }
                 }
             }
         }
@@ -280,23 +286,29 @@ fn run_control_loop(rx: Receiver<Command>) {
                 } => {
                     let ax = &mut axes[axis];
                     if ax.active.is_none() {
-                        let profile = TrapezoidalProfile::new(
+                        match TrapezoidalProfile::new(
                             ax.position,
                             target,
                             max_velocity,
                             max_acceleration,
                             max_deceleration,
-                        );
-                        println!(
-                            "  -> {}: move: {:.3} -> {target:.3} mm ({:.3}s)",
-                            axis_label(axis),
-                            ax.position,
-                            profile.duration()
-                        );
-                        ax.active = Some(ActiveMove {
-                            profile,
-                            started_at: Instant::now(),
-                        });
+                        ) {
+                            Ok(profile) => {
+                                println!(
+                                    "  -> {}: move: {:.3} -> {target:.3} mm ({:.3}s)",
+                                    axis_label(axis),
+                                    ax.position,
+                                    profile.duration()
+                                );
+                                ax.active = Some(ActiveMove {
+                                    profile,
+                                    started_at: Instant::now(),
+                                });
+                            }
+                            Err(e) => {
+                                println!("  ! {}: move rejected: {e}", axis_label(axis));
+                            }
+                        }
                     } else {
                         println!(
                             "  -> {}: busy: queuing move to {target:.3} mm",

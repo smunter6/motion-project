@@ -63,6 +63,55 @@ pub enum MotionPhase {
     Done,
 }
 
+/// Reasons a `TrapezoidalProfile` could not be constructed.
+///
+/// A typed enum (not a bare `String`) so callers — including a future
+/// coordinator resolving several axes' moves at once, where "impossible to
+/// resolve" won't always reduce to a single bad number — can match on
+/// *which* constraint failed, not just that something did.
+///
+/// Finiteness is checked alongside sign/positivity: a NaN or infinite input
+/// wouldn't trip a bare `> 0.0` check (`NaN > 0.0` is `false`, so it would
+/// still be caught, but `f64::INFINITY > 0.0` is `true` and would sail
+/// through) and would instead silently propagate into every downstream
+/// position/velocity as NaN or infinity — a worse failure mode than an
+/// explicit, early rejection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TrajectoryError {
+    /// `start` or `end` is NaN or +/-infinity — not a real position.
+    NonFinitePosition { start: f64, end: f64 },
+    /// `max_velocity` must be a finite, positive number.
+    InvalidMaxVelocity(f64),
+    /// `max_acceleration` must be a finite, positive number.
+    InvalidMaxAcceleration(f64),
+    /// `max_deceleration` must be a finite, positive number.
+    InvalidMaxDeceleration(f64),
+}
+
+impl std::fmt::Display for TrajectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrajectoryError::NonFinitePosition { start, end } => write!(
+                f,
+                "start ({start}) and end ({end}) must both be finite numbers"
+            ),
+            TrajectoryError::InvalidMaxVelocity(v) => {
+                write!(f, "max_velocity must be a finite, positive number (got {v})")
+            }
+            TrajectoryError::InvalidMaxAcceleration(a) => write!(
+                f,
+                "max_acceleration must be a finite, positive number (got {a})"
+            ),
+            TrajectoryError::InvalidMaxDeceleration(d) => write!(
+                f,
+                "max_deceleration must be a finite, positive number (got {d})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TrajectoryError {}
+
 /// A single-axis point-to-point move described by a trapezoidal (or, for short
 /// moves, triangular) velocity profile.
 ///
@@ -118,12 +167,15 @@ impl TrapezoidalProfile {
     /// Build a profile for a move from `start` to `end`.
     ///
     /// `max_velocity`, `max_acceleration`, and `max_deceleration` must all be
-    /// > 0. They represent the physical limits of the axis (ultimately set by
-    /// motor torque / current limits on real hardware; chosen numbers in
-    /// sim). Keeping them explicit means sim exercises the same limits real
-    /// hardware will impose. Acceleration and deceleration are independent —
-    /// many real axes (and PLCopen-style motion function blocks) allow a
-    /// faster ramp-up than ramp-down, or vice versa.
+    /// finite and > 0, and `start`/`end` must both be finite; otherwise this
+    /// returns `Err` rather than panicking or producing a silently-broken
+    /// profile. See [`TrajectoryError`] for why finiteness is checked, not
+    /// just sign. These limits represent the physical limits of the axis
+    /// (ultimately set by motor torque / current limits on real hardware;
+    /// chosen numbers in sim). Keeping them explicit means sim exercises the
+    /// same limits real hardware will impose. Acceleration and deceleration
+    /// are independent — many real axes (and PLCopen-style motion function
+    /// blocks) allow a faster ramp-up than ramp-down, or vice versa.
     ///
     /// A zero-distance move is valid and produces a profile that simply reports
     /// `start` for all time with zero velocity (total duration 0).
@@ -133,16 +185,19 @@ impl TrapezoidalProfile {
         max_velocity: f64,
         max_acceleration: f64,
         max_deceleration: f64,
-    ) -> Self {
-        assert!(max_velocity > 0.0, "max_velocity must be positive");
-        assert!(
-            max_acceleration > 0.0,
-            "max_acceleration must be positive"
-        );
-        assert!(
-            max_deceleration > 0.0,
-            "max_deceleration must be positive"
-        );
+    ) -> Result<Self, TrajectoryError> {
+        if !start.is_finite() || !end.is_finite() {
+            return Err(TrajectoryError::NonFinitePosition { start, end });
+        }
+        if !(max_velocity.is_finite() && max_velocity > 0.0) {
+            return Err(TrajectoryError::InvalidMaxVelocity(max_velocity));
+        }
+        if !(max_acceleration.is_finite() && max_acceleration > 0.0) {
+            return Err(TrajectoryError::InvalidMaxAcceleration(max_acceleration));
+        }
+        if !(max_deceleration.is_finite() && max_deceleration > 0.0) {
+            return Err(TrajectoryError::InvalidMaxDeceleration(max_deceleration));
+        }
 
         let delta = end - start;
         let distance = delta.abs();
@@ -150,7 +205,7 @@ impl TrapezoidalProfile {
 
         // Degenerate move: already there. Everything is zero / start.
         if distance == 0.0 {
-            return Self {
+            return Ok(Self {
                 start,
                 end,
                 direction,
@@ -162,7 +217,7 @@ impl TrapezoidalProfile {
                 t_cruise_end: 0.0,
                 t_total: 0.0,
                 d_accel: 0.0,
-            };
+            });
         }
 
         // --- Decide trapezoid vs. triangle -------------------------------
@@ -225,7 +280,7 @@ impl TrapezoidalProfile {
             t_total = t_accel + t_decel;
         }
 
-        Self {
+        Ok(Self {
             start,
             end,
             direction,
@@ -237,7 +292,7 @@ impl TrapezoidalProfile {
             t_cruise_end,
             t_total,
             d_accel,
-        }
+        })
     }
 
     /// Total duration of the move in seconds. Needed later to coordinate
@@ -347,7 +402,7 @@ mod tests {
 
     #[test]
     fn starts_at_start_and_ends_at_end() {
-        let p = TrapezoidalProfile::new(10.0, 110.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(10.0, 110.0, 50.0, 100.0, 100.0).unwrap();
         let at_start = p.sample(0.0);
         let at_end = p.sample(p.duration());
         assert!(approx(at_start.position, 10.0));
@@ -359,7 +414,7 @@ mod tests {
 
     #[test]
     fn clamps_before_and_after_move() {
-        let p = TrapezoidalProfile::new(0.0, 100.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 100.0, 50.0, 100.0, 100.0).unwrap();
         // Way before.
         let before = p.sample(-5.0);
         assert!(approx(before.position, 0.0));
@@ -373,7 +428,7 @@ mod tests {
     #[test]
     fn never_exceeds_max_velocity() {
         let vmax = 50.0;
-        let p = TrapezoidalProfile::new(0.0, 500.0, vmax, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 500.0, vmax, 100.0, 100.0).unwrap();
         // Sample densely across the whole move.
         let n = 10_000;
         for i in 0..=n {
@@ -394,7 +449,7 @@ mod tests {
         // 500 mm with vmax=50, amax=100.
         // accel distance = v^2/2a = 2500/200 = 12.5 mm; accel+decel = 25 mm.
         // 25 <= 500, so trapezoidal; cruise velocity should equal vmax.
-        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0, 100.0).unwrap();
         assert!(approx(p.cruise_velocity, 50.0));
         // Somewhere in the middle we should be cruising at exactly vmax.
         let mid = p.sample(p.duration() / 2.0);
@@ -406,7 +461,7 @@ mod tests {
         // 10 mm with vmax=50, amax=100.
         // accel+decel distance to reach vmax = 25 mm > 10 mm, so triangular.
         // peak velocity = sqrt(a*d) = sqrt(100*10) = sqrt(1000) ~= 31.62 mm/s.
-        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 100.0).unwrap();
         let expected_peak = (100.0_f64 * 10.0).sqrt();
         assert!(approx(p.cruise_velocity, expected_peak));
         assert!(p.cruise_velocity < 50.0);
@@ -421,7 +476,7 @@ mod tests {
     fn symmetric_move_is_symmetric_in_position() {
         // Position profile should be point-symmetric about the midpoint:
         // x(t) - start  ==  end - x(T - t).
-        let p = TrapezoidalProfile::new(0.0, 200.0, 40.0, 80.0, 80.0);
+        let p = TrapezoidalProfile::new(0.0, 200.0, 40.0, 80.0, 80.0).unwrap();
         let dur = p.duration();
         let n = 1000;
         for i in 0..=n {
@@ -441,7 +496,7 @@ mod tests {
     #[test]
     fn negative_direction_move_works() {
         // Moving from 100 down to 0 should mirror the positive case.
-        let p = TrapezoidalProfile::new(100.0, 0.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(100.0, 0.0, 50.0, 100.0, 100.0).unwrap();
         assert!(approx(p.sample(0.0).position, 100.0));
         assert!(approx(p.sample(p.duration()).position, 0.0));
         // Velocity should be negative during the move.
@@ -451,7 +506,7 @@ mod tests {
 
     #[test]
     fn zero_distance_move_is_inert() {
-        let p = TrapezoidalProfile::new(42.0, 42.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(42.0, 42.0, 50.0, 100.0, 100.0).unwrap();
         assert!(approx(p.duration(), 0.0));
         assert!(approx(p.sample(0.0).position, 42.0));
         assert!(approx(p.sample(1.0).position, 42.0));
@@ -463,7 +518,7 @@ mod tests {
         // distance=200, v_max=50, a_max=100 => t_accel=0.5s, t_total=4.5s, so
         // accel/decel each occupy ~11% of duration: comfortably wider than
         // the 5%-in / 5%-from-end sample points below.
-        let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0, 100.0).unwrap();
         let dur = p.duration();
         assert_eq!(p.phase_at(-1.0), MotionPhase::Pre);
         assert_eq!(p.phase_at(0.0), MotionPhase::Pre);
@@ -480,7 +535,7 @@ mod tests {
     #[test]
     fn phase_at_never_reports_cruise_for_triangle() {
         // Short move: triangular, so Cruise must never appear.
-        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 100.0).unwrap();
         let dur = p.duration();
         let n = 1000;
         for i in 0..=n {
@@ -500,7 +555,7 @@ mod tests {
     #[test]
     fn position_is_continuous_across_phase_boundaries() {
         // No jumps at the accel->cruise and cruise->decel seams.
-        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0, 100.0).unwrap();
         for &boundary in &[p.t_accel, p.t_cruise_end] {
             let just_before = p.sample(boundary - EPS).position;
             let just_after = p.sample(boundary + EPS).position;
@@ -522,7 +577,7 @@ mod tests {
         // (twice as long as accel, since decel is half the rate) — with the
         // old symmetric-only formula t_total would have been 4.25s; with
         // independent rates it's 4.75s.
-        let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0, 50.0);
+        let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0, 50.0).unwrap();
         assert!(approx(p.duration(), 4.75));
         assert!(approx(p.t_accel, 0.5));
 
@@ -556,7 +611,7 @@ mod tests {
         // triangular. Peak velocity from
         //   v_peak = sqrt(2 * distance * accel * decel / (accel + decel))
         //          = sqrt(2*10*100*25/125) = sqrt(400) = 20.
-        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 25.0);
+        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 25.0).unwrap();
         assert!(approx(p.cruise_velocity, 20.0));
         assert!(p.cruise_velocity < 50.0);
 
@@ -575,5 +630,61 @@ mod tests {
         let at_end = p.sample(p.duration());
         assert!(approx(at_end.position, 10.0));
         assert!(approx(at_end.velocity, 0.0));
+    }
+
+    #[test]
+    fn rejects_non_positive_max_velocity() {
+        assert_eq!(
+            TrapezoidalProfile::new(0.0, 100.0, 0.0, 100.0, 100.0),
+            Err(TrajectoryError::InvalidMaxVelocity(0.0))
+        );
+        assert_eq!(
+            TrapezoidalProfile::new(0.0, 100.0, -5.0, 100.0, 100.0),
+            Err(TrajectoryError::InvalidMaxVelocity(-5.0))
+        );
+    }
+
+    #[test]
+    fn rejects_non_positive_max_acceleration() {
+        assert_eq!(
+            TrapezoidalProfile::new(0.0, 100.0, 50.0, -10.0, 100.0),
+            Err(TrajectoryError::InvalidMaxAcceleration(-10.0))
+        );
+    }
+
+    #[test]
+    fn rejects_non_positive_max_deceleration() {
+        assert_eq!(
+            TrapezoidalProfile::new(0.0, 100.0, 50.0, 100.0, -10.0),
+            Err(TrajectoryError::InvalidMaxDeceleration(-10.0))
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_inputs() {
+        // NaN positions. NaN never equals NaN (IEEE 754), so we match on the
+        // variant and check `.is_nan()` rather than `assert_eq!` against a
+        // NaN payload.
+        match TrapezoidalProfile::new(f64::NAN, 100.0, 50.0, 100.0, 100.0) {
+            Err(TrajectoryError::NonFinitePosition { start, end }) => {
+                assert!(start.is_nan());
+                assert!(approx(end, 100.0));
+            }
+            other => panic!("expected NonFinitePosition, got {other:?}"),
+        }
+
+        // Infinite max_velocity would otherwise pass a bare `> 0.0` check;
+        // infinity does equal infinity under IEEE 754, so assert_eq! is fine
+        // here.
+        assert_eq!(
+            TrapezoidalProfile::new(0.0, 100.0, f64::INFINITY, 100.0, 100.0),
+            Err(TrajectoryError::InvalidMaxVelocity(f64::INFINITY))
+        );
+
+        // NaN max_acceleration.
+        match TrapezoidalProfile::new(0.0, 100.0, 50.0, f64::NAN, 100.0) {
+            Err(TrajectoryError::InvalidMaxAcceleration(a)) => assert!(a.is_nan()),
+            other => panic!("expected InvalidMaxAcceleration, got {other:?}"),
+        }
     }
 }
