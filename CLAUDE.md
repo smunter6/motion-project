@@ -7,8 +7,9 @@ earlier planning/design conversation. Read it before making changes.
 
 A **learning project** (go one deliberate step at a time; explain the reasoning,
 don't just emit code) building motion planning / trajectory generation for a
-simple Cartesian robot. The end goal is to drive **EtherCAT servo drives** (via
-the pure-Rust **EtherCRAB** master + the **CiA 402** drive profile, CSP mode)
+simple robot, initially Cartesian then integrating more complex kinematics.
+The end goal is to drive **EtherCAT servo drives** (via the pure-Rust
+**EtherCRAB** master + the **CiA 402** drive profile, CSP mode)
 while supporting a **hardware-free simulation mode** with simple visualization.
 The user does not currently have the hardware, so sim mode is a first-class
 requirement, not an afterthought.
@@ -16,10 +17,10 @@ requirement, not an afterthought.
 ## Who I'm working with
 
 Experienced engineer/scientist, comfortable with deep technical detail, new-ish
-to Rust embedded/motion specifics. Prefers: understanding *why* before code,
-small steps with discussion between them, honest flagging of design tradeoffs
-and anything not yet compiler-verified. Do not over-produce; confirm direction
-at natural decision points.
+to Rust embedded but experienced with traditional motion control. Prefers:
+understanding *why* before code, small steps with discussion between them, honest
+flagging of design tradeoffs and anything not yet compiler-verified. Do not
+over-produce; confirm direction at natural decision points.
 
 ## Core architectural decisions (already made — respect these)
 
@@ -183,3 +184,6 @@ implement, then verify with `cargo test`/`cargo run`. Flag design tradeoffs
 explicitly and let the user choose at decision points. Keep `motion-core`
 pure. Preserve the architectural decisions above unless we explicitly revisit
 one.
+
+NEVER use sed, awk, or cat to read or edit files. Always use the built-in
+Read, Edit, and Write tools.
