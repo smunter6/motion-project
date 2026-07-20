@@ -18,12 +18,12 @@ fn main() {
     // Move a linear axis from 0 mm to 100 mm.
     let start = 0.0;
     let end = 100.0;
-    let max_velocity = 50.0; // mm/s
+    let max_speed = 50.0; // mm/s
     let max_acceleration = 200.0; // mm/s^2
     let max_deceleration = 200.0; // mm/s^2
 
     let profile =
-        TrapezoidalProfile::new(start, end, max_velocity, max_acceleration, max_deceleration)
+        TrapezoidalProfile::new(start, end, max_speed, max_acceleration, max_deceleration)
             .expect("demo move parameters are hardcoded and valid");
 
     // --- Control-loop cadence ------------------------------------------
@@ -32,7 +32,7 @@ fn main() {
     let duration = profile.duration();
 
     println!("Trapezoidal move: {start} -> {end} mm");
-    println!("  max velocity     = {max_velocity} mm/s");
+    println!("  max speed        = {max_speed} mm/s");
     println!("  max acceleration = {max_acceleration} mm/s^2");
     println!("  max deceleration = {max_deceleration} mm/s^2");
     println!("  control rate     = {rate_hz} Hz  (dt = {:.1} ms)", dt * 1000.0);

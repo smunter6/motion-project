@@ -16,17 +16,19 @@
 //! infinite acceleration / infinite force). So a well-behaved move has up to
 //! three phases:
 //!
-//! 1. **Accelerate** at a constant rate until reaching a maximum velocity.
-//! 2. **Cruise** at that maximum velocity.
-//! 3. **Decelerate** at a constant rate, arriving exactly as velocity hits zero.
+//! 1. **Accelerate** at a constant rate until reaching a maximum speed.
+//! 2. **Cruise** at that maximum speed.
+//! 3. **Decelerate** at a constant rate, arriving exactly as speed hits zero.
 //!
-//! Plotted as velocity-vs-time this is a trapezoid (ramp up, flat top, ramp
-//! down). Position — the integral of velocity — comes out as a smooth S-ish
-//! curve.
+//! Plotted as speed-vs-time this is a trapezoid (ramp up, flat top, ramp
+//! down) — "speed" because the shape only comes out trapezoidal for the
+//! *magnitude* of motion; direction is constant throughout a single move
+//! and is applied separately (see `direction`). Position — the integral of
+//! signed velocity — comes out as a smooth S-ish curve.
 //!
 //! # The triangular special case
 //!
-//! If the move is short, the axis may never reach `max_velocity`: it accelerates
+//! If the move is short, the axis may never reach `max_speed`: it accelerates
 //! and must *already* start decelerating to stop in time. The trapezoid loses its
 //! flat top and becomes a triangle. We detect and handle this explicitly — the
 //! boundary between the two cases is one of the genuinely instructive parts.
@@ -48,14 +50,14 @@
 ///
 /// Exposed because it's genuinely useful (for display, diagnostics, and later
 /// logic), and computing it from the profile's known phase-boundary times is
-/// exact — far better than trying to infer it from velocity trends.
+/// exact — far better than trying to infer it from speed trends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionPhase {
     /// Before the move has started (t <= 0).
     Pre,
     /// Accelerating up toward cruise (or peak, if triangular).
     Accel,
-    /// Cruising at constant velocity. A triangular move has no cruise phase.
+    /// Cruising at constant speed. A triangular move has no cruise phase.
     Cruise,
     /// Decelerating down to a stop at the target.
     Decel,
@@ -80,8 +82,8 @@ pub enum MotionPhase {
 pub enum TrajectoryError {
     /// `start` or `end` is NaN or +/-infinity — not a real position.
     NonFinitePosition { start: f64, end: f64 },
-    /// `max_velocity` must be a finite, positive number.
-    InvalidMaxVelocity(f64),
+    /// `max_speed` must be a finite, positive number.
+    InvalidMaxSpeed(f64),
     /// `max_acceleration` must be a finite, positive number.
     InvalidMaxAcceleration(f64),
     /// `max_deceleration` must be a finite, positive number.
@@ -95,8 +97,8 @@ impl std::fmt::Display for TrajectoryError {
                 f,
                 "start ({start}) and end ({end}) must both be finite numbers"
             ),
-            TrajectoryError::InvalidMaxVelocity(v) => {
-                write!(f, "max_velocity must be a finite, positive number (got {v})")
+            TrajectoryError::InvalidMaxSpeed(v) => {
+                write!(f, "max_speed must be a finite, positive number (got {v})")
             }
             TrajectoryError::InvalidMaxAcceleration(a) => write!(
                 f,
@@ -118,7 +120,7 @@ impl std::error::Error for TrajectoryError {}
 /// Units are deliberately unspecified but must be *self-consistent*. Throughout
 /// the project we treat linear axes as millimetres and seconds, so:
 ///   - positions in mm
-///   - `max_velocity` in mm/s
+///   - `max_speed` in mm/s
 ///   - `max_acceleration` in mm/s^2
 ///
 /// The core stays in `f64` for clean, readable math. Conversion to integer
@@ -134,11 +136,11 @@ pub struct TrapezoidalProfile {
     /// Total distance travelled (always >= 0; direction is carried separately).
     distance: f64,
 
-    // Kinematic limits actually used for THIS move. `cruise_velocity` may be
-    // below the requested max_velocity when the move is triangular.
+    // Kinematic limits actually used for THIS move. `cruise_speed` may be
+    // below the requested max_speed when the move is triangular.
     accel: f64,
     decel: f64,
-    cruise_velocity: f64,
+    cruise_speed: f64,
 
     // Phase timing (all relative to move start, t = 0):
     t_accel: f64, // end of acceleration phase == start of cruise
@@ -166,7 +168,7 @@ pub struct TrajectorySample {
 impl TrapezoidalProfile {
     /// Build a profile for a move from `start` to `end`.
     ///
-    /// `max_velocity`, `max_acceleration`, and `max_deceleration` must all be
+    /// `max_speed`, `max_acceleration`, and `max_deceleration` must all be
     /// finite and > 0, and `start`/`end` must both be finite; otherwise this
     /// returns `Err` rather than panicking or producing a silently-broken
     /// profile. See [`TrajectoryError`] for why finiteness is checked, not
@@ -182,15 +184,15 @@ impl TrapezoidalProfile {
     pub fn new(
         start: f64,
         end: f64,
-        max_velocity: f64,
+        max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
     ) -> Result<Self, TrajectoryError> {
         if !start.is_finite() || !end.is_finite() {
             return Err(TrajectoryError::NonFinitePosition { start, end });
         }
-        if !(max_velocity.is_finite() && max_velocity > 0.0) {
-            return Err(TrajectoryError::InvalidMaxVelocity(max_velocity));
+        if !(max_speed.is_finite() && max_speed > 0.0) {
+            return Err(TrajectoryError::InvalidMaxSpeed(max_speed));
         }
         if !(max_acceleration.is_finite() && max_acceleration > 0.0) {
             return Err(TrajectoryError::InvalidMaxAcceleration(max_acceleration));
@@ -212,7 +214,7 @@ impl TrapezoidalProfile {
                 distance: 0.0,
                 accel: max_acceleration,
                 decel: max_deceleration,
-                cruise_velocity: 0.0,
+                cruise_speed: 0.0,
                 t_accel: 0.0,
                 t_cruise_end: 0.0,
                 t_total: 0.0,
@@ -222,43 +224,43 @@ impl TrapezoidalProfile {
 
         // --- Decide trapezoid vs. triangle -------------------------------
         //
-        // Distance needed to accelerate from 0 up to max_velocity, and
+        // Distance needed to accelerate from 0 up to max_speed, and
         // (independently, since accel and decel rates may differ) the
-        // distance needed to decelerate from max_velocity back to 0:
+        // distance needed to decelerate from max_speed back to 0:
         //
         //   v^2 = 2 * a * d   =>   d = v^2 / (2a)
         //
         // If accel distance + decel distance <= total distance, there's room to
         // reach cruise speed: it's a trapezoid. Otherwise we top out below
-        // max_velocity: it's a triangle.
+        // max_speed: it's a triangle.
         let accel = max_acceleration;
         let decel = max_deceleration;
-        let d_accel_full = (max_velocity * max_velocity) / (2.0 * accel);
-        let d_decel_full = (max_velocity * max_velocity) / (2.0 * decel);
+        let d_accel_full = (max_speed * max_speed) / (2.0 * accel);
+        let d_decel_full = (max_speed * max_speed) / (2.0 * decel);
         let d_accel_plus_decel = d_accel_full + d_decel_full;
 
-        let (cruise_velocity, t_accel, d_accel, t_cruise_end, t_total);
+        let (cruise_speed, t_accel, d_accel, t_cruise_end, t_total);
 
         if d_accel_plus_decel <= distance {
-            // ---- Trapezoidal: we do reach max_velocity ----
-            cruise_velocity = max_velocity;
+            // ---- Trapezoidal: we do reach max_speed ----
+            cruise_speed = max_speed;
 
             // Time to accelerate to cruise: v = a * t  =>  t = v / a
-            t_accel = cruise_velocity / accel;
+            t_accel = cruise_speed / accel;
             d_accel = d_accel_full;
-            let t_decel = cruise_velocity / decel;
+            let t_decel = cruise_speed / decel;
 
             // Cruise covers whatever distance is left after accel + decel.
             let d_cruise = distance - d_accel_plus_decel;
-            let t_cruise = d_cruise / cruise_velocity;
+            let t_cruise = d_cruise / cruise_speed;
 
             t_cruise_end = t_accel + t_cruise;
             t_total = t_cruise_end + t_decel;
         } else {
-            // ---- Triangular: peak velocity is below max_velocity ----
+            // ---- Triangular: peak speed is below max_speed ----
             //
             // Accelerate over d_accel, decelerate over d_decel, with
-            // d_accel + d_decel == distance and a single peak velocity where
+            // d_accel + d_decel == distance and a single peak speed where
             // the two phases meet:
             //
             //   d_accel = v_peak^2 / (2*accel)
@@ -268,12 +270,12 @@ impl TrapezoidalProfile {
             //
             // (reduces to the familiar sqrt(accel * distance) when
             // accel == decel.)
-            cruise_velocity =
+            cruise_speed =
                 (2.0 * distance * accel * decel / (accel + decel)).sqrt();
 
-            t_accel = cruise_velocity / accel;
-            d_accel = (cruise_velocity * cruise_velocity) / (2.0 * accel);
-            let t_decel = cruise_velocity / decel;
+            t_accel = cruise_speed / accel;
+            d_accel = (cruise_speed * cruise_speed) / (2.0 * accel);
+            let t_decel = cruise_speed / decel;
 
             // No cruise phase: cruise start == cruise end.
             t_cruise_end = t_accel;
@@ -287,7 +289,7 @@ impl TrapezoidalProfile {
             distance,
             accel,
             decel,
-            cruise_velocity,
+            cruise_speed,
             t_accel,
             t_cruise_end,
             t_total,
@@ -353,8 +355,9 @@ impl TrapezoidalProfile {
             };
         }
 
-        // Compute position/velocity for a positive-direction move, then re-sign.
-        let (pos_along, vel_along) = if t < self.t_accel {
+        // Compute position/speed magnitude for a positive-direction move,
+        // then re-sign into direction-aware position/velocity below.
+        let (pos_along, speed_along) = if t < self.t_accel {
             // --- Acceleration phase ---
             //   v(t) = a * t
             //   x(t) = 1/2 * a * t^2
@@ -362,11 +365,11 @@ impl TrapezoidalProfile {
             let x = 0.5 * self.accel * t * t;
             (x, v)
         } else if t < self.t_cruise_end {
-            // --- Cruise phase (constant velocity) ---
-            //   v(t) = cruise_velocity
-            //   x(t) = d_accel + cruise_velocity * (t - t_accel)
-            let v = self.cruise_velocity;
-            let x = self.d_accel + self.cruise_velocity * (t - self.t_accel);
+            // --- Cruise phase (constant speed) ---
+            //   v(t) = cruise_speed
+            //   x(t) = d_accel + cruise_speed * (t - t_accel)
+            let v = self.cruise_speed;
+            let x = self.d_accel + self.cruise_speed * (t - self.t_accel);
             (x, v)
         } else {
             // --- Deceleration phase ---
@@ -384,7 +387,7 @@ impl TrapezoidalProfile {
 
         TrajectorySample {
             position: self.start + self.direction * pos_along,
-            velocity: self.direction * vel_along,
+            velocity: self.direction * speed_along,
         }
     }
 }
@@ -426,19 +429,19 @@ mod tests {
     }
 
     #[test]
-    fn never_exceeds_max_velocity() {
-        let vmax = 50.0;
-        let p = TrapezoidalProfile::new(0.0, 500.0, vmax, 100.0, 100.0).unwrap();
+    fn never_exceeds_max_speed() {
+        let smax = 50.0;
+        let p = TrapezoidalProfile::new(0.0, 500.0, smax, 100.0, 100.0).unwrap();
         // Sample densely across the whole move.
         let n = 10_000;
         for i in 0..=n {
             let t = p.duration() * (i as f64) / (n as f64);
             let s = p.sample(t);
             assert!(
-                s.velocity.abs() <= vmax + 1e-6,
-                "velocity {} exceeded vmax {} at t={}",
+                s.velocity.abs() <= smax + 1e-6,
+                "velocity {} exceeded smax {} at t={}",
                 s.velocity,
-                vmax,
+                smax,
                 t
             );
         }
@@ -446,25 +449,25 @@ mod tests {
 
     #[test]
     fn long_move_is_trapezoidal_and_reaches_cruise() {
-        // 500 mm with vmax=50, amax=100.
+        // 500 mm with smax=50, amax=100.
         // accel distance = v^2/2a = 2500/200 = 12.5 mm; accel+decel = 25 mm.
-        // 25 <= 500, so trapezoidal; cruise velocity should equal vmax.
+        // 25 <= 500, so trapezoidal; cruise speed should equal smax.
         let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0, 100.0).unwrap();
-        assert!(approx(p.cruise_velocity, 50.0));
-        // Somewhere in the middle we should be cruising at exactly vmax.
+        assert!(approx(p.cruise_speed, 50.0));
+        // Somewhere in the middle we should be cruising at exactly smax.
         let mid = p.sample(p.duration() / 2.0);
         assert!(approx(mid.velocity, 50.0));
     }
 
     #[test]
-    fn short_move_is_triangular_and_stays_below_max_velocity() {
-        // 10 mm with vmax=50, amax=100.
-        // accel+decel distance to reach vmax = 25 mm > 10 mm, so triangular.
-        // peak velocity = sqrt(a*d) = sqrt(100*10) = sqrt(1000) ~= 31.62 mm/s.
+    fn short_move_is_triangular_and_stays_below_max_speed() {
+        // 10 mm with smax=50, amax=100.
+        // accel+decel distance to reach smax = 25 mm > 10 mm, so triangular.
+        // peak speed = sqrt(a*d) = sqrt(100*10) = sqrt(1000) ~= 31.62 mm/s.
         let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 100.0).unwrap();
         let expected_peak = (100.0_f64 * 10.0).sqrt();
-        assert!(approx(p.cruise_velocity, expected_peak));
-        assert!(p.cruise_velocity < 50.0);
+        assert!(approx(p.cruise_speed, expected_peak));
+        assert!(p.cruise_speed < 50.0);
         // No cruise phase: accel end == cruise end.
         assert!(approx(p.t_accel, p.t_cruise_end));
         // Peak occurs at the midpoint in time.
@@ -581,7 +584,7 @@ mod tests {
         assert!(approx(p.duration(), 4.75));
         assert!(approx(p.t_accel, 0.5));
 
-        // Cruise still reaches full max_velocity.
+        // Cruise still reaches full max_speed.
         let cruising = p.sample(2.0);
         assert!(approx(cruising.velocity, 50.0));
 
@@ -605,15 +608,15 @@ mod tests {
     }
 
     #[test]
-    fn asymmetric_triangle_peak_velocity_matches_formula() {
+    fn asymmetric_triangle_peak_speed_matches_formula() {
         // distance=10, v_max=50, accel=100, decel=25. Reaching v_max would
         // need d_accel+d_decel = 2500/200 + 2500/50 = 62.5 mm > 10 mm, so
-        // triangular. Peak velocity from
+        // triangular. Peak speed from
         //   v_peak = sqrt(2 * distance * accel * decel / (accel + decel))
         //          = sqrt(2*10*100*25/125) = sqrt(400) = 20.
         let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 25.0).unwrap();
-        assert!(approx(p.cruise_velocity, 20.0));
-        assert!(p.cruise_velocity < 50.0);
+        assert!(approx(p.cruise_speed, 20.0));
+        assert!(p.cruise_speed < 50.0);
 
         // Accel phase (0.2s) is a quarter the length of decel (0.8s), since
         // decel is a quarter the rate of accel — asymmetric in time, unlike
@@ -633,14 +636,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_positive_max_velocity() {
+    fn rejects_non_positive_max_speed() {
         assert_eq!(
             TrapezoidalProfile::new(0.0, 100.0, 0.0, 100.0, 100.0),
-            Err(TrajectoryError::InvalidMaxVelocity(0.0))
+            Err(TrajectoryError::InvalidMaxSpeed(0.0))
         );
         assert_eq!(
             TrapezoidalProfile::new(0.0, 100.0, -5.0, 100.0, 100.0),
-            Err(TrajectoryError::InvalidMaxVelocity(-5.0))
+            Err(TrajectoryError::InvalidMaxSpeed(-5.0))
         );
     }
 
@@ -673,12 +676,12 @@ mod tests {
             other => panic!("expected NonFinitePosition, got {other:?}"),
         }
 
-        // Infinite max_velocity would otherwise pass a bare `> 0.0` check;
+        // Infinite max_speed would otherwise pass a bare `> 0.0` check;
         // infinity does equal infinity under IEEE 754, so assert_eq! is fine
         // here.
         assert_eq!(
             TrapezoidalProfile::new(0.0, 100.0, f64::INFINITY, 100.0, 100.0),
-            Err(TrajectoryError::InvalidMaxVelocity(f64::INFINITY))
+            Err(TrajectoryError::InvalidMaxSpeed(f64::INFINITY))
         );
 
         // NaN max_acceleration.

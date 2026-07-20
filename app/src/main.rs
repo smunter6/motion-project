@@ -20,7 +20,7 @@
 //!     cargo run -p app
 //!
 //! Commands (one per line on stdin):
-//!     move <axisN> <target_mm> [max_velocity] [max_acceleration] [max_deceleration]
+//!     move <axisN> <target_mm> [max_speed] [max_acceleration] [max_deceleration]
 //!     status
 //!     help
 //!     quit
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use motion_core::{MotionPhase, TrapezoidalProfile};
 
 const CONTROL_RATE_HZ: f64 = 250.0;
-const DEFAULT_MAX_VELOCITY: f64 = 50.0; // mm/s
+const DEFAULT_MAX_SPEED: f64 = 50.0; // mm/s
 const DEFAULT_MAX_ACCELERATION: f64 = 200.0; // mm/s^2
 const STATUS_PRINT_PERIOD: Duration = Duration::from_millis(250);
 
@@ -46,7 +46,7 @@ enum Command {
     Move {
         axis: usize,
         target: f64,
-        max_velocity: f64,
+        max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
     },
@@ -101,9 +101,9 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
                 return Err(format!("too many arguments: {line:?}"));
             }
             let mut rest = rest.iter();
-            let max_velocity = match rest.next() {
+            let max_speed = match rest.next() {
                 Some(v) => parse_f64(v)?,
-                None => DEFAULT_MAX_VELOCITY,
+                None => DEFAULT_MAX_SPEED,
             };
             let max_acceleration = match rest.next() {
                 Some(a) => parse_f64(a)?,
@@ -119,7 +119,7 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
             Ok(Some(Command::Move {
                 axis: parse_axis(axis)?,
                 target: parse_f64(target)?,
-                max_velocity,
+                max_speed,
                 max_acceleration,
                 max_deceleration,
             }))
@@ -162,7 +162,7 @@ fn print_help() {
     );
     println!("commands:");
     println!(
-        "  move <axisN> <target_mm> [max_velocity_mm_s] [max_acceleration_mm_s2] \
+        "  move <axisN> <target_mm> [max_speed_mm_s] [max_acceleration_mm_s2] \
          [max_deceleration_mm_s2]"
     );
     println!("      axisN is axis0..axis{}", NUM_AXES - 1);
@@ -189,7 +189,7 @@ struct ActiveMove {
 
 struct PendingMove {
     target: f64,
-    max_velocity: f64,
+    max_speed: f64,
     max_acceleration: f64,
     max_deceleration: f64,
 }
@@ -249,7 +249,7 @@ fn run_control_loop(rx: Receiver<Command>) {
                     match TrapezoidalProfile::new(
                         ax.position,
                         p.target,
-                        p.max_velocity,
+                        p.max_speed,
                         p.max_acceleration,
                         p.max_deceleration,
                     ) {
@@ -280,7 +280,7 @@ fn run_control_loop(rx: Receiver<Command>) {
                 Command::Move {
                     axis,
                     target,
-                    max_velocity,
+                    max_speed,
                     max_acceleration,
                     max_deceleration,
                 } => {
@@ -289,7 +289,7 @@ fn run_control_loop(rx: Receiver<Command>) {
                         match TrapezoidalProfile::new(
                             ax.position,
                             target,
-                            max_velocity,
+                            max_speed,
                             max_acceleration,
                             max_deceleration,
                         ) {
@@ -316,7 +316,7 @@ fn run_control_loop(rx: Receiver<Command>) {
                         );
                         ax.pending = Some(PendingMove {
                             target,
-                            max_velocity,
+                            max_speed,
                             max_acceleration,
                             max_deceleration,
                         });
