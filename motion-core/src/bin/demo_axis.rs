@@ -20,8 +20,10 @@ fn main() {
     let end = 100.0;
     let max_velocity = 50.0; // mm/s
     let max_acceleration = 200.0; // mm/s^2
+    let max_deceleration = 200.0; // mm/s^2
 
-    let profile = TrapezoidalProfile::new(start, end, max_velocity, max_acceleration);
+    let profile =
+        TrapezoidalProfile::new(start, end, max_velocity, max_acceleration, max_deceleration);
 
     // --- Control-loop cadence ------------------------------------------
     let rate_hz = 250.0;
@@ -31,6 +33,7 @@ fn main() {
     println!("Trapezoidal move: {start} -> {end} mm");
     println!("  max velocity     = {max_velocity} mm/s");
     println!("  max acceleration = {max_acceleration} mm/s^2");
+    println!("  max deceleration = {max_deceleration} mm/s^2");
     println!("  control rate     = {rate_hz} Hz  (dt = {:.1} ms)", dt * 1000.0);
     println!("  total duration   = {:.4} s  ({} cycles)", duration, (duration / dt).ceil() as u64);
     println!();

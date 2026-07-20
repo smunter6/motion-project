@@ -1,4 +1,4 @@
-//! A continuously-running, single-axis motion app you can drive from the
+//! A continuously-running, multi-axis motion app you can drive from the
 //! terminal. This is the first cut of the "online" architecture: a
 //! fixed-rate control loop running on its own schedule, decoupled from
 //! (blocking) terminal input by a channel.
@@ -9,12 +9,18 @@
 //! `AxisGroup` seam, this loop's "print the setpoint" step becomes "send
 //! the setpoint to the backend, read actual position back".
 //!
+//! Axes are independent: `move axis0 100` and `move axis1 50` run
+//! concurrently on their own clocks, with no relationship between their
+//! durations. Driving several axes to arrive together (finish-together
+//! time-scaling) is a distinct, harder feature — deliberately deferred; see
+//! the roadmap's Step 2.
+//!
 //! Run from the workspace root with:
 //!
 //!     cargo run -p app
 //!
 //! Commands (one per line on stdin):
-//!     move <target_mm> [max_velocity] [max_acceleration]
+//!     move <axisN> <target_mm> [max_velocity] [max_acceleration] [max_deceleration]
 //!     status
 //!     help
 //!     quit
@@ -31,11 +37,18 @@ const DEFAULT_MAX_VELOCITY: f64 = 50.0; // mm/s
 const DEFAULT_MAX_ACCELERATION: f64 = 200.0; // mm/s^2
 const STATUS_PRINT_PERIOD: Duration = Duration::from_millis(250);
 
+/// Number of independent axes the app manages, named `axis0`..`axis{N-1}`
+/// on the command line. Bumping this is the only change needed to add more
+/// axes — everything else is `Vec`-driven.
+const NUM_AXES: usize = 2;
+
 enum Command {
     Move {
+        axis: usize,
         target: f64,
         max_velocity: f64,
         max_acceleration: f64,
+        max_deceleration: f64,
     },
     Status,
     Help,
@@ -83,25 +96,55 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
         ["quit"] | ["exit"] => Ok(Some(Command::Quit)),
         ["status"] => Ok(Some(Command::Status)),
         ["help"] => Ok(Some(Command::Help)),
-        ["move", target] => Ok(Some(Command::Move {
-            target: parse_f64(target)?,
-            max_velocity: DEFAULT_MAX_VELOCITY,
-            max_acceleration: DEFAULT_MAX_ACCELERATION,
-        })),
-        ["move", target, vmax] => Ok(Some(Command::Move {
-            target: parse_f64(target)?,
-            max_velocity: parse_f64(vmax)?,
-            max_acceleration: DEFAULT_MAX_ACCELERATION,
-        })),
-        ["move", target, vmax, amax] => Ok(Some(Command::Move {
-            target: parse_f64(target)?,
-            max_velocity: parse_f64(vmax)?,
-            max_acceleration: parse_f64(amax)?,
-        })),
+        ["move", axis, target, rest @ ..] => {
+            if rest.len() > 3 {
+                return Err(format!("too many arguments: {line:?}"));
+            }
+            let mut rest = rest.iter();
+            let max_velocity = match rest.next() {
+                Some(v) => parse_f64(v)?,
+                None => DEFAULT_MAX_VELOCITY,
+            };
+            let max_acceleration = match rest.next() {
+                Some(a) => parse_f64(a)?,
+                None => DEFAULT_MAX_ACCELERATION,
+            };
+            // Deceleration defaults to whatever acceleration resolved to
+            // (default or user-specified), so a symmetric move needs no
+            // extra argument.
+            let max_deceleration = match rest.next() {
+                Some(d) => parse_f64(d)?,
+                None => max_acceleration,
+            };
+            Ok(Some(Command::Move {
+                axis: parse_axis(axis)?,
+                target: parse_f64(target)?,
+                max_velocity,
+                max_acceleration,
+                max_deceleration,
+            }))
+        }
         _ => Err(format!(
             "unrecognized command: {line:?} (type \"help\" for usage)"
         )),
     }
+}
+
+/// Parses an axis token like `"axis0"` into its index, validating it's a
+/// known axis. Axis names are `axis0`..`axis{NUM_AXES-1}`.
+fn parse_axis(s: &str) -> Result<usize, String> {
+    let index = s
+        .strip_prefix("axis")
+        .ok_or_else(|| format!("expected an axis name like \"axis0\", got {s:?}"))?
+        .parse::<usize>()
+        .map_err(|_| format!("expected an axis name like \"axis0\", got {s:?}"))?;
+    if index >= NUM_AXES {
+        return Err(format!(
+            "no such axis {s:?} (valid: axis0..axis{})",
+            NUM_AXES - 1
+        ));
+    }
+    Ok(index)
 }
 
 fn parse_f64(s: &str) -> Result<f64, String> {
@@ -109,17 +152,28 @@ fn parse_f64(s: &str) -> Result<f64, String> {
         .map_err(|_| format!("expected a number, got {s:?}"))
 }
 
+fn axis_label(axis: usize) -> String {
+    format!("axis{axis}")
+}
+
 fn print_help() {
-    println!("motion-project online app — single axis, control rate {CONTROL_RATE_HZ} Hz");
+    println!(
+        "motion-project online app — {NUM_AXES} independent axes, control rate {CONTROL_RATE_HZ} Hz"
+    );
     println!("commands:");
-    println!("  move <target_mm> [max_velocity_mm_s] [max_acceleration_mm_s2]");
-    println!("  status                 — print current position/phase");
+    println!(
+        "  move <axisN> <target_mm> [max_velocity_mm_s] [max_acceleration_mm_s2] \
+         [max_deceleration_mm_s2]"
+    );
+    println!("      axisN is axis0..axis{}", NUM_AXES - 1);
+    println!("      (deceleration defaults to the acceleration value if omitted)");
+    println!("  status                 — print every axis's position/phase");
     println!("  help                   — show this message");
     println!("  quit                   — exit");
     println!(
-        "  (a move sent while another is in progress is queued and starts \
-         the instant the current move finishes — only the most recent \
-         queued move is kept)"
+        "  (a move sent to an axis that's already moving is queued and starts \
+         the instant that axis's current move finishes — only the most \
+         recent queued move per axis is kept; axes are otherwise independent)"
     );
     println!();
 }
@@ -137,20 +191,39 @@ struct PendingMove {
     target: f64,
     max_velocity: f64,
     max_acceleration: f64,
+    max_deceleration: f64,
 }
 
-fn run_control_loop(rx: Receiver<Command>) {
-    let dt = Duration::from_secs_f64(1.0 / CONTROL_RATE_HZ);
-
-    let mut position = 0.0_f64;
-    let mut active: Option<ActiveMove> = None;
+/// All runtime state for one axis. Axes are independent: each has its own
+/// position, its own in-progress move (if any), and its own single-slot
+/// pending queue — nothing here is shared across axes.
+struct AxisRuntime {
+    position: f64,
+    active: Option<ActiveMove>,
     // Single-slot queue: at most one move waits for the current one to
     // finish. This is the "block until idle" policy — deliberately simple
     // for now; see plcopen-motion-goal memory for why not to bake in
     // "always starts at rest" any harder than this in the API shape.
-    let mut pending: Option<PendingMove> = None;
-    let mut last_status_print = Instant::now();
-    let mut last_phase: Option<MotionPhase> = None;
+    pending: Option<PendingMove>,
+    last_status_print: Instant,
+    last_phase: Option<MotionPhase>,
+}
+
+impl AxisRuntime {
+    fn new() -> Self {
+        Self {
+            position: 0.0,
+            active: None,
+            pending: None,
+            last_status_print: Instant::now(),
+            last_phase: None,
+        }
+    }
+}
+
+fn run_control_loop(rx: Receiver<Command>) {
+    let dt = Duration::from_secs_f64(1.0 / CONTROL_RATE_HZ);
+    let mut axes: Vec<AxisRuntime> = (0..NUM_AXES).map(|_| AxisRuntime::new()).collect();
 
     // Fixed schedule anchored to a single start instant, so ticks don't
     // drift from accumulated sleep-call overhead.
@@ -158,35 +231,40 @@ fn run_control_loop(rx: Receiver<Command>) {
     let mut cycle: u64 = 0;
 
     loop {
-        // 1. Finish/advance the in-progress move, if any.
-        if let Some(mv) = &active {
-            let elapsed = mv.started_at.elapsed().as_secs_f64();
-            if elapsed >= mv.profile.duration() {
-                position = mv.profile.target();
-                println!("  -> reached {position:.3} mm");
-                active = None;
-                last_phase = None;
+        for (i, ax) in axes.iter_mut().enumerate() {
+            // 1. Finish/advance this axis's in-progress move, if any.
+            if let Some(mv) = &ax.active {
+                let elapsed = mv.started_at.elapsed().as_secs_f64();
+                if elapsed >= mv.profile.duration() {
+                    ax.position = mv.profile.target();
+                    println!("  -> {}: reached {:.3} mm", axis_label(i), ax.position);
+                    ax.active = None;
+                    ax.last_phase = None;
+                }
             }
-        }
 
-        // 2. If idle and a move is queued, start it now.
-        if active.is_none() {
-            if let Some(p) = pending.take() {
-                let profile = TrapezoidalProfile::new(
-                    position,
-                    p.target,
-                    p.max_velocity,
-                    p.max_acceleration,
-                );
-                println!(
-                    "  -> starting queued move: {position:.3} -> {:.3} mm ({:.3}s)",
-                    p.target,
-                    profile.duration()
-                );
-                active = Some(ActiveMove {
-                    profile,
-                    started_at: Instant::now(),
-                });
+            // 2. If idle and a move is queued, start it now.
+            if ax.active.is_none() {
+                if let Some(p) = ax.pending.take() {
+                    let profile = TrapezoidalProfile::new(
+                        ax.position,
+                        p.target,
+                        p.max_velocity,
+                        p.max_acceleration,
+                        p.max_deceleration,
+                    );
+                    println!(
+                        "  -> {}: starting queued move: {:.3} -> {:.3} mm ({:.3}s)",
+                        axis_label(i),
+                        ax.position,
+                        p.target,
+                        profile.duration()
+                    );
+                    ax.active = Some(ActiveMove {
+                        profile,
+                        started_at: Instant::now(),
+                    });
+                }
             }
         }
 
@@ -194,37 +272,45 @@ fn run_control_loop(rx: Receiver<Command>) {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Command::Move {
+                    axis,
                     target,
                     max_velocity,
                     max_acceleration,
+                    max_deceleration,
                 } => {
-                    if active.is_none() {
+                    let ax = &mut axes[axis];
+                    if ax.active.is_none() {
                         let profile = TrapezoidalProfile::new(
-                            position,
+                            ax.position,
                             target,
                             max_velocity,
                             max_acceleration,
+                            max_deceleration,
                         );
                         println!(
-                            "  -> move: {position:.3} -> {target:.3} mm ({:.3}s)",
+                            "  -> {}: move: {:.3} -> {target:.3} mm ({:.3}s)",
+                            axis_label(axis),
+                            ax.position,
                             profile.duration()
                         );
-                        active = Some(ActiveMove {
+                        ax.active = Some(ActiveMove {
                             profile,
                             started_at: Instant::now(),
                         });
                     } else {
-                        println!("  -> busy: queuing move to {target:.3} mm");
-                        pending = Some(PendingMove {
+                        println!(
+                            "  -> {}: busy: queuing move to {target:.3} mm",
+                            axis_label(axis)
+                        );
+                        ax.pending = Some(PendingMove {
                             target,
                             max_velocity,
                             max_acceleration,
+                            max_deceleration,
                         });
                     }
                 }
-                Command::Status => {
-                    print_status(position, &active);
-                }
+                Command::Status => print_status(&axes),
                 Command::Help => print_help(),
                 Command::Quit => {
                     println!("exiting.");
@@ -233,27 +319,31 @@ fn run_control_loop(rx: Receiver<Command>) {
             }
         }
 
-        // 4. Sample the active move and print a sparing heartbeat — on
+        // 4. Sample each active move and print a sparing heartbeat — on
         //    phase changes always, otherwise at most every
         //    STATUS_PRINT_PERIOD (250 Hz is far too fast for a terminal).
-        if let Some(mv) = &active {
-            let elapsed = mv.started_at.elapsed().as_secs_f64();
-            let sample = mv.profile.sample(elapsed);
-            position = sample.position;
-            let phase = mv.profile.phase_at(elapsed);
+        for (i, ax) in axes.iter_mut().enumerate() {
+            if let Some(mv) = &ax.active {
+                let elapsed = mv.started_at.elapsed().as_secs_f64();
+                let sample = mv.profile.sample(elapsed);
+                ax.position = sample.position;
+                let phase = mv.profile.phase_at(elapsed);
 
-            let phase_changed = last_phase != Some(phase);
-            let now = Instant::now();
-            if phase_changed || now.duration_since(last_status_print) >= STATUS_PRINT_PERIOD {
-                println!(
-                    "     t={elapsed:>6.3}s  pos={:>9.3} mm  vel={:>8.3} mm/s  {}",
-                    sample.position,
-                    sample.velocity,
-                    phase_label(phase)
-                );
-                last_status_print = now;
+                let phase_changed = ax.last_phase != Some(phase);
+                let now = Instant::now();
+                if phase_changed || now.duration_since(ax.last_status_print) >= STATUS_PRINT_PERIOD
+                {
+                    println!(
+                        "     {}  t={elapsed:>6.3}s  pos={:>9.3} mm  vel={:>8.3} mm/s  {}",
+                        axis_label(i),
+                        sample.position,
+                        sample.velocity,
+                        phase_label(phase)
+                    );
+                    ax.last_status_print = now;
+                }
+                ax.last_phase = Some(phase);
             }
-            last_phase = Some(phase);
         }
 
         // 5. Sleep to the next scheduled tick.
@@ -266,20 +356,23 @@ fn run_control_loop(rx: Receiver<Command>) {
     }
 }
 
-fn print_status(position: f64, active: &Option<ActiveMove>) {
-    match active {
-        Some(mv) => {
-            let elapsed = mv.started_at.elapsed().as_secs_f64();
-            let sample = mv.profile.sample(elapsed);
-            println!(
-                "  status: pos={:.3} mm  vel={:.3} mm/s  {}  (target {:.3} mm)",
-                sample.position,
-                sample.velocity,
-                phase_label(mv.profile.phase_at(elapsed)),
-                mv.profile.target()
-            );
+fn print_status(axes: &[AxisRuntime]) {
+    for (i, ax) in axes.iter().enumerate() {
+        match &ax.active {
+            Some(mv) => {
+                let elapsed = mv.started_at.elapsed().as_secs_f64();
+                let sample = mv.profile.sample(elapsed);
+                println!(
+                    "  status: {}: pos={:.3} mm  vel={:.3} mm/s  {}  (target {:.3} mm)",
+                    axis_label(i),
+                    sample.position,
+                    sample.velocity,
+                    phase_label(mv.profile.phase_at(elapsed)),
+                    mv.profile.target()
+                );
+            }
+            None => println!("  status: {}: idle at {:.3} mm", axis_label(i), ax.position),
         }
-        None => println!("  status: idle at {position:.3} mm"),
     }
 }
 

@@ -88,6 +88,7 @@ pub struct TrapezoidalProfile {
     // Kinematic limits actually used for THIS move. `cruise_velocity` may be
     // below the requested max_velocity when the move is triangular.
     accel: f64,
+    decel: f64,
     cruise_velocity: f64,
 
     // Phase timing (all relative to move start, t = 0):
@@ -116,18 +117,31 @@ pub struct TrajectorySample {
 impl TrapezoidalProfile {
     /// Build a profile for a move from `start` to `end`.
     ///
-    /// `max_velocity` and `max_acceleration` must be > 0. They represent the
-    /// physical limits of the axis (ultimately set by motor torque / current
-    /// limits on real hardware; chosen numbers in sim). Keeping them explicit
-    /// means sim exercises the same limits real hardware will impose.
+    /// `max_velocity`, `max_acceleration`, and `max_deceleration` must all be
+    /// > 0. They represent the physical limits of the axis (ultimately set by
+    /// motor torque / current limits on real hardware; chosen numbers in
+    /// sim). Keeping them explicit means sim exercises the same limits real
+    /// hardware will impose. Acceleration and deceleration are independent —
+    /// many real axes (and PLCopen-style motion function blocks) allow a
+    /// faster ramp-up than ramp-down, or vice versa.
     ///
     /// A zero-distance move is valid and produces a profile that simply reports
     /// `start` for all time with zero velocity (total duration 0).
-    pub fn new(start: f64, end: f64, max_velocity: f64, max_acceleration: f64) -> Self {
+    pub fn new(
+        start: f64,
+        end: f64,
+        max_velocity: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
+    ) -> Self {
         assert!(max_velocity > 0.0, "max_velocity must be positive");
         assert!(
             max_acceleration > 0.0,
             "max_acceleration must be positive"
+        );
+        assert!(
+            max_deceleration > 0.0,
+            "max_deceleration must be positive"
         );
 
         let delta = end - start;
@@ -142,6 +156,7 @@ impl TrapezoidalProfile {
                 direction,
                 distance: 0.0,
                 accel: max_acceleration,
+                decel: max_deceleration,
                 cruise_velocity: 0.0,
                 t_accel: 0.0,
                 t_cruise_end: 0.0,
@@ -152,8 +167,9 @@ impl TrapezoidalProfile {
 
         // --- Decide trapezoid vs. triangle -------------------------------
         //
-        // Distance needed to accelerate from 0 up to max_velocity (and, by
-        // symmetry, the same distance to decelerate back to 0):
+        // Distance needed to accelerate from 0 up to max_velocity, and
+        // (independently, since accel and decel rates may differ) the
+        // distance needed to decelerate from max_velocity back to 0:
         //
         //   v^2 = 2 * a * d   =>   d = v^2 / (2a)
         //
@@ -161,8 +177,10 @@ impl TrapezoidalProfile {
         // reach cruise speed: it's a trapezoid. Otherwise we top out below
         // max_velocity: it's a triangle.
         let accel = max_acceleration;
+        let decel = max_deceleration;
         let d_accel_full = (max_velocity * max_velocity) / (2.0 * accel);
-        let d_accel_plus_decel = 2.0 * d_accel_full;
+        let d_decel_full = (max_velocity * max_velocity) / (2.0 * decel);
+        let d_accel_plus_decel = d_accel_full + d_decel_full;
 
         let (cruise_velocity, t_accel, d_accel, t_cruise_end, t_total);
 
@@ -173,28 +191,38 @@ impl TrapezoidalProfile {
             // Time to accelerate to cruise: v = a * t  =>  t = v / a
             t_accel = cruise_velocity / accel;
             d_accel = d_accel_full;
+            let t_decel = cruise_velocity / decel;
 
             // Cruise covers whatever distance is left after accel + decel.
             let d_cruise = distance - d_accel_plus_decel;
             let t_cruise = d_cruise / cruise_velocity;
 
             t_cruise_end = t_accel + t_cruise;
-            t_total = t_cruise_end + t_accel; // decel mirrors accel
+            t_total = t_cruise_end + t_decel;
         } else {
             // ---- Triangular: peak velocity is below max_velocity ----
             //
-            // Accelerate over half the distance, decelerate over the other half.
-            // Peak velocity from  v^2 = 2 * a * (distance / 2):
+            // Accelerate over d_accel, decelerate over d_decel, with
+            // d_accel + d_decel == distance and a single peak velocity where
+            // the two phases meet:
             //
-            //   v_peak = sqrt(a * distance)
-            cruise_velocity = (accel * distance).sqrt();
+            //   d_accel = v_peak^2 / (2*accel)
+            //   d_decel = v_peak^2 / (2*decel)
+            //   d_accel + d_decel = distance
+            //     => v_peak = sqrt(2 * distance * accel * decel / (accel + decel))
+            //
+            // (reduces to the familiar sqrt(accel * distance) when
+            // accel == decel.)
+            cruise_velocity =
+                (2.0 * distance * accel * decel / (accel + decel)).sqrt();
 
             t_accel = cruise_velocity / accel;
-            d_accel = distance / 2.0;
+            d_accel = (cruise_velocity * cruise_velocity) / (2.0 * accel);
+            let t_decel = cruise_velocity / decel;
 
             // No cruise phase: cruise start == cruise end.
             t_cruise_end = t_accel;
-            t_total = 2.0 * t_accel;
+            t_total = t_accel + t_decel;
         }
 
         Self {
@@ -203,6 +231,7 @@ impl TrapezoidalProfile {
             direction,
             distance,
             accel,
+            decel,
             cruise_velocity,
             t_accel,
             t_cruise_end,
@@ -286,14 +315,15 @@ impl TrapezoidalProfile {
             (x, v)
         } else {
             // --- Deceleration phase ---
-            // Measure time remaining until the move ends; by symmetry the decel
-            // phase is a mirror of the accel phase run backwards from the end.
+            // Measure time remaining until the move ends and integrate
+            // backwards from a full stop at t_total, at the deceleration
+            // rate (independent of the acceleration rate).
             //   td = t_total - t              (time left)
-            //   v(t) = a * td
-            //   x(t) = distance - 1/2 * a * td^2
+            //   v(t) = decel * td
+            //   x(t) = distance - 1/2 * decel * td^2
             let td = self.t_total - t;
-            let v = self.accel * td;
-            let x = self.distance - 0.5 * self.accel * td * td;
+            let v = self.decel * td;
+            let x = self.distance - 0.5 * self.decel * td * td;
             (x, v)
         };
 
@@ -317,7 +347,7 @@ mod tests {
 
     #[test]
     fn starts_at_start_and_ends_at_end() {
-        let p = TrapezoidalProfile::new(10.0, 110.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(10.0, 110.0, 50.0, 100.0, 100.0);
         let at_start = p.sample(0.0);
         let at_end = p.sample(p.duration());
         assert!(approx(at_start.position, 10.0));
@@ -329,7 +359,7 @@ mod tests {
 
     #[test]
     fn clamps_before_and_after_move() {
-        let p = TrapezoidalProfile::new(0.0, 100.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 100.0, 50.0, 100.0, 100.0);
         // Way before.
         let before = p.sample(-5.0);
         assert!(approx(before.position, 0.0));
@@ -343,7 +373,7 @@ mod tests {
     #[test]
     fn never_exceeds_max_velocity() {
         let vmax = 50.0;
-        let p = TrapezoidalProfile::new(0.0, 500.0, vmax, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 500.0, vmax, 100.0, 100.0);
         // Sample densely across the whole move.
         let n = 10_000;
         for i in 0..=n {
@@ -364,7 +394,7 @@ mod tests {
         // 500 mm with vmax=50, amax=100.
         // accel distance = v^2/2a = 2500/200 = 12.5 mm; accel+decel = 25 mm.
         // 25 <= 500, so trapezoidal; cruise velocity should equal vmax.
-        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0, 100.0);
         assert!(approx(p.cruise_velocity, 50.0));
         // Somewhere in the middle we should be cruising at exactly vmax.
         let mid = p.sample(p.duration() / 2.0);
@@ -376,7 +406,7 @@ mod tests {
         // 10 mm with vmax=50, amax=100.
         // accel+decel distance to reach vmax = 25 mm > 10 mm, so triangular.
         // peak velocity = sqrt(a*d) = sqrt(100*10) = sqrt(1000) ~= 31.62 mm/s.
-        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 100.0);
         let expected_peak = (100.0_f64 * 10.0).sqrt();
         assert!(approx(p.cruise_velocity, expected_peak));
         assert!(p.cruise_velocity < 50.0);
@@ -391,7 +421,7 @@ mod tests {
     fn symmetric_move_is_symmetric_in_position() {
         // Position profile should be point-symmetric about the midpoint:
         // x(t) - start  ==  end - x(T - t).
-        let p = TrapezoidalProfile::new(0.0, 200.0, 40.0, 80.0);
+        let p = TrapezoidalProfile::new(0.0, 200.0, 40.0, 80.0, 80.0);
         let dur = p.duration();
         let n = 1000;
         for i in 0..=n {
@@ -411,7 +441,7 @@ mod tests {
     #[test]
     fn negative_direction_move_works() {
         // Moving from 100 down to 0 should mirror the positive case.
-        let p = TrapezoidalProfile::new(100.0, 0.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(100.0, 0.0, 50.0, 100.0, 100.0);
         assert!(approx(p.sample(0.0).position, 100.0));
         assert!(approx(p.sample(p.duration()).position, 0.0));
         // Velocity should be negative during the move.
@@ -421,7 +451,7 @@ mod tests {
 
     #[test]
     fn zero_distance_move_is_inert() {
-        let p = TrapezoidalProfile::new(42.0, 42.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(42.0, 42.0, 50.0, 100.0, 100.0);
         assert!(approx(p.duration(), 0.0));
         assert!(approx(p.sample(0.0).position, 42.0));
         assert!(approx(p.sample(1.0).position, 42.0));
@@ -433,7 +463,7 @@ mod tests {
         // distance=200, v_max=50, a_max=100 => t_accel=0.5s, t_total=4.5s, so
         // accel/decel each occupy ~11% of duration: comfortably wider than
         // the 5%-in / 5%-from-end sample points below.
-        let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0, 100.0);
         let dur = p.duration();
         assert_eq!(p.phase_at(-1.0), MotionPhase::Pre);
         assert_eq!(p.phase_at(0.0), MotionPhase::Pre);
@@ -450,7 +480,7 @@ mod tests {
     #[test]
     fn phase_at_never_reports_cruise_for_triangle() {
         // Short move: triangular, so Cruise must never appear.
-        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 100.0);
         let dur = p.duration();
         let n = 1000;
         for i in 0..=n {
@@ -470,7 +500,7 @@ mod tests {
     #[test]
     fn position_is_continuous_across_phase_boundaries() {
         // No jumps at the accel->cruise and cruise->decel seams.
-        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0);
+        let p = TrapezoidalProfile::new(0.0, 500.0, 50.0, 100.0, 100.0);
         for &boundary in &[p.t_accel, p.t_cruise_end] {
             let just_before = p.sample(boundary - EPS).position;
             let just_after = p.sample(boundary + EPS).position;
@@ -482,5 +512,68 @@ mod tests {
                 just_after
             );
         }
+    }
+
+    #[test]
+    fn asymmetric_trapezoid_uses_distinct_accel_and_decel_rates() {
+        // distance=200, v_max=50, accel=100, decel=50 (half the accel rate).
+        // d_accel = 2500/200 = 12.5, d_decel = 2500/100 = 25, sum=37.5 <= 200
+        // => trapezoidal. t_accel = 50/100 = 0.5s, t_decel = 50/50 = 1.0s
+        // (twice as long as accel, since decel is half the rate) — with the
+        // old symmetric-only formula t_total would have been 4.25s; with
+        // independent rates it's 4.75s.
+        let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0, 50.0);
+        assert!(approx(p.duration(), 4.75));
+        assert!(approx(p.t_accel, 0.5));
+
+        // Cruise still reaches full max_velocity.
+        let cruising = p.sample(2.0);
+        assert!(approx(cruising.velocity, 50.0));
+
+        // 0.75s of time remains in the decel phase at t=4.0s; decelerating
+        // at 50 mm/s^2 (not 100) for that long means v = 50 * 0.75 = 37.5.
+        let decelerating = p.sample(4.0);
+        assert!(approx(decelerating.velocity, 37.5));
+
+        // Still starts and ends at rest, exactly at the target.
+        assert!(approx(p.sample(0.0).position, 0.0));
+        let at_end = p.sample(p.duration());
+        assert!(approx(at_end.position, 200.0));
+        assert!(approx(at_end.velocity, 0.0));
+
+        // Velocity invariant still holds with independent rates.
+        let n = 1000;
+        for i in 0..=n {
+            let t = p.duration() * (i as f64) / (n as f64);
+            assert!(p.sample(t).velocity <= 50.0 + 1e-6);
+        }
+    }
+
+    #[test]
+    fn asymmetric_triangle_peak_velocity_matches_formula() {
+        // distance=10, v_max=50, accel=100, decel=25. Reaching v_max would
+        // need d_accel+d_decel = 2500/200 + 2500/50 = 62.5 mm > 10 mm, so
+        // triangular. Peak velocity from
+        //   v_peak = sqrt(2 * distance * accel * decel / (accel + decel))
+        //          = sqrt(2*10*100*25/125) = sqrt(400) = 20.
+        let p = TrapezoidalProfile::new(0.0, 10.0, 50.0, 100.0, 25.0);
+        assert!(approx(p.cruise_velocity, 20.0));
+        assert!(p.cruise_velocity < 50.0);
+
+        // Accel phase (0.2s) is a quarter the length of decel (0.8s), since
+        // decel is a quarter the rate of accel — asymmetric in time, unlike
+        // the old symmetric formula which forced them equal.
+        assert!(approx(p.t_accel, 0.2));
+        assert!(approx(p.duration(), 1.0));
+
+        // Peak occurs exactly at the accel/decel boundary.
+        let peak = p.sample(p.t_accel);
+        assert!(approx(peak.velocity, 20.0));
+
+        // Still starts and ends at rest, exactly at the target.
+        assert!(approx(p.sample(0.0).position, 0.0));
+        let at_end = p.sample(p.duration());
+        assert!(approx(at_end.position, 10.0));
+        assert!(approx(at_end.velocity, 0.0));
     }
 }
