@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "motion-core",
+    "app",
+]
+
+# As the project grows, new crates get added here:
+#   "axis-backend"      - the trait seam (command axes, read feedback)
+#   "backend-sim"       - software plant model implementing the seam
+#   "backend-ethercat"  - EtherCRAB + CiA 402 implementation (when hardware arrives)
+#   "viz"               - simple 2D + plot visualization
+#
+# "app" (wires planner + backend + viz together) has arrived early, ahead of
+# backend-sim/viz: for now it samples motion-core's trajectory directly and
+# treats the setpoint as ground truth. See app/src/main.rs.
