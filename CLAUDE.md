@@ -52,7 +52,7 @@ at natural decision points.
 - EtherCRAB is `no_std`-capable, so the same crate could later target an
   RP2350-based master with an embedded TX/RX transport.
 
-## Current state — Steps 1–4 done (2 deferred)
+## Current state — Steps 1–5 done (2 deferred)
 
 - `motion-core`: single-axis **trapezoidal velocity profile**,
   `TrapezoidalProfile::new(start, end, max_speed, max_acceleration,
@@ -74,9 +74,18 @@ at natural decision points.
   *actual* (backend) position, not the last commanded one. Moves queue
   (single slot per axis) while an axis is busy, block-until-idle. Axes are
   fully independent — see Step 2, deferred.
-- Not yet built: `viz` (Step 5), richer sim dynamics (Step 6),
-  `backend-ethercat` (Step 7), coordinated multi-axis moves (Step 2,
-  deferred).
+- `app`'s viz window (`app/src/viz.rs` + `app/src/recording.rs`): an
+  eframe/egui_plot window baked into the `app` binary itself, not a separate
+  crate. Input stays entirely terminal-driven — viz has no controls, it only
+  plots. `RecordingAxisGroup` (`recording.rs`) wraps the real backend and
+  taps the `AxisGroup::exchange()` seam: it forwards every call unchanged and
+  copies each cycle's setpoint/feedback into a shared, bounded `History`
+  buffer. `run_control_loop` needed zero logic changes — only its backend
+  construction line changed to wrap `SimAxisGroup` in `RecordingAxisGroup`.
+  Shows target-vs-actual position/velocity per axis, plus an XY tool-position
+  plot when `NUM_AXES >= 2`.
+- Not yet built: richer sim dynamics (Step 6), `backend-ethercat` (Step 7),
+  coordinated multi-axis moves (Step 2, deferred).
 
 ## Roadmap
 
@@ -115,13 +124,35 @@ at natural decision points.
    feedback position, not the last commanded one. Confirmed live: a 0->100mm
    move now reports "reached 99.999 mm", the small Euler-integration
    following error `backend-sim`'s design was meant to surface.
-5. Simple **viz** (egui/eframe + egui_plot): 2D axis/tool view + target-vs-actual
-   position/velocity plots. Viz is a dev tool, runs on host, not deployed to Pi.
-   (WSLg needed to show a window from WSL; or run viz natively on Windows.)
-   Open question, deliberately not decided yet: whether `app` and `viz` share
-   the control-loop code (extract to a common crate) or `viz` gets its own
-   copy. Revisit when viz actually starts, not before — no second consumer
-   of the loop exists yet, so extracting now would be speculative.
+5. **[done]** Simple **viz** (egui/eframe + egui_plot): target-vs-actual
+   position/velocity plots per axis, plus an XY tool-position plot. Viz is a
+   dev tool, runs on host, not deployed to Pi. Design settled 2026-07-20,
+   resolving the loop-sharing question in favor of the smallest option:
+   - **Baked into `app`, not a separate crate or shared "runtime" crate.**
+     `app` gained two modules (`recording.rs`, `viz.rs`); no new workspace
+     member. Terminal input is unchanged — viz is a passive, read-only
+     window, not a second frontend with its own input handling.
+   - **Data comes from tapping the `AxisGroup` seam, not from touching
+     `run_control_loop`'s decision logic.** `RecordingAxisGroup` wraps
+     whatever backend it's given, forwards `exchange()` unchanged, and
+     records setpoint/feedback into a shared `History`. The loop only
+     changed what it constructs the backend as.
+   - **Thread layout flipped.** eframe/winit require the GUI event loop on
+     the main thread, so `run_control_loop` moved onto its own spawned
+     thread (alongside the existing stdin-reader thread); `main()`'s thread
+     now runs `eframe::run_native`. The terminal `quit` command sets a
+     shared `AtomicBool` that viz polls each frame to close its own window.
+   - **Renderer: `glow` (OpenGL), not the default `wgpu`.** `wgpu` failed at
+     startup in this WSL setup (`WinitEventLoop(ExitFailure(1))`) — no
+     `/dev/dri` render node, no Vulkan ICD, only WSL's `/dev/dxg` GPU
+     passthrough. `glow` via Mesa's GL (through `/dev/dxg`) works. Also
+     dropped eframe's default `accesskit` feature (AT-SPI/D-Bus screen-reader
+     integration, unneeded for a dev plotting tool, and was itself hitting a
+     missing D-Bus session daemon during startup diagnosis).
+   - **Environment note for a fresh WSL setup**: running a GUI app needs
+     `libwayland-client0 libwayland-egl1 libwayland-cursor0 libxkbcommon0
+     libegl1 libgl1` installed (`apt-get install`) even with WSLg present —
+     WSLg provides the compositor, not the client-side libraries.
 6. Richer sim: second-order lag, position/following-error limits, faults;
    S-curve (jerk-limited) profiles.
 7. (Hardware later) `backend-ethercat`: EtherCRAB + CiA 402 state machine +
@@ -132,8 +163,9 @@ at natural decision points.
 - [done] `app` binary crate exists (arrived early, ahead of Step 4/backend-sim —
   see `app/src/main.rs`); `Cargo.lock` is committed, `.gitignore` no longer
   excludes it.
-- Workspace layout target:
-  motion-core / axis-backend / backend-sim / backend-ethercat / viz / app.
+- Workspace layout target: motion-core / axis-backend / backend-sim /
+  backend-ethercat / app. (`viz` is not a separate crate — see Step 5: it's
+  baked into `app` as `app/src/viz.rs` + `app/src/recording.rs`.)
 - **Backlog**: unit tests for `app`'s `parse_command`/`parse_axis` (in
   `app/src/main.rs`, `#[cfg(test)] mod tests`, same pattern as
   `trajectory.rs`). Currently only manually smoke-tested via piping stdin.

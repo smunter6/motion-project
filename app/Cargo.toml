@@ -7,3 +7,6 @@ edition = "2024"
 motion-core = { path = "../motion-core" }
 axis-backend = { path = "../axis-backend" }
 backend-sim = { path = "../backend-sim" }
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui = "0.35.0"
+egui_plot = "0.36.0"

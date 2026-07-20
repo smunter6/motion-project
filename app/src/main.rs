@@ -29,19 +29,30 @@
 //!     help
 //!     quit
 
+mod recording;
+mod viz;
+
 use std::io::{self, BufRead};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use axis_backend::{AxisGroup, AxisSetpoint};
 use backend_sim::SimAxisGroup;
 use motion_core::{MotionPhase, TrapezoidalProfile};
+use recording::{History, RecordingAxisGroup};
+use viz::VizApp;
 
 const CONTROL_RATE_HZ: f64 = 250.0;
 const DEFAULT_MAX_SPEED: f64 = 50.0; // mm/s
 const DEFAULT_MAX_ACCELERATION: f64 = 200.0; // mm/s^2
 const STATUS_PRINT_PERIOD: Duration = Duration::from_millis(250);
+
+/// How much target-vs-actual history the viz window keeps per axis, in
+/// seconds. Older samples are dropped as new ones arrive.
+const HISTORY_SECONDS: f64 = 10.0;
 
 /// Number of independent axes the app manages, named `axis0`..`axis{N-1}`
 /// on the command line. Bumping this is the only change needed to add more
@@ -67,7 +78,34 @@ fn main() {
     let (tx, rx) = mpsc::channel::<Command>();
     thread::spawn(move || read_commands(tx));
 
-    run_control_loop(rx);
+    let capacity = (CONTROL_RATE_HZ * HISTORY_SECONDS) as usize;
+    let history = Arc::new(Mutex::new(History::new(NUM_AXES, capacity)));
+    // Set once the control loop exits (via `quit` or stdin EOF) — the viz
+    // window has no controls of its own, so this is its cue to close too.
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    {
+        let history = Arc::clone(&history);
+        let shutdown = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            run_control_loop(rx, history);
+            shutdown.store(true, Ordering::Relaxed);
+        });
+    }
+
+    // eframe/winit need the GUI event loop on the main thread, so it runs
+    // here while the control loop (moved above) and stdin reader each run
+    // on their own thread. This call blocks until the viz window closes.
+    let native_options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    };
+    eframe::run_native(
+        "motion-project viz",
+        native_options,
+        Box::new(move |_cc| Ok(Box::new(VizApp::new(history, shutdown, NUM_AXES)))),
+    )
+    .expect("failed to run viz window");
 }
 
 /// Blocks on stdin, parsing one command per line and forwarding it to the
@@ -234,10 +272,12 @@ impl AxisRuntime {
     }
 }
 
-fn run_control_loop(rx: Receiver<Command>) {
+fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
     let dt = Duration::from_secs_f64(1.0 / CONTROL_RATE_HZ);
     let mut axes: Vec<AxisRuntime> = (0..NUM_AXES).map(|_| AxisRuntime::new()).collect();
-    let mut backend = SimAxisGroup::new(NUM_AXES, dt.as_secs_f64());
+    // Recording is a passive tap at the AxisGroup seam (see recording.rs) —
+    // everything below this line is unchanged from before viz existed.
+    let mut backend = RecordingAxisGroup::new(SimAxisGroup::new(NUM_AXES, dt.as_secs_f64()), history);
 
     // Fixed schedule anchored to a single start instant, so ticks don't
     // drift from accumulated sleep-call overhead.
