@@ -108,6 +108,11 @@ impl eframe::App for VizApp {
                                         "status:   {}",
                                         state_label(s.feedback.state, s.feedback.motion)
                                     ));
+                                    // Raw DS402 detail alongside the coarser
+                                    // status line above — mainly useful
+                                    // while watching an enable/disable
+                                    // sequence step through its 3 cycles.
+                                    ui.weak(format!("ds402:    {:?}", s.feedback.ds402_state));
                                     if let Some(fault) = s.feedback.fault {
                                         ui.colored_label(
                                             egui::Color32::RED,
@@ -118,7 +123,7 @@ impl eframe::App for VizApp {
                                 None => {
                                     ui.label("position:    0.000 mm");
                                     ui.label("velocity:    0.000 mm/s");
-                                    ui.label("status:   standstill");
+                                    ui.label("status:   disabled");
                                 }
                             }
                         });

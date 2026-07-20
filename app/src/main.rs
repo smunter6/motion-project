@@ -25,9 +25,24 @@
 //!
 //! Commands (one per line on stdin):
 //!     move <axisN> <target_mm> [max_speed] [max_acceleration] [max_deceleration]
+//!     enable <axisN>
+//!     disable <axisN>
+//!     reset <axisN>
 //!     status
 //!     help
 //!     quit
+//!
+//! Axes start disabled (DS402's `SwitchOnDisabled`), matching real drive
+//! power-up — `move` on a disabled axis is rejected, not queued. `enable`
+//! steps an axis through the real DS402 sequence (`SwitchOnDisabled` ->
+//! `ReadyToSwitchOn` -> `SwitchedOn` -> `OperationEnabled`), one transition
+//! per control cycle, same as a real master/drive negotiate it. See
+//! `axis-backend`'s `Ds402State` docs.
+//!
+//! Disabling an axis that's actually moving is a fault, not a graceful
+//! power-down — a real drive can't safely just cut its power stage
+//! mid-motion the way it safely can from rest. A faulted axis needs `reset`
+//! before it'll accept `enable` again; `reset` alone doesn't re-enable it.
 
 mod recording;
 mod viz;
@@ -39,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use axis_backend::{AxisGroup, AxisSetpoint};
+use axis_backend::{AxisGroup, AxisSetpoint, Ds402State};
 use backend_sim::SimAxisGroup;
 use motion_core::{MotionPhase, TrapezoidalProfile};
 use recording::{History, RecordingAxisGroup};
@@ -66,6 +81,15 @@ enum Command {
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+    },
+    Enable {
+        axis: usize,
+    },
+    Disable {
+        axis: usize,
+    },
+    Reset {
+        axis: usize,
     },
     Status,
     Help,
@@ -140,6 +164,15 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
         ["quit"] | ["exit"] => Ok(Some(Command::Quit)),
         ["status"] => Ok(Some(Command::Status)),
         ["help"] => Ok(Some(Command::Help)),
+        ["enable", axis] => Ok(Some(Command::Enable {
+            axis: parse_axis(axis)?,
+        })),
+        ["disable", axis] => Ok(Some(Command::Disable {
+            axis: parse_axis(axis)?,
+        })),
+        ["reset", axis] => Ok(Some(Command::Reset {
+            axis: parse_axis(axis)?,
+        })),
         ["move", axis, target, rest @ ..] => {
             if rest.len() > 3 {
                 return Err(format!("too many arguments: {line:?}"));
@@ -211,9 +244,20 @@ fn print_help() {
     );
     println!("      axisN is axis0..axis{}", NUM_AXES - 1);
     println!("      (deceleration defaults to the acceleration value if omitted)");
+    println!("  enable <axisN>         — power up and enable an axis (required before move)");
+    println!("  disable <axisN>        — disable an axis (aborts any active move)");
+    println!("  reset <axisN>          — clear a fault (doesn't re-enable — enable after)");
     println!("  status                 — print every axis's position/phase");
     println!("  help                   — show this message");
     println!("  quit                   — exit");
+    println!(
+        "  (axes start disabled, matching real drive power-up — move on a \
+         disabled axis is rejected, not queued)"
+    );
+    println!(
+        "  (disabling a moving axis faults it, not a graceful power-down — \
+         reset, then enable again, to recover)"
+    );
     println!(
         "  (a move sent to an axis that's already moving is queued and starts \
          the instant that axis's current move finishes — only the most \
@@ -257,6 +301,20 @@ struct AxisRuntime {
     pending: Option<PendingMove>,
     last_status_print: Instant,
     last_phase: Option<MotionPhase>,
+    // What the user last asked for via `enable`/`disable` — sent to the
+    // backend every cycle as `AxisSetpoint::enabled` (see axis-backend's
+    // docs on why that's a cyclic field, not a one-off command).
+    want_enabled: bool,
+    // The backend-confirmed DS402 state, updated from feedback each cycle.
+    // `move` gates on this, not `want_enabled` — the two can disagree for a
+    // few cycles while the backend is still stepping through the enable
+    // sequence.
+    ds402_state: Ds402State,
+    // A one-shot pulse: set true when `reset` is issued, sent as
+    // `AxisSetpoint::fault_reset` for exactly one cycle, then cleared —
+    // mirrors DS402's edge-triggered "Fault Reset" controlword bit, which
+    // isn't a held/level state like `enabled`.
+    pending_fault_reset: bool,
 }
 
 impl AxisRuntime {
@@ -268,6 +326,9 @@ impl AxisRuntime {
             pending: None,
             last_status_print: Instant::now(),
             last_phase: None,
+            want_enabled: false,
+            ds402_state: Ds402State::SwitchOnDisabled,
+            pending_fault_reset: false,
         }
     }
 }
@@ -289,6 +350,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
         for (i, ax) in axes.iter_mut().enumerate() {
             if ax.active.is_none() {
                 if let Some(p) = ax.pending.take() {
+                    if ax.ds402_state != Ds402State::OperationEnabled {
+                        println!(
+                            "  ! {}: queued move dropped: axis is not enabled",
+                            axis_label(i)
+                        );
+                        continue;
+                    }
                     match TrapezoidalProfile::new(
                         ax.position,
                         p.target,
@@ -321,20 +389,29 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
         //    the active trajectory if there is one, otherwise hold at the
         //    axis's last known actual position with zero velocity.
         let setpoints: Vec<AxisSetpoint> = axes
-            .iter()
-            .map(|ax| match &ax.active {
-                Some(mv) => {
-                    let elapsed = mv.started_at.elapsed().as_secs_f64();
-                    let sample = mv.profile.sample(elapsed);
-                    AxisSetpoint {
-                        position: sample.position,
-                        velocity: sample.velocity,
+            .iter_mut()
+            .map(|ax| {
+                // Consume the one-shot reset pulse right here — it's sent
+                // in this cycle's setpoint and must not repeat next cycle.
+                let fault_reset = std::mem::take(&mut ax.pending_fault_reset);
+                match &ax.active {
+                    Some(mv) => {
+                        let elapsed = mv.started_at.elapsed().as_secs_f64();
+                        let sample = mv.profile.sample(elapsed);
+                        AxisSetpoint {
+                            position: sample.position,
+                            velocity: sample.velocity,
+                            enabled: ax.want_enabled,
+                            fault_reset,
+                        }
                     }
+                    None => AxisSetpoint {
+                        position: ax.position,
+                        velocity: 0.0,
+                        enabled: ax.want_enabled,
+                        fault_reset,
+                    },
                 }
-                None => AxisSetpoint {
-                    position: ax.position,
-                    velocity: 0.0,
-                },
             })
             .collect();
 
@@ -356,8 +433,59 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             ax.position = feedback[i].position;
             ax.velocity = feedback[i].velocity;
 
-            if let Some(fault) = feedback[i].fault {
-                println!("  ! {}: backend fault: {fault:?}", axis_label(i));
+            // Surface DS402 transitions as they're confirmed by the
+            // backend — at 250 Hz a full enable/disable sequence (3
+            // transitions) finishes in ~12ms, so these prints arrive
+            // essentially back-to-back, not spread over noticeable time.
+            if feedback[i].ds402_state != ax.ds402_state {
+                let was_fault = ax.ds402_state == Ds402State::Fault;
+                println!(
+                    "     {}: {:?} -> {:?}",
+                    axis_label(i),
+                    ax.ds402_state,
+                    feedback[i].ds402_state
+                );
+                ax.ds402_state = feedback[i].ds402_state;
+                match ax.ds402_state {
+                    Ds402State::OperationEnabled => {
+                        println!("  -> {}: enabled", axis_label(i))
+                    }
+                    Ds402State::SwitchOnDisabled if was_fault => {
+                        println!("  -> {}: fault reset, disabled", axis_label(i))
+                    }
+                    Ds402State::SwitchOnDisabled => {
+                        println!("  -> {}: disabled", axis_label(i))
+                    }
+                    Ds402State::FaultReactionActive => {
+                        if let Some(fault) = feedback[i].fault {
+                            println!("  ! {}: FAULT: {fault:?}", axis_label(i));
+                        }
+                        // A fault means the last request is void — recovery
+                        // is an explicit reset, then a fresh enable, not an
+                        // automatic re-enable once the fault clears.
+                        ax.want_enabled = false;
+                    }
+                    _ => {}
+                }
+            }
+
+            // A move can't continue on an axis that isn't fully enabled —
+            // e.g. the user just disabled it, or a fault just knocked it
+            // out of OperationEnabled.
+            if ax.ds402_state != Ds402State::OperationEnabled {
+                if ax.active.is_some() {
+                    if feedback[i].fault.is_some() {
+                        println!("  ! {}: move faulted", axis_label(i));
+                    } else {
+                        println!(
+                            "  ! {}: move aborted: axis is no longer enabled",
+                            axis_label(i)
+                        );
+                    }
+                    ax.active = None;
+                    ax.last_phase = None;
+                }
+                continue;
             }
 
             if let Some(mv) = &ax.active {
@@ -399,7 +527,12 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_deceleration,
                 } => {
                     let ax = &mut axes[axis];
-                    if ax.active.is_none() {
+                    if ax.ds402_state != Ds402State::OperationEnabled {
+                        println!(
+                            "  ! {}: move rejected: axis is disabled (enable it first)",
+                            axis_label(axis)
+                        );
+                    } else if ax.active.is_none() {
                         match TrapezoidalProfile::new(
                             ax.position,
                             target,
@@ -436,6 +569,46 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         });
                     }
                 }
+                Command::Enable { axis } => {
+                    let ax = &mut axes[axis];
+                    if matches!(
+                        ax.ds402_state,
+                        Ds402State::Fault | Ds402State::FaultReactionActive
+                    ) {
+                        // Must refuse outright, not just leave `want_enabled`
+                        // false and hope — an `enable` that arrives anywhere
+                        // during the fault window must not "stick" and
+                        // silently fire the instant a later `reset` clears
+                        // the fault, without a fresh `enable` after it.
+                        println!(
+                            "  ! {}: cannot enable: axis has a fault — reset it first",
+                            axis_label(axis)
+                        );
+                    } else if ax.want_enabled && ax.ds402_state == Ds402State::OperationEnabled {
+                        println!("  -> {}: already enabled", axis_label(axis));
+                    } else {
+                        ax.want_enabled = true;
+                        println!("  -> {}: enabling...", axis_label(axis));
+                    }
+                }
+                Command::Disable { axis } => {
+                    let ax = &mut axes[axis];
+                    if !ax.want_enabled && ax.ds402_state == Ds402State::SwitchOnDisabled {
+                        println!("  -> {}: already disabled", axis_label(axis));
+                    } else {
+                        ax.want_enabled = false;
+                        println!("  -> {}: disabling...", axis_label(axis));
+                    }
+                }
+                Command::Reset { axis } => {
+                    let ax = &mut axes[axis];
+                    if ax.ds402_state == Ds402State::Fault {
+                        ax.pending_fault_reset = true;
+                        println!("  -> {}: resetting fault...", axis_label(axis));
+                    } else {
+                        println!("  -> {}: no fault to reset", axis_label(axis));
+                    }
+                }
                 Command::Status => print_status(&axes),
                 Command::Help => print_help(),
                 Command::Quit => {
@@ -465,15 +638,21 @@ fn print_status(axes: &[AxisRuntime]) {
                 // what the heartbeat print shows, and what's actually true
                 // for the axis right now, not just what was commanded.
                 println!(
-                    "  status: {}: pos={:.3} mm  vel={:.3} mm/s  {}  (target {:.3} mm)",
+                    "  status: {}: pos={:.3} mm  vel={:.3} mm/s  {}  (target {:.3} mm)  [{:?}]",
                     axis_label(i),
                     ax.position,
                     ax.velocity,
                     phase_label(mv.profile.phase_at(elapsed)),
-                    mv.profile.target()
+                    mv.profile.target(),
+                    ax.ds402_state
                 );
             }
-            None => println!("  status: {}: idle at {:.3} mm", axis_label(i), ax.position),
+            None => println!(
+                "  status: {}: idle at {:.3} mm  [{:?}]",
+                axis_label(i),
+                ax.position,
+                ax.ds402_state
+            ),
         }
     }
 }

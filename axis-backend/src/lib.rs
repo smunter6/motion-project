@@ -36,6 +36,25 @@ use std::fmt;
 pub struct AxisSetpoint {
     pub position: f64,
     pub velocity: f64,
+    /// Requested power-stage state: `true` to (request to) enable, `false`
+    /// to (request to) disable. Mirrors a CiA 402 controlword's enable
+    /// bits, simplified to one flag the same way the trait stays in `f64`
+    /// engineering units rather than raw encoder counts (decision #4) —
+    /// sequencing the real multi-step DS402 transitions to get there is
+    /// each backend's own business. Sent every cycle, like the real
+    /// controlword, not as a one-off command.
+    pub enabled: bool,
+    /// Requests clearing a latched fault (see [`AxisFeedback::fault`]),
+    /// mirroring CiA 402's edge-triggered "Fault Reset" controlword bit
+    /// (transition 15: `Fault` -> `SwitchOnDisabled`) — a distinct bit from
+    /// `enabled`, since resetting a fault and requesting enable are
+    /// different real controlword bits, not the same request. Only has any
+    /// effect while [`AxisFeedback::ds402_state`] is [`Ds402State::Fault`];
+    /// harmless otherwise. Resetting clears the fault but does *not*
+    /// re-enable the axis — a fresh `enabled: true` afterward still has to
+    /// run the normal sequence, the same way a real operator has to
+    /// acknowledge a fault before re-enabling.
+    pub fault_reset: bool,
 }
 
 /// A single control-cycle feedback reading for one axis.
@@ -43,11 +62,9 @@ pub struct AxisSetpoint {
 pub struct AxisFeedback {
     pub position: f64,
     pub velocity: f64,
-    /// A fault this axis is reporting, if any. Present from the start —
-    /// even before any backend can actually raise one — so callers (the run
-    /// loop, eventually viz) build their fault-handling path against a
-    /// backend that simply never uses it, rather than retrofitting fault
-    /// handling once real hardware exists.
+    /// A fault this axis is reporting, if any. Mirrors
+    /// [`ds402_state`](Self::ds402_state) being [`Ds402State::FaultReactionActive`]
+    /// or [`Ds402State::Fault`] — `None` the rest of the time.
     pub fault: Option<AxisFault>,
     /// This axis's motion-control state machine state. See [`AxisState`].
     pub state: AxisState,
@@ -55,6 +72,9 @@ pub struct AxisFeedback {
     /// [`AxisState::DiscreteMotion`] (and, later, `ContinuousMotion`/
     /// `SynchronizedMotion`). See [`MotionFlags`].
     pub motion: MotionFlags,
+    /// This axis's real CiA 402 (DS402) power-state, one layer more
+    /// detailed than [`AxisState`]. See [`Ds402State`] for why both exist.
+    pub ds402_state: Ds402State,
 }
 
 /// One axis's motion-control state, loosely modeled on the PLCopen
@@ -65,14 +85,14 @@ pub struct AxisFeedback {
 /// unlike PLCopen's own flat `BOOL` outputs.
 ///
 /// Several variants aren't raised by any backend yet — `backend-sim` only
-/// ever reports `StandStill`, `DiscreteMotion`, or `ErrorStop`. They're
-/// included now so this type doesn't need reshaping later, when enable/
-/// disable, homing, jogging, or coordinated moves (Step 2, deferred) arrive.
+/// ever reports `Disabled`, `StandStill`, `DiscreteMotion`, or `ErrorStop`
+/// (via [`Ds402State::axis_state`]). They're included now so this type
+/// doesn't need reshaping later, when homing, jogging, or coordinated moves
+/// (Step 2, deferred) arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisState {
-    /// Drive power stage off. Not raised by any backend yet — sim axes are
-    /// always enabled; a real CiA 402 drive will report this before it's
-    /// switched on.
+    /// Drive power stage off. Reported whenever the underlying
+    /// [`Ds402State`] is anything short of `OperationEnabled`.
     Disabled,
     /// A fault is latched (see [`AxisFeedback::fault`]); motion is stopped.
     ErrorStop,
@@ -92,6 +112,65 @@ pub enum AxisState {
     Homing,
 }
 
+/// One axis's real CiA 402 (DS402) power-state machine state — the actual
+/// state a servo drive's statusword reports, one layer more detailed than
+/// [`AxisState`].
+///
+/// The relationship between the two mirrors PLCopen itself: a real PLCopen
+/// motion controller manages a drive's DS402 state machine internally and
+/// exposes only the coarser `MC_ReadStatus` view (`AxisState`) to the
+/// application — the detailed drive state is exactly what PLCopen's own
+/// `ST_AxisStatus` structure exists to carry, as backend/vendor-specific
+/// detail beneath the standard bits. See [`Ds402State::axis_state`] for that
+/// mapping.
+///
+/// Omits DS402's transient `Not Ready to Switch On` pseudo-state (occupied
+/// only for an instant right after power-on, before self-test completes) —
+/// backends here start already past it, in `SwitchOnDisabled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ds402State {
+    /// Power stage off; not yet enabled. The startup state.
+    SwitchOnDisabled,
+    /// Enabled a first step: ready, but the power stage still isn't live.
+    ReadyToSwitchOn,
+    /// Power stage live, but not yet accepting motion commands.
+    SwitchedOn,
+    /// Fully enabled: power stage live and accepting motion commands. The
+    /// only state in which [`AxisFeedback::motion`] can be non-default.
+    OperationEnabled,
+    /// Controlled stop in progress after a quick-stop request. Not raised
+    /// by any backend yet — no quick-stop command exists yet.
+    QuickStopActive,
+    /// A fault was just detected; held for exactly one `exchange()` cycle
+    /// before automatically advancing to `Fault` (DS402 transition 14) —
+    /// mirrors a real drive's brief fault-handling window, even though
+    /// `backend-sim` has no braking dynamics to actually perform there.
+    FaultReactionActive,
+    /// A fault is latched; motion is stopped until
+    /// [`AxisSetpoint::fault_reset`] clears it (DS402 transition 15, back to
+    /// `SwitchOnDisabled`). Resetting doesn't re-enable the axis — that
+    /// still needs a fresh `enabled: true` afterward.
+    Fault,
+}
+
+impl Ds402State {
+    /// Maps this DS402 power-state to the coarser [`AxisState`] reported at
+    /// the `AxisGroup` trait level. `moving` only matters in
+    /// `OperationEnabled` — that's the only DS402 state in which the axis
+    /// can actually be executing motion.
+    pub fn axis_state(self, moving: bool) -> AxisState {
+        match self {
+            Ds402State::SwitchOnDisabled | Ds402State::ReadyToSwitchOn | Ds402State::SwitchedOn => {
+                AxisState::Disabled
+            }
+            Ds402State::OperationEnabled if moving => AxisState::DiscreteMotion,
+            Ds402State::OperationEnabled => AxisState::StandStill,
+            Ds402State::QuickStopActive => AxisState::Stopping,
+            Ds402State::FaultReactionActive | Ds402State::Fault => AxisState::ErrorStop,
+        }
+    }
+}
+
 /// Sub-flags describing motion in progress, alongside [`AxisState`].
 /// Unlike `AxisState`'s variants, these three are meant to mirror PLCopen's
 /// own flat bools directly — they're not a state machine, just "which part
@@ -105,12 +184,20 @@ pub struct MotionFlags {
 
 /// A fault reported by a backend for one axis.
 ///
-/// Deliberately minimal: no backend raises one of these yet. Real
-/// categories (following error exceeded, drive fault, not operational...)
-/// get added when a backend actually needs to report them (richer sim, or
-/// `backend-ethercat`).
+/// Deliberately minimal — categories get added when a backend actually
+/// needs to report them, not speculatively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisFault {
+    /// Removed `enabled` while the axis was actively moving. A real drive
+    /// can't safely just cut its power stage mid-motion the way it can from
+    /// rest (uncontrolled coast/stop) — `backend-sim` treats it as a fault
+    /// rather than a graceful disable, requiring [`AxisSetpoint::fault_reset`]
+    /// before it'll accept `enabled: true` again. A real quick-stop command
+    /// (DS402 `QuickStopActive`, not implemented yet) is the controlled way
+    /// to stop a moving axis without faulting.
+    DisabledWhileMoving,
+    /// Placeholder for fault categories no backend raises yet (following
+    /// error exceeded, drive fault, not operational...).
     Unspecified,
 }
 
@@ -178,6 +265,7 @@ mod tests {
                         fault: None,
                         state: AxisState::StandStill,
                         motion: MotionFlags::default(),
+                        ds402_state: Ds402State::OperationEnabled,
                     };
                     num_axes
                 ],
@@ -215,10 +303,14 @@ mod tests {
             AxisSetpoint {
                 position: 10.0,
                 velocity: 1.0,
+                enabled: true,
+                fault_reset: false,
             },
             AxisSetpoint {
                 position: 20.0,
                 velocity: 2.0,
+                enabled: true,
+                fault_reset: false,
             },
         ];
         let feedback = group.exchange(&setpoints).unwrap();
@@ -233,6 +325,8 @@ mod tests {
         let setpoints = [AxisSetpoint {
             position: 0.0,
             velocity: 0.0,
+            enabled: true,
+            fault_reset: false,
         }];
         let err = group.exchange(&setpoints).unwrap_err();
         assert_eq!(
