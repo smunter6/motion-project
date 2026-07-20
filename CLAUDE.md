@@ -63,18 +63,63 @@ over-produce; confirm direction at natural decision points.
   17 unit tests. `src/bin/demo_axis.rs` demos one move at 250 Hz.
 - `axis-backend`: the `AxisGroup` trait seam (`exchange()`, one combined
   cyclic call) + `AxisSetpoint`/`AxisFeedback`/`AxisFault`/`AxisGroupError`.
+  `AxisSetpoint` carries `enabled: bool` and `fault_reset: bool` — two
+  distinct cyclic fields, like real CiA 402 controlword bits (enable vs. the
+  edge-triggered Fault Reset bit), not one-off commands. `AxisFeedback`
+  carries a motion-control state machine at two layers: `AxisState`
+  (PLCopen `MC_ReadStatus`-flavored: `Disabled`/`StandStill`/
+  `DiscreteMotion`/`ErrorStop`/etc.) and, one layer more detailed,
+  `Ds402State` (the real CiA 402 power-state machine: `SwitchOnDisabled` ->
+  `ReadyToSwitchOn` -> `SwitchedOn` -> `OperationEnabled`, plus
+  `FaultReactionActive`/`Fault` — both now reachable — and reserved
+  `QuickStopActive`) — `Ds402State::axis_state()` maps the former from the
+  latter. Design settled 2026-07-20: the DS402 detail mirrors what
+  PLCopen's own `ST_AxisStatus` field exists for (vendor/backend-specific
+  detail beneath the standard bits), and lives at the trait level (not just
+  inside `backend-sim`) since `backend-ethercat` will need the same shape
+  later. Also carries `MotionFlags`
+  (`accelerating`/`constant_velocity`/`decelerating`). `AxisFault` has one
+  real category so far: `DisabledWhileMoving`.
 - `backend-sim`: `SimAxisGroup`, a software `AxisGroup` that integrates
-  velocity into position each cycle (dt-stepping, not a pass-through).
+  velocity into position each cycle (dt-stepping, not a pass-through), but
+  only while `OperationEnabled` — a disabled (or faulted) axis ignores
+  commanded velocity entirely, matching a real drive's power stage being
+  off. Steps the DS402 machine at most one transition per `exchange()`
+  cycle in either direction (enabling takes 3 cycles, ~12ms at 250 Hz), the
+  same way a real master/drive negotiate it one controlword write at a
+  time — not a simplification for its own sake, see `step_ds402`'s doc
+  comment. Design settled 2026-07-20: disabling a *moving* axis raises
+  `AxisFault::DisabledWhileMoving` and routes through
+  `FaultReactionActive` (held exactly one cycle) into latched `Fault`,
+  rather than gracefully stepping down — a real drive can't safely cut its
+  power stage mid-motion the way it can from rest. `Fault` only clears via
+  `fault_reset` (DS402 transition 15, to `SwitchOnDisabled`); resetting
+  does not itself re-enable the axis. Disabling from `StandStill` (never
+  actually moving) stays graceful, no fault. 18 unit tests total, including
+  dedicated coverage of the enable/disable sequence and the fault/reset
+  path (dev-dependency on `motion-core` lets some tests drive a real
+  `TrapezoidalProfile`'s sampled velocity through the sim rather than
+  hand-crafted sequences).
 - `app`: a continuously-running, multi-axis (`axis0`, `axis1`, `NUM_AXES`)
-  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]`, `status`,
-  `help`, `quit`. Fixed 250 Hz control loop on its own thread, decoupled
-  from blocking stdin by a channel. Each cycle samples the active
-  trajectory (or holds at rest if idle) into an `AxisSetpoint` per axis,
-  calls `SimAxisGroup::exchange` once, and treats the returned feedback as
-  ground truth for position/velocity — a new move's start is the axis's
-  *actual* (backend) position, not the last commanded one. Moves queue
-  (single slot per axis) while an axis is busy, block-until-idle. Axes are
-  fully independent — see Step 2, deferred.
+  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]`, `enable
+  <axisN>`, `disable <axisN>`, `reset <axisN>`, `status`, `help`, `quit`.
+  Fixed 250 Hz control loop on its own thread, decoupled from blocking
+  stdin by a channel. Each cycle samples the active trajectory (or holds at
+  rest if idle) into an `AxisSetpoint` per axis, calls
+  `SimAxisGroup::exchange` once, and treats the returned feedback as ground
+  truth for position/velocity — a new move's start is the axis's *actual*
+  (backend) position, not the last commanded one. Moves queue (single slot
+  per axis) while an axis is busy, block-until-idle. Axes are fully
+  independent — see Step 2, deferred. Axes start disabled (DS402
+  `SwitchOnDisabled`, matching real drive power-up); `move` on a disabled
+  axis is rejected, not queued. Disabling a moving axis faults it (position
+  freezes where it was, `Command::Enable` refuses outright while faulted —
+  not just while `SwitchOnDisabled` — so a premature `enable` sent during
+  the fault window can't silently "stick" and auto-fire the instant a later
+  `reset` clears it); `reset` clears the fault but requires a fresh
+  `enable` afterward, same as the backend. DS402 transitions print to the
+  terminal as the backend confirms them, and `status` shows the current
+  `Ds402State`.
 - `app`'s viz window (`app/src/viz.rs` + `app/src/recording.rs`): an
   eframe/egui_plot window baked into the `app` binary itself, not a separate
   crate. Input stays entirely terminal-driven — viz has no controls, it only
