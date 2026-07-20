@@ -14,14 +14,15 @@ use std::time::Instant;
 
 use axis_backend::{AxisFeedback, AxisGroup, AxisGroupError, AxisSetpoint};
 
-/// One control cycle's target-vs-actual data for one axis.
+/// One control cycle's exchange for one axis: the setpoint sent and the
+/// feedback read back, verbatim — whatever fields `axis-backend` carries,
+/// this captures all of them, so a future addition to `AxisSetpoint`/
+/// `AxisFeedback` doesn't also need a matching edit here.
 #[derive(Clone, Copy)]
 pub struct Sample {
     pub t: f64,
-    pub target_position: f64,
-    pub actual_position: f64,
-    pub target_velocity: f64,
-    pub actual_velocity: f64,
+    pub setpoint: AxisSetpoint,
+    pub feedback: AxisFeedback,
 }
 
 /// Bounded per-axis sample history, shared between the control-loop thread
@@ -52,10 +53,8 @@ impl History {
     fn push(&mut self, i: usize, setpoint: &AxisSetpoint, feedback: &AxisFeedback) {
         let sample = Sample {
             t: self.start.elapsed().as_secs_f64(),
-            target_position: setpoint.position,
-            actual_position: feedback.position,
-            target_velocity: setpoint.velocity,
-            actual_velocity: feedback.velocity,
+            setpoint: *setpoint,
+            feedback: *feedback,
         };
         let buf = &mut self.axes[i];
         if buf.len() == self.capacity {

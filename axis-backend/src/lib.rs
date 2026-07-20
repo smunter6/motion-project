@@ -49,6 +49,58 @@ pub struct AxisFeedback {
     /// backend that simply never uses it, rather than retrofitting fault
     /// handling once real hardware exists.
     pub fault: Option<AxisFault>,
+    /// This axis's motion-control state machine state. See [`AxisState`].
+    pub state: AxisState,
+    /// Sub-flags describing motion in progress, meaningful alongside
+    /// [`AxisState::DiscreteMotion`] (and, later, `ContinuousMotion`/
+    /// `SynchronizedMotion`). See [`MotionFlags`].
+    pub motion: MotionFlags,
+}
+
+/// One axis's motion-control state, loosely modeled on the PLCopen
+/// (IEC 61131-3 Part 4) `MC_ReadStatus` state machine — not an exact match,
+/// but a useful reference set of states, since `backend-ethercat` will
+/// eventually need to report a real CiA 402 drive's state through this same
+/// shape. Mutually exclusive by construction (an enum, not a pile of bools),
+/// unlike PLCopen's own flat `BOOL` outputs.
+///
+/// Several variants aren't raised by any backend yet — `backend-sim` only
+/// ever reports `StandStill`, `DiscreteMotion`, or `ErrorStop`. They're
+/// included now so this type doesn't need reshaping later, when enable/
+/// disable, homing, jogging, or coordinated moves (Step 2, deferred) arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxisState {
+    /// Drive power stage off. Not raised by any backend yet — sim axes are
+    /// always enabled; a real CiA 402 drive will report this before it's
+    /// switched on.
+    Disabled,
+    /// A fault is latched (see [`AxisFeedback::fault`]); motion is stopped.
+    ErrorStop,
+    /// Decelerating to a controlled stop after an abort. Not raised by any
+    /// backend yet — no abort/stop command exists yet.
+    Stopping,
+    /// At rest, no fault, ready to accept a move.
+    StandStill,
+    /// Executing a point-to-point move.
+    DiscreteMotion,
+    /// Executing a jog/velocity-mode move. Not raised by any backend yet.
+    ContinuousMotion,
+    /// Executing a coordinated multi-axis move. Not raised by any backend
+    /// yet — coordinated moves are Step 2, explicitly deferred.
+    SynchronizedMotion,
+    /// Executing a homing sequence. Not raised by any backend yet.
+    Homing,
+}
+
+/// Sub-flags describing motion in progress, alongside [`AxisState`].
+/// Unlike `AxisState`'s variants, these three are meant to mirror PLCopen's
+/// own flat bools directly — they're not a state machine, just "which part
+/// of the velocity profile is this axis in right now."
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MotionFlags {
+    pub accelerating: bool,
+    pub constant_velocity: bool,
+    pub decelerating: bool,
 }
 
 /// A fault reported by a backend for one axis.
@@ -124,6 +176,8 @@ mod tests {
                         position: 0.0,
                         velocity: 0.0,
                         fault: None,
+                        state: AxisState::StandStill,
+                        motion: MotionFlags::default(),
                     };
                     num_axes
                 ],

@@ -120,6 +120,7 @@ name = "backend-sim"
 version = "0.1.0"
 dependencies = [
  "axis-backend",
+ "motion-core",
 ]
 
 [[package]]

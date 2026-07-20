@@ -52,7 +52,7 @@ const STATUS_PRINT_PERIOD: Duration = Duration::from_millis(250);
 
 /// How much target-vs-actual history the viz window keeps per axis, in
 /// seconds. Older samples are dropped as new ones arrive.
-const HISTORY_SECONDS: f64 = 10.0;
+const HISTORY_SECONDS: f64 = 60.0;
 
 /// Number of independent axes the app manages, named `axis0`..`axis{N-1}`
 /// on the command line. Bumping this is the only change needed to add more

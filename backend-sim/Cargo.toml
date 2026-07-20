@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 axis-backend = { path = "../axis-backend" }
+
+[dev-dependencies]
+motion-core = { path = "../motion-core" }

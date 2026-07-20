@@ -29,7 +29,16 @@
 //! Richer dynamics (second-order lag, following-error limits, faults) are a
 //! deliberately later step — see CLAUDE.md's roadmap.
 
-use axis_backend::{AxisFeedback, AxisGroup, AxisGroupError, AxisSetpoint};
+use axis_backend::{AxisFeedback, AxisGroup, AxisGroupError, AxisSetpoint, AxisState, MotionFlags};
+
+/// Below this speed, an axis counts as "at rest" for [`AxisState`] purposes.
+const STANDSTILL_EPS: f64 = 1e-6;
+
+/// Below this per-cycle change in commanded speed, the axis counts as at
+/// constant velocity rather than accelerating/decelerating. Real ramps move
+/// by many multiples of this every cycle, so a tiny epsilon is enough to
+/// absorb float noise without misclassifying an actual ramp as "constant".
+const ACCEL_EPS: f64 = 1e-9;
 
 /// A software `AxisGroup`: `num_axes` independent axes, each integrating its
 /// own velocity setpoint into position at a fixed cycle time `dt`.
@@ -55,6 +64,8 @@ impl SimAxisGroup {
                     position: 0.0,
                     velocity: 0.0,
                     fault: None,
+                    state: AxisState::StandStill,
+                    motion: MotionFlags::default(),
                 };
                 num_axes
             ],
@@ -75,8 +86,34 @@ impl AxisGroup for SimAxisGroup {
             });
         }
         for (fb, sp) in self.feedback.iter_mut().zip(setpoints) {
-            fb.position += sp.velocity * self.dt;
-            fb.velocity = sp.velocity;
+            // `fb.velocity` still holds last cycle's commanded speed here —
+            // compare against this cycle's before overwriting it, to tell
+            // whether the axis is speeding up, at constant speed, or
+            // slowing down. No lag in this plant, so the commanded setpoint
+            // *is* the axis's actual speed each cycle.
+            let prev_speed = fb.velocity;
+            let speed = sp.velocity;
+
+            fb.position += speed * self.dt;
+            fb.velocity = speed;
+
+            let moving = speed.abs() > STANDSTILL_EPS;
+            fb.state = match fb.fault {
+                Some(_) => AxisState::ErrorStop,
+                None if moving => AxisState::DiscreteMotion,
+                None => AxisState::StandStill,
+            };
+
+            fb.motion = if !moving {
+                MotionFlags::default()
+            } else {
+                let delta = speed.abs() - prev_speed.abs();
+                MotionFlags {
+                    accelerating: delta > ACCEL_EPS,
+                    constant_velocity: delta.abs() <= ACCEL_EPS,
+                    decelerating: delta < -ACCEL_EPS,
+                }
+            };
         }
         Ok(&self.feedback)
     }
@@ -163,5 +200,151 @@ mod tests {
             }])
             .unwrap();
         assert!(fb[0].fault.is_none());
+    }
+
+    /// Drives one axis through a hand-crafted speed sequence (ramp up,
+    /// cruise, ramp down, stop) and checks `AxisState`/`MotionFlags` after
+    /// every cycle. Isolates the flag-transition logic itself, independent
+    /// of any real trajectory shape (see the trapezoidal-profile tests below
+    /// for that).
+    fn drive_and_check(sim: &mut SimAxisGroup, velocities: &[f64], expected: &[(AxisState, MotionFlags)]) {
+        assert_eq!(velocities.len(), expected.len());
+        for (i, (&velocity, &(want_state, want_motion))) in
+            velocities.iter().zip(expected).enumerate()
+        {
+            let fb = sim
+                .exchange(&[AxisSetpoint {
+                    position: 0.0,
+                    velocity,
+                }])
+                .unwrap();
+            assert_eq!(
+                fb[0].state, want_state,
+                "cycle {i}: velocity={velocity}, expected state {want_state:?}, got {:?}",
+                fb[0].state
+            );
+            assert_eq!(
+                fb[0].motion, want_motion,
+                "cycle {i}: velocity={velocity}, expected motion {want_motion:?}, got {:?}",
+                fb[0].motion
+            );
+        }
+    }
+
+    #[test]
+    fn state_and_motion_flags_track_a_hand_crafted_ramp_positive_direction() {
+        let mut sim = SimAxisGroup::new(1, 0.004);
+        let velocities = [0.0, 2.0, 4.0, 4.0, 4.0, 2.0, 0.0];
+        let accel = (AxisState::DiscreteMotion, MotionFlags { accelerating: true, constant_velocity: false, decelerating: false });
+        let cruise = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: true, decelerating: false });
+        let decel = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: false, decelerating: true });
+        let rest = (AxisState::StandStill, MotionFlags::default());
+        let expected = [rest, accel, accel, cruise, cruise, decel, rest];
+        drive_and_check(&mut sim, &velocities, &expected);
+    }
+
+    #[test]
+    fn state_and_motion_flags_track_a_hand_crafted_ramp_negative_direction() {
+        // Mirror image of the positive-direction case: the flags are
+        // defined on |speed| increasing/decreasing, not signed velocity, so
+        // this should classify identically to the positive case above.
+        let mut sim = SimAxisGroup::new(1, 0.004);
+        let velocities = [0.0, -2.0, -4.0, -4.0, -4.0, -2.0, 0.0];
+        let accel = (AxisState::DiscreteMotion, MotionFlags { accelerating: true, constant_velocity: false, decelerating: false });
+        let cruise = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: true, decelerating: false });
+        let decel = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: false, decelerating: true });
+        let rest = (AxisState::StandStill, MotionFlags::default());
+        let expected = [rest, accel, accel, cruise, cruise, decel, rest];
+        drive_and_check(&mut sim, &velocities, &expected);
+    }
+
+    /// Drives a real `motion_core::TrapezoidalProfile`'s sampled velocity
+    /// through `SimAxisGroup`, cycle by cycle at the app's real 250 Hz
+    /// control rate, and spot-checks state/motion flags at points well
+    /// inside each phase. Spot checks (rather than asserting every single
+    /// cycle) sidestep phase-boundary ambiguity: `phase_at(t)` switches
+    /// labels at an exact continuous-time boundary, but the *cycle* that
+    /// straddles that boundary can legitimately still show the previous
+    /// phase's flag (e.g. the first cycle `phase_at` calls "Cruise" can
+    /// still have a higher speed than the cycle before it, so it's fair for
+    /// `accelerating` to still be true on that one cycle).
+    fn assert_motion_flags_track_profile(start: f64, end: f64) {
+        use motion_core::{MotionPhase, TrapezoidalProfile};
+
+        let dt = 1.0 / 250.0;
+        // max_speed=50, accel=decel=200 => accel phase 0..0.25s, cruise
+        // 0.25..2.0s, decel 2.0..2.25s, total 2.25s duration (same numbers
+        // as CLAUDE.md's worked 0->100mm example).
+        let profile = TrapezoidalProfile::new(start, end, 50.0, 200.0, 200.0).unwrap();
+        let mut sim = SimAxisGroup::new(1, dt);
+
+        // (checkpoint time, expected phase) — each picked well inside its
+        // phase, at least 2 cycles' margin from any boundary.
+        let checkpoints = [
+            (0.10, MotionPhase::Accel),
+            (1.00, MotionPhase::Cruise),
+            (2.15, MotionPhase::Decel),
+        ];
+
+        let total_steps = (profile.duration() / dt).ceil() as i64 + 5;
+        for step in 1..=total_steps {
+            let t = step as f64 * dt;
+            let sample = profile.sample(t);
+            let fb = sim
+                .exchange(&[AxisSetpoint {
+                    position: sample.position,
+                    velocity: sample.velocity,
+                }])
+                .unwrap();
+
+            for &(checkpoint_t, expected_phase) in &checkpoints {
+                if (t - checkpoint_t).abs() > dt / 2.0 {
+                    continue;
+                }
+                assert_eq!(
+                    profile.phase_at(t),
+                    expected_phase,
+                    "test bug: checkpoint t={t} isn't actually in {expected_phase:?}"
+                );
+                assert_eq!(fb[0].state, AxisState::DiscreteMotion, "t={t}");
+                let motion = fb[0].motion;
+                match expected_phase {
+                    MotionPhase::Accel => assert!(
+                        motion.accelerating && !motion.constant_velocity && !motion.decelerating,
+                        "t={t}: expected accelerating, got {motion:?}"
+                    ),
+                    MotionPhase::Cruise => assert!(
+                        motion.constant_velocity && !motion.accelerating && !motion.decelerating,
+                        "t={t}: expected constant_velocity, got {motion:?}"
+                    ),
+                    MotionPhase::Decel => assert!(
+                        motion.decelerating && !motion.accelerating && !motion.constant_velocity,
+                        "t={t}: expected decelerating, got {motion:?}"
+                    ),
+                    _ => unreachable!("checkpoints are only Accel/Cruise/Decel"),
+                }
+            }
+        }
+
+        // Once the move is done and holding at rest, the axis settles to
+        // StandStill with no motion flags set.
+        let fb = sim
+            .exchange(&[AxisSetpoint {
+                position: end,
+                velocity: 0.0,
+            }])
+            .unwrap();
+        assert_eq!(fb[0].state, AxisState::StandStill);
+        assert_eq!(fb[0].motion, MotionFlags::default());
+    }
+
+    #[test]
+    fn motion_flags_track_a_real_trapezoidal_profile_positive_direction() {
+        assert_motion_flags_track_profile(0.0, 100.0);
+    }
+
+    #[test]
+    fn motion_flags_track_a_real_trapezoidal_profile_negative_direction() {
+        assert_motion_flags_track_profile(0.0, -100.0);
     }
 }
