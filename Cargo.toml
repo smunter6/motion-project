@@ -3,11 +3,11 @@ resolver = "2"
 members = [
     "motion-core",
     "axis-backend",
+    "backend-sim",
     "app",
 ]
 
 # As the project grows, new crates get added here:
-#   "backend-sim"       - software plant model implementing the axis-backend seam
 #   "backend-ethercat"  - EtherCRAB + CiA 402 implementation (when hardware arrives)
 #   "viz"               - simple 2D + plot visualization
 #

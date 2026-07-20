@@ -14,5 +14,12 @@ name = "axis-backend"
 version = "0.1.0"
 
 [[package]]
+name = "backend-sim"
+version = "0.1.0"
+dependencies = [
+ "axis-backend",
+]
+
+[[package]]
 name = "motion-core"
 version = "0.1.0"
