@@ -294,6 +294,90 @@ over-produce; confirm direction at natural decision points.
   it. Keeps `app` backend-agnostic the same way the trait seam itself is —
   a `backend-ethercat` swap-in only has to report the same `AxisState`
   values, not replicate `backend-sim`'s exact DS402 timing.
+- **Multi-waypoint path following** (added 2026-07-21, later the same day
+  as axis groups — picked up after the user declined a third axis/XYZ group
+  since `egui_plot` has no 3D support, not worth it just for a viz plot):
+  `motion_core::WaypointPath` (`motion-core/src/waypoint_path.rs`) is
+  geometry only — a smooth route through several N-dimensional waypoints via
+  **centripetal Catmull-Rom** (chosen for *local support*: each segment
+  depends only on its 4 nearest control points, so a per-segment
+  `SegmentKind::Line` override — force one leg straight, mirroring real
+  PLCopen/CNC path composition — doesn't perturb any other segment's
+  curvature), with **reflected phantom endpoints** (`P₋₁ = 2·P₀ − P₁`, not
+  duplication) for the first/last waypoint's missing neighbor — a
+  2-waypoint path degenerates to an exact straight line under this scheme
+  (verified to floating-point precision, and cross-checked against
+  `LinearMove` directly). Arc length has no closed form for a cubic, so each
+  segment gets its own lookup table (200 samples, built once at
+  construction) mapping arc-length to spline parameter; a query always
+  evaluates the *exact* curve at the LUT-refined parameter, never
+  interpolating stored LUT positions. `tangent_at_arc_length` uses a central
+  finite difference in the arc-length domain rather than an analytic
+  Catmull-Rom derivative — arc-length parameterization already gives
+  `|dP/ds| ~= 1`, so this is accurate enough for the velocity feed-forward
+  it exists for. `motion_core::PathProfile` (`path_profile.rs`) composes
+  this with a `TrapezoidalProfile` over the path's total arc length —
+  "reuse the existing scalar profile," the same pattern `LinearMove`
+  established for the one-segment case, completely unchanged. 61
+  motion-core tests total (up from 43).
+  **`app`**: `movepath <groupName> <n> <coord>...(n waypoints) [vmax] [amax]
+  [dmax]` — group-only (an axis target is rejected; a single-axis "path" is
+  just `move ... buffered` chaining). Reuses the hard-coded `AXIS_GROUPS`
+  table rather than the original shelved design's free-form per-command
+  axis list — an explicit user call ("that's exactly why I stopped to
+  implement [axis groups] first"), since it costs nothing new to wire and
+  gains full reuse of the existing group machinery. Every segment defaults
+  to `SegmentKind::Spline` (the type supports `Line`, no CLI syntax for it
+  yet). **Deliberately idle-group-only, no queueing or `BufferMode`** — a
+  busy group's `movepath` is rejected outright, pointing at `stop`; this was
+  the original design's own scope call, re-confirmed rather than assumed
+  still right. `install_path_move` prepends the group's actual current
+  position as the path's own start waypoint (same "start is actual
+  feedback" rule every other move follows) and installs the fresh
+  `PathProfile` atomically across every member, mirroring
+  `install_group_move` exactly. A new `Profile::Path { shared:
+  Rc<SharedPathMove>, index }` variant sits alongside `Profile::Group`;
+  `SharedPathMove` mirrors `SharedGroupMove`'s shape exactly. The group
+  interruption cascade (`group_of`/`cascade_group_stop`) is **generalized,
+  not duplicated**, via a small `ActiveGroupMove` enum
+  (`Group(Rc<SharedGroupMove>) | Path(Rc<SharedPathMove>)`) with
+  `axes()`/`group()`/`max_deceleration()`/`still_drives()` accessors, since
+  `LinearMove` and `PathProfile` don't share a trait — the same cascade
+  function now handles both move kinds. `print_status`'s group-active
+  detection was generalized the same way. Live-verified against the built
+  binary: a 3-waypoint path traced correctly (including a genuine,
+  correct mid-path dip from spline curvature, not a bug); `movepath` on a
+  busy group was cleanly rejected without disturbing the in-flight move; a
+  plain single-axis `move` queued behind a busy group member and fired once
+  the group move finished; `stop axis0` mid-`movepath` correctly cascaded
+  `axis1` into its own `StopRamp`, confirming the cascade generalization
+  actually works for path moves, not just group moves.
+  **`movepath ... file <path>`** (added 2026-07-21, right after the above —
+  the user's call that the inline `<n> <coord>...` form "might be too
+  complex for an interactive mode app" past a handful of waypoints):
+  `parse_move_path` now dispatches on whether the first token after the
+  target is the literal `"file"` (`parse_move_path_file`) or a waypoint
+  count (`parse_move_path_inline`, the original form, unchanged) — both
+  converge on the identical `Command::MovePath`, so nothing downstream (the
+  control loop, `install_path_move`) needed to change at all. File format:
+  one waypoint per line, `coord_count` whitespace-separated numbers, blank
+  lines skipped, no comment syntax. Reading happens on the stdin-reading
+  thread inside `parse_command` (same place every other parse error is
+  already handled), not in the control loop. `read_waypoints_file` is a
+  thin `std::fs::read_to_string` wrapper around a separate, pure
+  `parse_waypoint_lines(contents, coord_count)` — split out specifically so
+  the line-parsing logic (blank-line skipping, per-line coordinate-count
+  and numeric validation, line-numbered error messages) stays unit-testable
+  without touching the filesystem; only two tests actually exercise real
+  files (a round-trip through a temp file, and a missing-file error).
+  Trailing `[vmax] [amax] [dmax]` parsing was extracted into a shared
+  `parse_kinematic_limits` helper used by both forms. Live-verified against
+  the built binary: a 4-waypoint file drove the group through to the exact
+  final waypoint, and a missing file produced a clean rejection message
+  without touching loop state.
+  **What's left**: per-segment `Line` override CLI syntax (from either
+  `movepath` form), `movepath` queueing/aborting, file-format comments
+  (deliberately out of scope so far).
 - `app`'s viz window (`app/src/viz.rs` + `app/src/recording.rs`): an
   eframe/egui_plot window baked into the `app` binary itself, not a separate
   crate. Input stays entirely terminal-driven — viz has no controls, it only
