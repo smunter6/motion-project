@@ -32,7 +32,7 @@ use std::fmt;
 /// `motion-core`. Conversion to whatever a real drive actually wants
 /// (integer encoder counts) is `backend-ethercat`'s job at its side of this
 /// seam, not this type's.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AxisSetpoint {
     pub position: f64,
     pub velocity: f64,
@@ -55,6 +55,19 @@ pub struct AxisSetpoint {
     /// run the normal sequence, the same way a real operator has to
     /// acknowledge a fault before re-enabling.
     pub fault_reset: bool,
+    /// True while a commanded stop (PLCopen `MC_Stop`) is decelerating this
+    /// axis to rest.
+    ///
+    /// Deliberately **not** DS402's Quick Stop — that's a distinct,
+    /// typically emergency/safety-triggered mechanism with its own
+    /// [`Ds402State::QuickStopActive`], unaffected by this flag. From the
+    /// drive's own point of view a commanded stop is nothing special: it's
+    /// still just an ordinary decelerating velocity setpoint sent every
+    /// cycle in `OperationEnabled`, same as the tail end of any move. This
+    /// flag only changes what [`AxisFeedback::state`] reports at the
+    /// coarser PLCopen layer (`Stopping` instead of `DiscreteMotion`) —
+    /// `ds402_state` is unaffected by it entirely.
+    pub stopping: bool,
 }
 
 /// A single control-cycle feedback reading for one axis.
@@ -85,10 +98,10 @@ pub struct AxisFeedback {
 /// unlike PLCopen's own flat `BOOL` outputs.
 ///
 /// Several variants aren't raised by any backend yet — `backend-sim` only
-/// ever reports `Disabled`, `StandStill`, `DiscreteMotion`, or `ErrorStop`
-/// (via [`Ds402State::axis_state`]). They're included now so this type
-/// doesn't need reshaping later, when homing, jogging, or coordinated moves
-/// (Step 2, deferred) arrive.
+/// ever reports `Disabled`, `StandStill`, `DiscreteMotion`, `Stopping`, or
+/// `ErrorStop`. They're included now so this type doesn't need reshaping
+/// later, when homing, jogging, or coordinated moves (Step 2, deferred)
+/// arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisState {
     /// Drive power stage off. Reported whenever the underlying
@@ -96,8 +109,10 @@ pub enum AxisState {
     Disabled,
     /// A fault is latched (see [`AxisFeedback::fault`]); motion is stopped.
     ErrorStop,
-    /// Decelerating to a controlled stop after an abort. Not raised by any
-    /// backend yet — no abort/stop command exists yet.
+    /// Decelerating to a controlled stop after a commanded stop (see
+    /// [`AxisSetpoint::stopping`]) — reported instead of `DiscreteMotion`
+    /// while decelerating for that reason. Not the same thing as DS402's
+    /// `QuickStopActive`; see `stopping`'s own docs for why.
     Stopping,
     /// At rest, no fault, ready to accept a move.
     StandStill,
@@ -305,12 +320,14 @@ mod tests {
                 velocity: 1.0,
                 enabled: true,
                 fault_reset: false,
+                stopping: false,
             },
             AxisSetpoint {
                 position: 20.0,
                 velocity: 2.0,
                 enabled: true,
                 fault_reset: false,
+                stopping: false,
             },
         ];
         let feedback = group.exchange(&setpoints).unwrap();
@@ -326,7 +343,7 @@ mod tests {
             position: 0.0,
             velocity: 0.0,
             enabled: true,
-            fault_reset: false,
+            ..Default::default()
         }];
         let err = group.exchange(&setpoints).unwrap_err();
         assert_eq!(

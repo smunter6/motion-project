@@ -26,4 +26,4 @@
 
 pub mod trajectory;
 
-pub use trajectory::{MotionPhase, TrajectorySample, TrapezoidalProfile};
+pub use trajectory::{MotionPhase, StopRamp, TrajectorySample, TrapezoidalProfile};

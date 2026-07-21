@@ -88,6 +88,9 @@ pub enum TrajectoryError {
     InvalidMaxAcceleration(f64),
     /// `max_deceleration` must be a finite, positive number.
     InvalidMaxDeceleration(f64),
+    /// `position` or `velocity` passed to [`StopRamp::new`] is NaN or
+    /// +/-infinity.
+    NonFiniteStopState { position: f64, velocity: f64 },
 }
 
 impl std::fmt::Display for TrajectoryError {
@@ -107,6 +110,10 @@ impl std::fmt::Display for TrajectoryError {
             TrajectoryError::InvalidMaxDeceleration(d) => write!(
                 f,
                 "max_deceleration must be a finite, positive number (got {d})"
+            ),
+            TrajectoryError::NonFiniteStopState { position, velocity } => write!(
+                f,
+                "position ({position}) and velocity ({velocity}) must both be finite numbers"
             ),
         }
     }
@@ -388,6 +395,122 @@ impl TrapezoidalProfile {
         TrajectorySample {
             position: self.start + self.direction * pos_along,
             velocity: self.direction * speed_along,
+        }
+    }
+}
+
+/// A controlled deceleration to rest from wherever an axis actually is right
+/// now — the mirror image of [`TrapezoidalProfile`]'s rest-to-rest move.
+///
+/// This is what backs a commanded stop (PLCopen `MC_Stop`): unlike a move,
+/// there's no target position to aim for and no accel/cruise phase, just
+/// "decelerate from `start_velocity` to zero at `max_deceleration`, holding
+/// wherever that lands." `TrapezoidalProfile` can't represent this itself —
+/// it always assumes both ends are at rest — hence a separate, much simpler
+/// type rather than generalizing it.
+///
+/// Same absolute-time, pure-function-of-`t` model as `TrapezoidalProfile`
+/// (see the module docs' "Time model" section) — no mutable state here
+/// either.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StopRamp {
+    start_position: f64,
+    start_velocity: f64,
+    decel: f64,
+    /// Sign of `start_velocity`. Irrelevant (never actually used, since it's
+    /// always multiplied by a clamped `t` that's forced to `0.0`) when
+    /// `start_velocity == 0.0` — `f64::signum()` returns +/-1.0 even for
+    /// zero, never 0.0, but that's harmless here.
+    direction: f64,
+    /// Time to reach zero velocity: `|start_velocity| / decel`.
+    t_stop: f64,
+    /// Position once at rest — precomputed rather than recovered by
+    /// resampling at `t_stop`, matching `TrapezoidalProfile::target()`'s own
+    /// style (a stored field, not a recomputation).
+    final_position: f64,
+}
+
+impl StopRamp {
+    /// Build a stop ramp from the axis's *actual* current position and
+    /// velocity (backend feedback, not a commanded setpoint — same
+    /// "feedback is ground truth" principle a new move's start already
+    /// follows).
+    ///
+    /// `max_deceleration` must be finite and > 0; `start_position` and
+    /// `start_velocity` must both be finite. `start_velocity` may be any
+    /// sign (or zero, in which case the ramp has zero duration — the axis
+    /// was already at rest, so there's nothing to decelerate).
+    pub fn new(
+        start_position: f64,
+        start_velocity: f64,
+        max_deceleration: f64,
+    ) -> Result<Self, TrajectoryError> {
+        if !start_position.is_finite() || !start_velocity.is_finite() {
+            return Err(TrajectoryError::NonFiniteStopState {
+                position: start_position,
+                velocity: start_velocity,
+            });
+        }
+        if !(max_deceleration.is_finite() && max_deceleration > 0.0) {
+            return Err(TrajectoryError::InvalidMaxDeceleration(max_deceleration));
+        }
+
+        let direction = start_velocity.signum();
+        let t_stop = start_velocity.abs() / max_deceleration;
+        // v^2 = 2*a*d => d = v^2/(2a), signed by direction of travel.
+        let final_position =
+            start_position + direction * (start_velocity.abs() * start_velocity.abs()) / (2.0 * max_deceleration);
+
+        Ok(Self {
+            start_position,
+            start_velocity,
+            decel: max_deceleration,
+            direction,
+            t_stop,
+            final_position,
+        })
+    }
+
+    /// Total duration of the ramp in seconds — `0.0` if the axis was already
+    /// at rest.
+    pub fn duration(&self) -> f64 {
+        self.t_stop
+    }
+
+    /// The position the axis comes to rest at.
+    pub fn target(&self) -> f64 {
+        self.final_position
+    }
+
+    /// Which phase the ramp is in at elapsed time `t` (seconds since the
+    /// stop was commanded).
+    ///
+    /// Only ever `Pre`, `Decel`, or `Done` — never `Accel`/`Cruise`, there
+    /// are no such phases here. Unlike `TrapezoidalProfile::phase_at`
+    /// (where a zero-distance move reports `Pre` forever — see its own
+    /// docs), a zero-duration stop reports `Done` immediately for any
+    /// `t >= 0.0`: the axis was already at rest, so there's genuinely
+    /// nothing pending, not an ambiguous "already there" case.
+    pub fn phase_at(&self, t: f64) -> MotionPhase {
+        if t < 0.0 {
+            MotionPhase::Pre
+        } else if t >= self.t_stop {
+            MotionPhase::Done
+        } else {
+            MotionPhase::Decel
+        }
+    }
+
+    /// Sample the ramp at elapsed time `t` (seconds since the stop was
+    /// commanded). Clamped the same way `TrapezoidalProfile::sample` is:
+    /// `t < 0` returns the starting state, `t > duration` holds at rest at
+    /// [`target`](Self::target).
+    pub fn sample(&self, t: f64) -> TrajectorySample {
+        let t = t.clamp(0.0, self.t_stop);
+        TrajectorySample {
+            position: self.start_position + self.start_velocity * t
+                - self.direction * 0.5 * self.decel * t * t,
+            velocity: self.start_velocity - self.direction * self.decel * t,
         }
     }
 }
@@ -688,6 +811,95 @@ mod tests {
         match TrapezoidalProfile::new(0.0, 100.0, 50.0, f64::NAN, 100.0) {
             Err(TrajectoryError::InvalidMaxAcceleration(a)) => assert!(a.is_nan()),
             other => panic!("expected InvalidMaxAcceleration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_ramp_decelerates_positive_velocity_to_rest() {
+        // v0=40, decel=100 => t_stop=0.4s, distance = v^2/(2a) = 1600/200 = 8.
+        let r = StopRamp::new(10.0, 40.0, 100.0).unwrap();
+        assert!(approx(r.duration(), 0.4));
+        assert!(approx(r.target(), 18.0));
+        assert!(approx(r.sample(0.0).position, 10.0));
+        assert!(approx(r.sample(0.0).velocity, 40.0));
+        assert!(approx(r.sample(r.duration()).position, 18.0));
+        assert!(approx(r.sample(r.duration()).velocity, 0.0));
+        // Halfway through in time, velocity should be linearly halved.
+        let mid = r.sample(0.2);
+        assert!(approx(mid.velocity, 20.0));
+    }
+
+    #[test]
+    fn stop_ramp_decelerates_negative_velocity_to_rest() {
+        // Mirror image: v0=-40, decel=100 => same duration/distance, opposite sign.
+        let r = StopRamp::new(10.0, -40.0, 100.0).unwrap();
+        assert!(approx(r.duration(), 0.4));
+        assert!(approx(r.target(), 2.0));
+        assert!(approx(r.sample(r.duration()).position, 2.0));
+        assert!(approx(r.sample(r.duration()).velocity, 0.0));
+        let mid = r.sample(0.2);
+        assert!(approx(mid.velocity, -20.0));
+    }
+
+    #[test]
+    fn stop_ramp_from_rest_is_instantly_done() {
+        let r = StopRamp::new(5.0, 0.0, 100.0).unwrap();
+        assert!(approx(r.duration(), 0.0));
+        assert!(approx(r.target(), 5.0));
+        // Unlike TrapezoidalProfile's zero-distance case (always Pre), a
+        // zero-duration stop is Done for any t >= 0 — nothing pending.
+        assert_eq!(r.phase_at(0.0), MotionPhase::Done);
+        assert_eq!(r.phase_at(1.0), MotionPhase::Done);
+        assert_eq!(r.phase_at(-1.0), MotionPhase::Pre);
+    }
+
+    #[test]
+    fn stop_ramp_clamps_before_and_after() {
+        let r = StopRamp::new(0.0, 40.0, 100.0).unwrap();
+        let before = r.sample(-5.0);
+        assert!(approx(before.position, 0.0));
+        assert!(approx(before.velocity, 40.0));
+        let after = r.sample(r.duration() + 5.0);
+        assert!(approx(after.position, r.target()));
+        assert!(approx(after.velocity, 0.0));
+    }
+
+    #[test]
+    fn stop_ramp_phase_at_reports_decel_then_done() {
+        let r = StopRamp::new(0.0, 40.0, 100.0).unwrap();
+        assert_eq!(r.phase_at(-1.0), MotionPhase::Pre);
+        assert_eq!(r.phase_at(0.0), MotionPhase::Decel);
+        assert_eq!(r.phase_at(r.duration() / 2.0), MotionPhase::Decel);
+        assert_eq!(r.phase_at(r.duration()), MotionPhase::Done);
+        assert_eq!(r.phase_at(r.duration() + 1.0), MotionPhase::Done);
+    }
+
+    #[test]
+    fn stop_ramp_rejects_non_positive_max_deceleration() {
+        assert_eq!(
+            StopRamp::new(0.0, 40.0, 0.0),
+            Err(TrajectoryError::InvalidMaxDeceleration(0.0))
+        );
+        assert_eq!(
+            StopRamp::new(0.0, 40.0, -10.0),
+            Err(TrajectoryError::InvalidMaxDeceleration(-10.0))
+        );
+    }
+
+    #[test]
+    fn stop_ramp_rejects_non_finite_inputs() {
+        match StopRamp::new(f64::NAN, 40.0, 100.0) {
+            Err(TrajectoryError::NonFiniteStopState { position, velocity }) => {
+                assert!(position.is_nan());
+                assert!(approx(velocity, 40.0));
+            }
+            other => panic!("expected NonFiniteStopState, got {other:?}"),
+        }
+        match StopRamp::new(0.0, f64::INFINITY, 100.0) {
+            Err(TrajectoryError::NonFiniteStopState { velocity, .. }) => {
+                assert!(velocity.is_infinite());
+            }
+            other => panic!("expected NonFiniteStopState, got {other:?}"),
         }
     }
 }

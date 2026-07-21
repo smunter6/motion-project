@@ -74,7 +74,9 @@ const ACCEL_EPS: f64 = 1e-9;
 /// before re-enabling.
 ///
 /// `QuickStopActive` isn't reachable yet — no quick-stop command exists —
-/// held in place if ever reached.
+/// held in place if ever reached. Unlike the fault path, a *commanded*
+/// stop (`AxisSetpoint::stopping`) never touches this state machine at
+/// all — see `exchange`'s handling of it and `stopping`'s own docs for why.
 fn step_ds402(current: Ds402State, enabled: bool, fault_reset: bool, fault_detected: bool) -> Ds402State {
     use Ds402State::*;
 
@@ -182,7 +184,16 @@ impl AxisGroup for SimAxisGroup {
             fb.velocity = speed;
 
             let moving = speed.abs() > STANDSTILL_EPS;
-            fb.state = fb.ds402_state.axis_state(moving);
+            let base_state = fb.ds402_state.axis_state(moving);
+            // A commanded stop only ever changes the coarser AxisState, not
+            // Ds402State — see AxisSetpoint::stopping's docs for why. Only
+            // ever replaces DiscreteMotion: a stop request sent while
+            // Disabled/ErrorStop/etc. changes nothing.
+            fb.state = if sp.stopping && base_state == AxisState::DiscreteMotion {
+                AxisState::Stopping
+            } else {
+                base_state
+            };
 
             fb.motion = if !moving {
                 MotionFlags::default()
@@ -218,7 +229,7 @@ mod tests {
                     position: 0.0,
                     velocity: 0.0,
                     enabled: true,
-                    fault_reset: false,
+                    ..Default::default()
                 };
                 num_axes
             ];
@@ -234,7 +245,7 @@ mod tests {
             position: 0.0,
             velocity: 5.0,
             enabled: true,
-            fault_reset: false,
+            ..Default::default()
         }];
 
         let fb = sim.exchange(&setpoints).unwrap();
@@ -256,7 +267,7 @@ mod tests {
             position: 999.0,
             velocity: -3.0,
             enabled: true,
-            fault_reset: false,
+            ..Default::default()
         }];
         let fb = sim.exchange(&setpoints).unwrap();
         assert_eq!(fb[0].velocity, -3.0);
@@ -272,13 +283,13 @@ mod tests {
                 position: 0.0,
                 velocity: 10.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             },
             AxisSetpoint {
                 position: 0.0,
                 velocity: -4.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             },
         ];
         let fb = sim.exchange(&setpoints).unwrap();
@@ -294,7 +305,7 @@ mod tests {
                 position: 0.0,
                 velocity: 0.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap_err();
         assert_eq!(
@@ -314,7 +325,7 @@ mod tests {
                 position: 0.0,
                 velocity: 1.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap();
         assert!(fb[0].fault.is_none());
@@ -335,7 +346,7 @@ mod tests {
                     position: 0.0,
                     velocity,
                     enabled: true,
-                    fault_reset: false,
+                    ..Default::default()
                 }])
                 .unwrap();
             assert_eq!(
@@ -418,7 +429,7 @@ mod tests {
                     position: sample.position,
                     velocity: sample.velocity,
                     enabled: true,
-                    fault_reset: false,
+                    ..Default::default()
                 }])
                 .unwrap();
 
@@ -458,7 +469,7 @@ mod tests {
                 position: end,
                 velocity: 0.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap();
         assert_eq!(fb[0].state, AxisState::StandStill);
@@ -485,8 +496,7 @@ mod tests {
             .exchange(&[AxisSetpoint {
                 position: 0.0,
                 velocity: 0.0,
-                enabled: false,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::SwitchOnDisabled);
@@ -501,7 +511,7 @@ mod tests {
                 position: 0.0,
                 velocity: 0.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap()[0]
                 .ds402_state
@@ -523,8 +533,7 @@ mod tests {
             sim.exchange(&[AxisSetpoint {
                 position: 0.0,
                 velocity: 0.0,
-                enabled: false,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap()[0]
                 .ds402_state
@@ -549,7 +558,7 @@ mod tests {
                     position: 0.0,
                     velocity: 0.0,
                     enabled: true,
-                    fault_reset: false,
+                    ..Default::default()
                 }])
                 .unwrap();
             assert_eq!(fb[0].state, AxisState::Disabled);
@@ -561,7 +570,7 @@ mod tests {
                 position: 0.0,
                 velocity: 0.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::OperationEnabled);
@@ -579,8 +588,7 @@ mod tests {
                 .exchange(&[AxisSetpoint {
                     position: 0.0,
                     velocity: 100.0,
-                    enabled: false,
-                    fault_reset: false,
+                    ..Default::default()
                 }])
                 .unwrap();
             assert_eq!(fb[0].position, 0.0);
@@ -603,8 +611,7 @@ mod tests {
             .exchange(&[AxisSetpoint {
                 position: 0.0,
                 velocity: 0.0,
-                enabled: false,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::SwitchedOn);
@@ -621,7 +628,7 @@ mod tests {
             position: 0.0,
             velocity: 5.0,
             enabled: true,
-            fault_reset: false,
+            ..Default::default()
         };
         sim.exchange(&[move_setpoint]).unwrap();
         let fb = sim.exchange(&[move_setpoint]).unwrap();
@@ -634,8 +641,7 @@ mod tests {
         let disable_setpoint = AxisSetpoint {
             position: 0.0,
             velocity: 5.0,
-            enabled: false,
-            fault_reset: false,
+            ..Default::default()
         };
         let fb = sim.exchange(&[disable_setpoint]).unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::FaultReactionActive);
@@ -657,7 +663,7 @@ mod tests {
                 position: 0.0,
                 velocity: 0.0,
                 enabled: true,
-                fault_reset: false,
+                ..Default::default()
             }])
             .unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::Fault);
@@ -672,15 +678,14 @@ mod tests {
             position: 0.0,
             velocity: 5.0,
             enabled: true,
-            fault_reset: false,
+            ..Default::default()
         };
         sim.exchange(&[move_setpoint]).unwrap();
 
         let disable_setpoint = AxisSetpoint {
             position: 0.0,
             velocity: 5.0,
-            enabled: false,
-            fault_reset: false,
+            ..Default::default()
         };
         sim.exchange(&[disable_setpoint]).unwrap(); // -> FaultReactionActive
         let fb = sim.exchange(&[disable_setpoint]).unwrap(); // -> Fault
@@ -693,8 +698,8 @@ mod tests {
             .exchange(&[AxisSetpoint {
                 position: 0.0,
                 velocity: 0.0,
-                enabled: false,
                 fault_reset: true,
+                ..Default::default()
             }])
             .unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::SwitchOnDisabled);
@@ -707,7 +712,7 @@ mod tests {
             position: 0.0,
             velocity: 0.0,
             enabled: true,
-            fault_reset: false,
+            ..Default::default()
         };
         assert_eq!(
             sim.exchange(&[enable_setpoint]).unwrap()[0].ds402_state,
@@ -733,9 +738,90 @@ mod tests {
                 velocity: 0.0,
                 enabled: true,
                 fault_reset: true,
+                ..Default::default()
             }])
             .unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::OperationEnabled);
         assert!(fb[0].fault.is_none());
+    }
+
+    #[test]
+    fn stopping_flag_reports_stopping_instead_of_discrete_motion_while_moving() {
+        let mut sim = SimAxisGroup::new(1, 0.004);
+        warm_up_enabled(&mut sim, 1);
+
+        // Moving normally: DiscreteMotion, as always.
+        let fb = sim
+            .exchange(&[AxisSetpoint {
+                position: 0.0,
+                velocity: 10.0,
+                enabled: true,
+                ..Default::default()
+            }])
+            .unwrap();
+        assert_eq!(fb[0].state, AxisState::DiscreteMotion);
+        assert_eq!(fb[0].ds402_state, Ds402State::OperationEnabled);
+
+        // Same commanded motion, but `stopping: true` this cycle: the
+        // coarser AxisState reports Stopping instead — Ds402State is
+        // unaffected, still OperationEnabled, and MotionFlags still
+        // reflect the real physical deceleration.
+        let fb = sim
+            .exchange(&[AxisSetpoint {
+                position: 0.0,
+                velocity: 5.0,
+                enabled: true,
+                stopping: true,
+                ..Default::default()
+            }])
+            .unwrap();
+        assert_eq!(fb[0].state, AxisState::Stopping);
+        assert_eq!(fb[0].ds402_state, Ds402State::OperationEnabled);
+        assert!(fb[0].motion.decelerating);
+
+        // Once at rest, StandStill — the stopping flag no longer matters,
+        // same as PLCopen's Stopping -> StandStill once the stop completes.
+        let fb = sim
+            .exchange(&[AxisSetpoint {
+                position: 0.0,
+                velocity: 0.0,
+                enabled: true,
+                stopping: true,
+                ..Default::default()
+            }])
+            .unwrap();
+        assert_eq!(fb[0].state, AxisState::StandStill);
+    }
+
+    #[test]
+    fn stopping_flag_is_a_no_op_when_not_moving_or_not_operational() {
+        // stopping=true while already at rest: still StandStill, not
+        // Stopping — there's nothing to stop.
+        let mut sim = SimAxisGroup::new(1, 0.004);
+        warm_up_enabled(&mut sim, 1);
+        let fb = sim
+            .exchange(&[AxisSetpoint {
+                position: 0.0,
+                velocity: 0.0,
+                enabled: true,
+                stopping: true,
+                ..Default::default()
+            }])
+            .unwrap();
+        assert_eq!(fb[0].state, AxisState::StandStill);
+
+        // stopping=true on a disabled axis: still Disabled, not Stopping —
+        // a stop request is meaningless for an axis that was never moving
+        // in the first place.
+        let mut sim = SimAxisGroup::new(1, 0.004);
+        let fb = sim
+            .exchange(&[AxisSetpoint {
+                position: 0.0,
+                velocity: 0.0,
+                stopping: true,
+                ..Default::default()
+            }])
+            .unwrap();
+        assert_eq!(fb[0].state, AxisState::Disabled);
     }
 }
