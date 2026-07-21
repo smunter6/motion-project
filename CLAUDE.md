@@ -87,7 +87,30 @@ over-produce; confirm direction at natural decision points.
   max_speed/max_acceleration/max_deceleration govern the *entire* resulting
   profile, including any reversal preamble — no blending or carryover from
   whatever move was superseded. `new()` is now a verified bit-identical thin
-  wrapper (`start_velocity: 0.0`). 32 unit tests total.
+  wrapper (`start_velocity: 0.0`). Also **`LinearMove`** (added 2026-07-21,
+  `src/linear_move.rs`): a straight-line move across several axes at once —
+  the kinematic foundation for `app`'s hard-coded axis groups. Deliberately
+  *not* the general spline/waypoint path-following design drafted (but
+  shelved) earlier the same day — that's full Catmull-Rom + arc-length-LUT
+  machinery, overkill for what's fundamentally one scalar
+  `TrapezoidalProfile` over the Euclidean distance between an N-dimensional
+  start and end point, composed with a fixed unit-direction vector per axis
+  (`position[i] = start[i] + unit_direction[i] * scalar.position`, velocity
+  likewise) — reusing `TrapezoidalProfile`/`new_with_start_velocity`
+  completely unchanged, the same "reuse the existing scalar profile" pattern
+  `StopRamp` and path-following would also use. `new_with_start_velocity`
+  projects the actual N-dimensional velocity onto the new line's unit
+  direction via a dot product, reducing straight back to the scalar
+  problem `TrapezoidalProfile::new_with_start_velocity` already solves
+  completely. **Known, accepted limitation**: the velocity component
+  perpendicular to the new line is discarded, not reconciled — a genuine
+  velocity discontinuity (not just an acceleration one) at the redirect
+  instant if the axes' actual velocity wasn't already parallel to the new
+  line; only reachable via `app`'s `aborting` group moves (the cascade path,
+  where other members get their own `StopRamp`, is fully vector-correct and
+  unaffected). `MAX_GROUP_AXES = 6` bounds the per-cycle `LinearMoveSample`
+  to a fixed-size, `Copy`, zero-allocation struct, matching this crate's
+  no-heap-in-the-hot-path discipline. 43 unit tests total.
 - `axis-backend`: the `AxisGroup` trait seam (`exchange()`, one combined
   cyclic call) + `AxisSetpoint`/`AxisFeedback`/`AxisFault`/`AxisGroupError`.
   `AxisSetpoint` carries `enabled: bool` and `fault_reset: bool` — two
@@ -140,9 +163,10 @@ over-produce; confirm direction at natural decision points.
   `TrapezoidalProfile`'s sampled velocity through the sim rather than
   hand-crafted sequences).
 - `app`: a continuously-running, multi-axis (`axis0`, `axis1`, `NUM_AXES`)
-  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]
-  [aborting|buffered]`, `stop <axisN> [decel]`, `enable <axisN>`, `disable
-  <axisN>`, `reset <axisN>`, `status`, `help`, `quit`. Fixed 250 Hz control
+  terminal app — `move <axisN|groupName> <target...> [vmax] [amax] [dmax]
+  [aborting|buffered]`, `stop <axisN|groupName> [decel]`, `enable
+  <axisN|groupName>`, `disable <axisN|groupName>`, `reset
+  <axisN|groupName>`, `status`, `help`, `quit`. Fixed 250 Hz control
   loop on its own thread, decoupled from blocking stdin by a channel. Each
   cycle samples the active trajectory (or holds at rest if idle) into an
   `AxisSetpoint` per axis, calls `SimAxisGroup::exchange` once, and treats
@@ -192,6 +216,69 @@ over-produce; confirm direction at natural decision points.
   reversed — without waiting for it to reach rest first. Only
   `Aborting`/`Buffered` so far; the four PLCopen blending variants are a
   deferred, structurally different problem (see the memory).
+  **Axis groups** (added 2026-07-21): a hard-coded `AXIS_GROUPS` const table
+  (`axisGroup0` = `axis0`+`axis1`, a Cartesian pair) — not created/removed at
+  runtime, deliberately simpler than PLCopen's real axis-group model. Every
+  existing verb (`enable`/`disable`/`reset`/`stop`/`move`) accepts a group
+  name in place of an axis name (`Target` enum + `parse_target`, tried
+  before falling back to `parse_axis`); `enable`/`disable`/`reset`/`stop` on
+  a group just fan the identical per-axis logic (now extracted into
+  `handle_enable`/`handle_disable`/`handle_reset`/`handle_stop`, called once
+  per member) out to each member — no new semantics there. `move
+  <groupName> <coord>...` is the one new behavior: one scalar
+  `motion_core::LinearMove` (see the `motion-core` entry above) drives every
+  member from a single shared `Rc<SharedGroupMove>`, installed atomically —
+  a two-step gather-then-construct-then-install sequence (not the
+  single-axis `abort_into` helper, which models one *independent* fallible
+  per-axis build) means a rejected construction leaves no member
+  half-redirected. `BufferMode::Aborting` redirects a busy group immediately
+  (even mid-move, via `LinearMove::new_with_start_velocity`) and drops
+  anything the group had queued, same as a single-axis `aborting` move.
+  **`BufferMode::Buffered` queuing (added 2026-07-21)**: a busy group now
+  queues via its own `group_pending: Vec<VecDeque<PendingGroupMove>>` (one
+  FIFO per hard-coded group, declared in `run_control_loop` — deliberately
+  *not* part of `AxisRuntime`, since promoting a queued group move needs
+  every member simultaneously idle at once, which doesn't fit inside any
+  single axis's own state). A new "step 1b" mirrors the per-axis promotion
+  loop but atomically across the whole group via `install_group_move` (a
+  shared helper factored out of the immediate-move path, used by both);
+  a group whose members stop being enabled drops its whole queue at once,
+  same message style as the per-axis case. **Group
+  interruption is cascading**: stopping, disabling, or faulting *any one*
+  member of an active group move brings every other member to its own
+  independent `StopRamp` too (a group move missing a member no longer means
+  anything), *and* drops that group's own queued moves too (`cascade_group_
+  stop` clears `group_pending[group]` as part of the cascade, the same
+  "seizing/losing control clears anything queued" precedent `abort_into`
+  already established for single axes) — implemented as a collect-then-apply
+  two-pass structure (the borrow checker won't allow mutating a second `Vec`
+  element while holding `&mut` into the first from the same `iter_mut()`),
+  guarded by `Rc::ptr_eq` so a member that's already moved on to something
+  else isn't double-fired. This reuses `abort_into`/`StopRamp` unchanged for
+  every cascaded sibling — no new profile-building logic anywhere for that
+  path. Confirmed live: a 2-axis group move traces a straight line at the
+  commanded path speed (per-axis velocity ratios match the unit direction
+  vector exactly); 3 buffered group moves queued while busy ran in FIFO
+  order; `stop axisGroup0` and `disable axis0` mid-move each correctly
+  dropped the still-queued follow-up move (not just the active one); an
+  `aborting` redirect while a move was queued took over immediately *and*
+  dropped the queued move; a same-direction `aborting` redirect is
+  seamless, a redirect into a different direction shows the documented
+  velocity discontinuity with no NaN/crash. This is a **genuinely different
+  feature from Step 2** below (which is about auto-synchronizing two
+  *independently issued* single-axis moves) — a group move is one command
+  constructing one shared trajectory by construction, not two moves
+  retroactively time-scaled; picking this up isn't Step 2 sneaking in via a
+  side door.
+  **`help`/`status` cleanup (2026-07-21)**: `help` had grown into a long
+  wall of parenthetical usage notes across the `stop`/`BufferMode`/groups
+  additions — trimmed back to a terse, one-line-per-command list (target
+  syntax is just `<axisN|groupName>` now); detailed per-command help (e.g.
+  `help move`) is a natural future addition, not built. `status` now prints
+  a summary line per hard-coded group alongside its per-axis lines
+  (`idle at [...]` or the shared profile's phase/target while a group move
+  is active), reusing one representative member's `Profile::Group` state
+  rather than duplicating anything new in `AxisRuntime`.
   **`verbose`** toggles the periodic per-cycle position/phase heartbeat
   printed while an axis is moving (off by default — the viz window already
   plots target-vs-actual continuously, so it's usually redundant on the
@@ -215,8 +302,27 @@ over-produce; confirm direction at natural decision points.
   copies each cycle's setpoint/feedback into a shared, bounded `History`
   buffer. `run_control_loop` needed zero logic changes — only its backend
   construction line changed to wrap `SimAxisGroup` in `RecordingAxisGroup`.
-  Shows target-vs-actual position/velocity per axis, plus an XY tool-position
-  plot when `NUM_AXES >= 2`.
+  Shows target-vs-actual position/velocity per axis. The XY plot (2026-07-21:
+  generalized from one hardcoded axis0/axis1 "tool position" plot into one
+  per hard-coded axis group — see `app`'s axis-groups entry above) loops
+  over `AXIS_GROUPS`, so it scales as more groups are added instead of
+  staying pinned to whichever two axes happened to exist first; only groups
+  of exactly 2 axes get a plane plot (a 3+-axis group would need a
+  projection or a 3D view, not built). A status box per group sits
+  alongside the per-axis ones, but — since viz only taps the
+  `AxisGroup::exchange()` seam and has no visibility into `app`'s
+  higher-level `Profile::Group`/command bookkeeping — it can only show a
+  per-member position/velocity rollup from `History`, not whether a
+  synchronized group move is *currently* active (the terminal `status`
+  command can, since it reads `AxisRuntime` directly). The growing content
+  (an XY plot + status box per group, plus per-axis plot pairs) started
+  overflowing the window vertically once groups were added — fixed by
+  wrapping the `CentralPanel`'s content in `egui::ScrollArea::vertical()`
+  (so it's always reachable regardless of window size/axis count going
+  forward, not just today's fit) and giving the window a generous explicit
+  starting size (`ViewportBuilder::with_inner_size([1000.0, 900.0])` in
+  `main()` — eframe's unset default was too short) so nothing needs to
+  scroll for the common 2-axis/1-group case.
 - Not yet built: richer sim dynamics (Step 6), `backend-ethercat` (Step 7),
   coordinated multi-axis moves (Step 2, deferred).
 
@@ -228,7 +334,12 @@ over-produce; confirm direction at natural decision points.
    This is where `duration()` starts earning its keep. Explicitly on hold —
    `app` currently drives axes independently (no coordination) and that's
    staying true until this is revisited. Don't build toward coordinated
-   moves as a side effect of Step 3/4/5 work below.
+   moves as a side effect of Step 3/4/5 work below. **Not the same thing**
+   as the hard-coded axis groups added 2026-07-21 (see the `app` entry
+   above): a group move is one command building one shared trajectory for a
+   *named, fixed* set of axes; this step is about auto-synchronizing the
+   durations of two *independently issued* single-axis moves — still
+   deferred, unrelated to groups existing now.
 3. **[done]** `AxisGroup` backend trait (`axis-backend` crate) + a simple
    **sim backend** (`backend-sim` crate). Design settled 2026-07-20:
    - `AxisGroup::exchange(&mut self, setpoints: &[AxisSetpoint]) ->
@@ -299,15 +410,14 @@ over-produce; confirm direction at natural decision points.
 - Workspace layout target: motion-core / axis-backend / backend-sim /
   backend-ethercat / app. (`viz` is not a separate crate — see Step 5: it's
   baked into `app` as `app/src/viz.rs` + `app/src/recording.rs`.)
-- **Backlog**: unit tests for `app`'s `parse_command`/`parse_axis` (in
-  `app/src/main.rs`, `#[cfg(test)] mod tests`, same pattern as
-  `trajectory.rs`). Currently only manually smoke-tested via piping stdin.
-  Pure parsing logic, no threading/timing involved — cheap to add whenever
-  we're back in `app`. (Full control-loop integration testing — queuing,
-  per-axis independence — is a separate, harder problem: real `sleep()`s and
-  `println!`-format assertions make it slow/brittle; revisit only if that
-  becomes a recurring pain point, and consider extracting the loop's
-  decision logic to run on fake time first.)
+- [done] Unit tests for `app`'s `parse_command`/`parse_axis` (added
+  2026-07-21, alongside axis groups since the move-parsing restructure
+  touched this code anyway): `app/src/main.rs`, `#[cfg(test)] mod tests`,
+  same pattern as `trajectory.rs`; 13 tests. (Full control-loop integration
+  testing — queuing, per-axis independence — remains a separate, harder
+  problem: real `sleep()`s and `println!`-format assertions make it
+  slow/brittle; revisit only if that becomes a recurring pain point, and
+  consider extracting the loop's decision logic to run on fake time first.)
 
 ## How to work in this repo
 
