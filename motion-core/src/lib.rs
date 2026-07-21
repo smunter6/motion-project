@@ -25,7 +25,11 @@
 //! CiA 402 backend for real drives.
 
 pub mod linear_move;
+pub mod path_profile;
 pub mod trajectory;
+pub mod waypoint_path;
 
 pub use linear_move::{LinearMove, LinearMoveError, LinearMoveSample, MAX_GROUP_AXES};
+pub use path_profile::{PathProfile, PathProfileError, PathSample};
 pub use trajectory::{MotionPhase, StopRamp, TrajectoryError, TrajectorySample, TrapezoidalProfile};
+pub use waypoint_path::{SegmentKind, WaypointPath, WaypointPathError};

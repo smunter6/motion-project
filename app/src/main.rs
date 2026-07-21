@@ -84,7 +84,8 @@ use std::time::{Duration, Instant};
 use axis_backend::{AxisGroup, AxisSetpoint, AxisState, Ds402State};
 use backend_sim::SimAxisGroup;
 use motion_core::{
-    LinearMove, LinearMoveError, MotionPhase, StopRamp, TrajectoryError, TrapezoidalProfile,
+    LinearMove, LinearMoveError, MotionPhase, PathProfile, PathProfileError, SegmentKind,
+    StopRamp, TrajectoryError, TrapezoidalProfile,
 };
 use recording::{History, RecordingAxisGroup};
 use viz::VizApp;
@@ -188,6 +189,22 @@ enum Command {
     StopGroup {
         group: usize,
         max_deceleration: Option<f64>,
+    },
+    /// A multi-waypoint move for a group, smoothly blended through every
+    /// waypoint via `motion_core::PathProfile` (centripetal Catmull-Rom).
+    /// `waypoints` are the points *after* the group's current position —
+    /// the actual current position is always prepended as the path's own
+    /// start (see `install_path_move`), the same "start is the axes'
+    /// actual position, not a commanded one" rule every other move here
+    /// follows. Deliberately idle-group-only for this first pass — see the
+    /// control loop's `Command::MovePath` arm — so there's no `buffer_mode`
+    /// field here the way `MoveGroup` has one.
+    MovePath {
+        group: usize,
+        waypoints: Vec<Vec<f64>>,
+        max_speed: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
     },
     Verbose,
     Status,
@@ -317,6 +334,7 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
             }
         }
         ["move", target, rest @ ..] => parse_move(target, rest, line),
+        ["movepath", target, rest @ ..] => parse_move_path(target, rest, line),
         _ => Err(format!(
             "unrecognized command: {line:?} (type \"help\" for usage)"
         )),
@@ -390,6 +408,162 @@ fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>
             buffer_mode,
         })),
     }
+}
+
+/// Parses everything after `"movepath" <target>`: either the inline form
+/// (a waypoint count, then that many waypoints' worth of coordinates — see
+/// `parse_move_path_inline`) or, if the first token is the literal `"file"`,
+/// waypoints read from a file, one per line (see `parse_move_path_file`) —
+/// the inline form gets unwieldy past a handful of waypoints for an
+/// interactive line-based command, so this is the same `Command::MovePath`
+/// reached a second way. A single axis can't be a `movepath` target either
+/// way — a one-axis "path" is just what `move ... buffered` chaining
+/// already gives you.
+fn parse_move_path(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>, String> {
+    let group = match parse_target(target)? {
+        Target::Axis(_) => {
+            return Err(format!(
+                "movepath requires a group target, not a single axis: {line:?}"
+            ))
+        }
+        Target::Group(g) => g,
+    };
+    let coord_count = AXIS_GROUPS[group].axes.len();
+
+    match rest {
+        ["file", path, rest @ ..] => parse_move_path_file(group, coord_count, path, rest, line),
+        _ => parse_move_path_inline(group, coord_count, rest, line),
+    }
+}
+
+/// The inline `movepath` form: a required waypoint count, then that many
+/// waypoints' worth of coordinates (`coord_count` each), then the usual
+/// up-to-3 numeric kinematic-limit args. No trailing `aborting`/`buffered`
+/// keyword — see `Command::MovePath`'s docs for why.
+fn parse_move_path_inline(
+    group: usize,
+    coord_count: usize,
+    rest: &[&str],
+    line: &str,
+) -> Result<Option<Command>, String> {
+    let (&n_waypoints_str, rest) = rest
+        .split_first()
+        .ok_or_else(|| format!("expected a waypoint count: {line:?}"))?;
+    let n_waypoints: usize = n_waypoints_str
+        .parse()
+        .map_err(|_| format!("expected a waypoint count, got {n_waypoints_str:?}"))?;
+    if n_waypoints == 0 {
+        return Err(format!("movepath needs at least 1 waypoint: {line:?}"));
+    }
+
+    let coord_total = n_waypoints * coord_count;
+    if rest.len() < coord_total {
+        return Err(format!(
+            "expected {coord_total} waypoint coordinate(s) ({n_waypoints} waypoint(s) x {coord_count} axes): {line:?}"
+        ));
+    }
+    let (coords, rest) = rest.split_at(coord_total);
+    let flat: Vec<f64> = coords.iter().map(|c| parse_f64(c)).collect::<Result<_, _>>()?;
+    let waypoints: Vec<Vec<f64>> = flat.chunks(coord_count).map(|c| c.to_vec()).collect();
+
+    let (max_speed, max_acceleration, max_deceleration) = parse_kinematic_limits(rest, line)?;
+    Ok(Some(Command::MovePath {
+        group,
+        waypoints,
+        max_speed,
+        max_acceleration,
+        max_deceleration,
+    }))
+}
+
+/// The file `movepath` form: waypoints read from `path` (see
+/// `read_waypoints_file`), followed by the usual up-to-3 numeric
+/// kinematic-limit args — everything else is identical to the inline form.
+/// Reading happens here, on the stdin-reading thread (same as every other
+/// parse error), not in the control loop — `Command::MovePath` ends up
+/// identical either way, so nothing downstream needs to know which form was
+/// used.
+fn parse_move_path_file(
+    group: usize,
+    coord_count: usize,
+    path: &str,
+    rest: &[&str],
+    line: &str,
+) -> Result<Option<Command>, String> {
+    let waypoints = read_waypoints_file(path, coord_count)?;
+    let (max_speed, max_acceleration, max_deceleration) = parse_kinematic_limits(rest, line)?;
+    Ok(Some(Command::MovePath {
+        group,
+        waypoints,
+        max_speed,
+        max_acceleration,
+        max_deceleration,
+    }))
+}
+
+/// Reads `path` and delegates to `parse_waypoint_lines` — split out as its
+/// own thin wrapper so the actual line-parsing logic stays unit-testable
+/// without touching the filesystem.
+fn read_waypoints_file(path: &str, coord_count: usize) -> Result<Vec<Vec<f64>>, String> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
+    parse_waypoint_lines(&contents, coord_count).map_err(|e| format!("{path}: {e}"))
+}
+
+/// One waypoint per line, `coord_count` whitespace-separated numbers each;
+/// blank lines are skipped (so trailing newlines, and visual grouping in a
+/// hand-written file, don't need special treatment). No comment syntax —
+/// deliberately as simple as the file format needs to be for now.
+fn parse_waypoint_lines(contents: &str, coord_count: usize) -> Result<Vec<Vec<f64>>, String> {
+    let mut waypoints = Vec::new();
+    for (i, raw_line) in contents.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() != coord_count {
+            return Err(format!(
+                "line {}: expected {coord_count} coordinate(s), got {}: {trimmed:?}",
+                i + 1,
+                tokens.len()
+            ));
+        }
+        let coords: Vec<f64> = tokens
+            .iter()
+            .map(|t| parse_f64(t))
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("line {}: {e}", i + 1))?;
+        waypoints.push(coords);
+    }
+    if waypoints.is_empty() {
+        return Err("no waypoints found (file is empty or all-blank)".to_string());
+    }
+    Ok(waypoints)
+}
+
+/// The trailing up-to-3 numeric kinematic-limit args shared by both
+/// `movepath` forms (`[vmax] [amax] [dmax]`, each defaulting the same way
+/// `move`'s do: `vmax`/`amax` fall back to the global defaults, `dmax`
+/// falls back to whatever `amax` resolved to).
+fn parse_kinematic_limits(rest: &[&str], line: &str) -> Result<(f64, f64, f64), String> {
+    if rest.len() > 3 {
+        return Err(format!("too many arguments: {line:?}"));
+    }
+    let mut numeric_rest = rest.iter();
+    let max_speed = match numeric_rest.next() {
+        Some(v) => parse_f64(v)?,
+        None => DEFAULT_MAX_SPEED,
+    };
+    let max_acceleration = match numeric_rest.next() {
+        Some(a) => parse_f64(a)?,
+        None => DEFAULT_MAX_ACCELERATION,
+    };
+    let max_deceleration = match numeric_rest.next() {
+        Some(d) => parse_f64(d)?,
+        None => max_acceleration,
+    };
+    Ok((max_speed, max_acceleration, max_deceleration))
 }
 
 /// What a command verb (`enable`/`disable`/`reset`/`stop`/`move`) is aimed
@@ -480,6 +654,14 @@ fn print_help() {
         "move <target> <coord>... [vmax] [amax] [dmax] [aborting|buffered]",
         "start or redirect a move",
     );
+    cmd_line(
+        "movepath <groupName> <n> <coord>... [vmax] [amax] [dmax]",
+        "smooth multi-waypoint move, waypoints inline (idle groups only)",
+    );
+    cmd_line(
+        "movepath <groupName> file <path> [vmax] [amax] [dmax]",
+        "same, waypoints read from a file (one per line)",
+    );
     cmd_line("stop <target> [decel]", "decelerate to a stop");
     cmd_line("enable <target>", "power up and enable");
     cmd_line("disable <target>", "disable (faults it if actively moving)");
@@ -505,23 +687,41 @@ struct SharedGroupMove {
     max_deceleration: f64,
 }
 
+/// The path-move analog of `SharedGroupMove` — same shape (a shared
+/// profile, participating axes, group index, deceleration for cascading
+/// into a stop), just wrapping `motion_core::PathProfile` instead of
+/// `LinearMove`. Kept as a distinct type (not a generalized
+/// `SharedGroupMove<P>`) since the two profile types don't share a common
+/// trait and nothing outside `Profile`'s own match arms needs to treat them
+/// uniformly — see `ActiveGroupMove` for the one place that does.
+struct SharedPathMove {
+    profile: PathProfile,
+    axes: &'static [usize],
+    group: usize,
+    max_deceleration: f64,
+}
+
 /// Whichever motion profile is currently driving an axis: a commanded
-/// move, a commanded stop, or (this axis's slice of) an active group move.
-/// All three are pure functions of elapsed time with the same shape
-/// (`sample`/`phase_at`/`target`), but aren't the same *type* —
+/// move, a commanded stop, or (this axis's slice of) an active group move
+/// or path move. All are pure functions of elapsed time with the same
+/// shape (`sample`/`phase_at`/`target`), but aren't the same *type* —
 /// `TrapezoidalProfile` always starts and ends at rest, `StopRamp` starts
 /// wherever the axis actually is right now (see its own docs for why
 /// that's a separate type, not a generalization of `TrapezoidalProfile`),
-/// and `Group` doesn't own a profile at all — it indexes into one shared
-/// across every participating axis. This enum is what lets the rest of the
-/// control loop treat "whatever's currently active" uniformly without
-/// caring which one it is — except where it does care (`is_stop`), for
-/// messages that should read differently for a stop than for a move.
+/// and `Group`/`Path` don't own a profile at all — they index into one
+/// shared across every participating axis. This enum is what lets the rest
+/// of the control loop treat "whatever's currently active" uniformly
+/// without caring which one it is — except where it does care (`is_stop`),
+/// for messages that should read differently for a stop than for a move.
 enum Profile {
     Move(TrapezoidalProfile),
     Stop(StopRamp),
     Group {
         shared: Rc<SharedGroupMove>,
+        index: usize,
+    },
+    Path {
+        shared: Rc<SharedPathMove>,
         index: usize,
     },
 }
@@ -538,6 +738,13 @@ impl Profile {
                     velocity: s.velocity()[*index],
                 }
             }
+            Profile::Path { shared, index } => {
+                let s = shared.profile.sample(t);
+                motion_core::TrajectorySample {
+                    position: s.position()[*index],
+                    velocity: s.velocity()[*index],
+                }
+            }
         }
     }
 
@@ -546,6 +753,7 @@ impl Profile {
             Profile::Move(p) => p.phase_at(t),
             Profile::Stop(p) => p.phase_at(t),
             Profile::Group { shared, .. } => shared.profile.phase_at(t),
+            Profile::Path { shared, .. } => shared.profile.phase_at(t),
         }
     }
 
@@ -554,6 +762,7 @@ impl Profile {
             Profile::Move(p) => p.target(),
             Profile::Stop(p) => p.target(),
             Profile::Group { shared, index } => shared.profile.target()[*index],
+            Profile::Path { shared, index } => shared.profile.target()[*index],
         }
     }
 
@@ -561,13 +770,14 @@ impl Profile {
         matches!(self, Profile::Stop(_))
     }
 
-    /// The group name this profile belongs to, if it's a `Group` — purely
-    /// for `status`'s benefit, so a group move reads as one rather than
-    /// looking like an ordinary single-axis move to a value that happens to
-    /// match another axis's target.
+    /// The group name this profile belongs to, if it's a `Group` or `Path`
+    /// — purely for `status`'s benefit, so a group/path move reads as one
+    /// rather than looking like an ordinary single-axis move to a value
+    /// that happens to match another axis's target.
     fn group_membership(&self) -> Option<&'static str> {
         match self {
             Profile::Group { shared, .. } => Some(group_label(shared.group)),
+            Profile::Path { shared, .. } => Some(group_label(shared.group)),
             _ => None,
         }
     }
@@ -600,51 +810,101 @@ fn abort_into(
     }
 }
 
-/// If `profile` is a `Profile::Group`, returns its shared state (cloning
-/// the `Rc`, not the underlying move) — used to detect group membership
-/// when a single member is about to be replaced/cleared, so every other
-/// member can be cascaded into a stop too (a group move missing one of its
-/// members no longer means anything).
-fn group_of(profile: &Profile) -> Option<Rc<SharedGroupMove>> {
+/// A `Profile::Group` or `Profile::Path`'s shared state, abstracted just
+/// enough for `cascade_group_stop` to treat both uniformly — the two
+/// underlying profile types (`LinearMove`, `PathProfile`) don't share a
+/// trait, so this is a thin enum over the two `Rc`s rather than a generic
+/// `SharedGroupMove<P>`, kept private to the cascade mechanism.
+enum ActiveGroupMove {
+    Group(Rc<SharedGroupMove>),
+    Path(Rc<SharedPathMove>),
+}
+
+impl ActiveGroupMove {
+    fn axes(&self) -> &'static [usize] {
+        match self {
+            ActiveGroupMove::Group(s) => s.axes,
+            ActiveGroupMove::Path(s) => s.axes,
+        }
+    }
+
+    fn group(&self) -> usize {
+        match self {
+            ActiveGroupMove::Group(s) => s.group,
+            ActiveGroupMove::Path(s) => s.group,
+        }
+    }
+
+    fn max_deceleration(&self) -> f64 {
+        match self {
+            ActiveGroupMove::Group(s) => s.max_deceleration,
+            ActiveGroupMove::Path(s) => s.max_deceleration,
+        }
+    }
+
+    /// Whether `profile` is still actively driven by *this specific* shared
+    /// move instance (identity, via `Rc::ptr_eq` within the matching
+    /// variant — a `Group` can never alias a `Path`, so a variant mismatch
+    /// is simply `false`, same as no active move at all).
+    fn still_drives(&self, profile: &Profile) -> bool {
+        match (self, profile) {
+            (ActiveGroupMove::Group(target), Profile::Group { shared, .. }) => {
+                Rc::ptr_eq(target, shared)
+            }
+            (ActiveGroupMove::Path(target), Profile::Path { shared, .. }) => {
+                Rc::ptr_eq(target, shared)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// If `profile` is a `Profile::Group` or `Profile::Path`, returns its
+/// shared state (cloning the `Rc`, not the underlying move) — used to
+/// detect group membership when a single member is about to be
+/// replaced/cleared, so every other member can be cascaded into a stop too
+/// (a group/path move missing one of its members no longer means
+/// anything).
+fn group_of(profile: &Profile) -> Option<ActiveGroupMove> {
     match profile {
-        Profile::Group { shared, .. } => Some(Rc::clone(shared)),
+        Profile::Group { shared, .. } => Some(ActiveGroupMove::Group(Rc::clone(shared))),
+        Profile::Path { shared, .. } => Some(ActiveGroupMove::Path(Rc::clone(shared))),
         _ => None,
     }
 }
 
-/// Cascades a group interruption: every member of `shared` other than
-/// `except` gets its own `StopRamp` from its own actual position/velocity,
-/// via the same `abort_into` mechanism a direct single-axis `stop` uses —
-/// no new profile-building logic, just invoked once per sibling. Guarded by
-/// `Rc::ptr_eq` so a member that's no longer actually part of *this*
-/// specific group move (it already moved on to something else, including a
-/// different group move) is left alone: this is what makes
+/// Cascades a group (or path) interruption: every member of `shared` other
+/// than `except` gets its own `StopRamp` from its own actual
+/// position/velocity, via the same `abort_into` mechanism a direct
+/// single-axis `stop` uses — no new profile-building logic, just invoked
+/// once per sibling. Guarded by `ActiveGroupMove::still_drives` (identity,
+/// via `Rc::ptr_eq`) so a member that's no longer actually part of *this*
+/// specific move (it already moved on to something else, including a
+/// different group/path move) is left alone: this is what makes
 /// double-interruption-in-the-same-cycle and asymmetric disable/fault
 /// timing between members both come out correct rather than double-firing
 /// or clobbering unrelated state.
 fn cascade_group_stop(
     axes: &mut [AxisRuntime],
     group_pending: &mut [VecDeque<PendingGroupMove>],
-    shared: &Rc<SharedGroupMove>,
+    shared: &ActiveGroupMove,
     except: usize,
 ) {
-    // A group move missing one of its members no longer means anything, so
-    // neither do any of *its own* queued follow-up moves — same "seizing/
-    // losing control clears anything queued" precedent as `abort_into`.
-    group_pending[shared.group].clear();
-    let decel = shared.max_deceleration;
-    for &other in shared.axes {
+    // A group/path move missing one of its members no longer means
+    // anything, so neither do any of *its own* queued follow-up moves —
+    // same "seizing/losing control clears anything queued" precedent as
+    // `abort_into`.
+    group_pending[shared.group()].clear();
+    let decel = shared.max_deceleration();
+    for &other in shared.axes() {
         if other == except {
             continue;
         }
-        let still_in_this_group = matches!(
-            &axes[other].active,
-            Some(ActiveMove {
-                profile: Profile::Group { shared: s, .. },
-                ..
-            }) if Rc::ptr_eq(s, shared)
-        );
-        if !still_in_this_group {
+        let still_in_this_move = match &axes[other].active {
+            Some(active) => shared.still_drives(&active.profile),
+            None => false,
+        };
+        if !still_in_this_move {
             continue;
         }
         abort_into(
@@ -708,6 +968,65 @@ fn install_group_move(
         ax.pending.clear();
         ax.active = Some(ActiveMove {
             profile: Profile::Group {
+                shared: Rc::clone(&shared),
+                index,
+            },
+            started_at: Instant::now(),
+        });
+        ax.last_phase = None;
+    }
+    Ok(duration)
+}
+
+/// The path-move analog of `install_group_move`: attempts to build a
+/// `PathProfile` for `group`'s `members`, prepending their current *actual*
+/// position as the path's own start waypoint (`waypoints` is everything
+/// *after* that — see `Command::MovePath`'s docs), and — only on success —
+/// installs it atomically as `Profile::Path` on every member. On failure
+/// nothing is touched, same "never half-redirect a member" guarantee
+/// `install_group_move` gives. Every segment defaults to
+/// `SegmentKind::Spline` (smooth blending through every waypoint) — this
+/// first pass doesn't expose a per-segment `Line` override from the command
+/// line, though `motion_core::WaypointPath` itself supports one.
+///
+/// Deliberately has no `new_with_start_velocity` counterpart: unlike
+/// `install_group_move`, this only ever runs against an idle group (see the
+/// control loop's `Command::MovePath` arm), so there's no in-flight
+/// velocity to reconcile with the path's initial tangent.
+fn install_path_move(
+    axes: &mut [AxisRuntime],
+    group: usize,
+    members: &'static [usize],
+    waypoints: Vec<Vec<f64>>,
+    max_speed: f64,
+    max_acceleration: f64,
+    max_deceleration: f64,
+) -> Result<f64, PathProfileError> {
+    let start: Vec<f64> = members.iter().map(|&a| axes[a].position).collect();
+    let mut all_waypoints = Vec::with_capacity(waypoints.len() + 1);
+    all_waypoints.push(start);
+    all_waypoints.extend(waypoints);
+    let segment_kinds = vec![SegmentKind::Spline; all_waypoints.len() - 1];
+
+    let profile = PathProfile::new(
+        all_waypoints,
+        segment_kinds,
+        max_speed,
+        max_acceleration,
+        max_deceleration,
+    )?;
+    let duration = profile.duration();
+    let shared = Rc::new(SharedPathMove {
+        profile,
+        axes: members,
+        group,
+        max_deceleration,
+    });
+    for (index, &axis) in members.iter().enumerate() {
+        let ax = &mut axes[axis];
+        ax.pending.clear();
+        ax.active = Some(ActiveMove {
+            profile: Profile::Path {
                 shared: Rc::clone(&shared),
                 index,
             },
@@ -1040,7 +1359,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
         // `axes.iter_mut()` below can't hold a `&mut` into one element
         // while `cascade_group_stop` also needs to touch others by index)
         // whenever a group member goes non-operational mid-loop.
-        let mut group_cascades: Vec<(Rc<SharedGroupMove>, usize)> = Vec::new();
+        let mut group_cascades: Vec<(ActiveGroupMove, usize)> = Vec::new();
 
         for (i, ax) in axes.iter_mut().enumerate() {
             ax.position = feedback[i].position;
@@ -1359,6 +1678,57 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         }
                     }
                 }
+                Command::MovePath {
+                    group,
+                    waypoints,
+                    max_speed,
+                    max_acceleration,
+                    max_deceleration,
+                } => {
+                    let members = AXIS_GROUPS[group].axes;
+                    let all_operational = members
+                        .iter()
+                        .all(|&axis| axis_operational(axes[axis].axis_state));
+                    let busy = members
+                        .iter()
+                        .any(|&axis| axes[axis].active.is_some() || !axes[axis].pending.is_empty());
+                    let n_waypoints = waypoints.len();
+
+                    if !all_operational {
+                        println!(
+                            "  ! {}: movepath rejected: not every member is enabled",
+                            group_label(group)
+                        );
+                    } else if busy {
+                        // No queueing for movepath yet (see Command::MovePath's
+                        // docs) — unlike move/movegroup, there's no buffer_mode
+                        // to choose Aborting here either.
+                        println!(
+                            "  ! {}: movepath rejected: group is busy (movepath doesn't queue or abort yet — stop first, or wait for idle)",
+                            group_label(group)
+                        );
+                    } else {
+                        match install_path_move(
+                            &mut axes,
+                            group,
+                            members,
+                            waypoints,
+                            max_speed,
+                            max_acceleration,
+                            max_deceleration,
+                        ) {
+                            Ok(duration) => {
+                                println!(
+                                    "  -> {}: path move through {n_waypoints} waypoint(s) ({duration:.3}s)",
+                                    group_label(group)
+                                );
+                            }
+                            Err(e) => {
+                                println!("  ! {}: movepath rejected: {e}", group_label(group));
+                            }
+                        }
+                    }
+                }
                 Command::Verbose => {
                     verbose = !verbose;
                     println!(
@@ -1418,32 +1788,34 @@ fn print_status(axes: &[AxisRuntime]) {
     }
 
     for (g, group) in AXIS_GROUPS.iter().enumerate() {
-        // A group is "active" when one of its members is currently
-        // running *this* group's shared move — any member works as the
-        // representative, since they all share the same profile/timing.
-        let active = group
-            .axes
-            .iter()
-            .find_map(|&axis| match &axes[axis].active {
-                Some(mv) => match &mv.profile {
-                    Profile::Group { shared, .. } if shared.group == g => Some((mv, shared)),
-                    _ => None,
-                },
-                None => None,
-            });
-        match active {
-            Some((mv, shared)) => {
+        // A group is "active" when one of its members is currently running
+        // *this* group's shared move (a group move or a path move — any
+        // member works as the representative, since they all share the
+        // same profile/timing) — both `LinearMove` and `PathProfile` expose
+        // the same `phase_at`/`target` shape, so this extracts a common
+        // (phase, target) pair regardless of which one is actually active.
+        let active = group.axes.iter().find_map(|&axis| match &axes[axis].active {
+            Some(mv) => {
                 let elapsed = mv.started_at.elapsed().as_secs_f64();
-                let target: Vec<String> = shared
-                    .profile
-                    .target()
-                    .iter()
-                    .map(|v| format!("{v:.3}"))
-                    .collect();
+                match &mv.profile {
+                    Profile::Group { shared, .. } if shared.group == g => {
+                        Some((shared.profile.phase_at(elapsed), shared.profile.target()))
+                    }
+                    Profile::Path { shared, .. } if shared.group == g => {
+                        Some((shared.profile.phase_at(elapsed), shared.profile.target()))
+                    }
+                    _ => None,
+                }
+            }
+            None => None,
+        });
+        match active {
+            Some((phase, target)) => {
+                let target: Vec<String> = target.iter().map(|v| format!("{v:.3}")).collect();
                 println!(
                     "  status: {}: {}  (target [{}] mm)",
                     group.name,
-                    phase_label(shared.profile.phase_at(elapsed)),
+                    phase_label(phase),
                     target.join(", ")
                 );
             }
@@ -1615,5 +1987,115 @@ mod tests {
     #[test]
     fn parse_command_rejects_unrecognized_input() {
         assert!(parse_command("frobnicate axis0").is_err());
+    }
+
+    #[test]
+    fn parse_command_movepath_defaults() {
+        assert_eq!(
+            parse_command("movepath axisGroup0 2 10 0 10 10"),
+            Ok(Some(Command::MovePath {
+                group: 0,
+                waypoints: vec![vec![10.0, 0.0], vec![10.0, 10.0]],
+                max_speed: DEFAULT_MAX_SPEED,
+                max_acceleration: DEFAULT_MAX_ACCELERATION,
+                max_deceleration: DEFAULT_MAX_ACCELERATION,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_movepath_explicit_kinematics() {
+        assert_eq!(
+            parse_command("movepath axisGroup0 1 5 5 10 20 30"),
+            Ok(Some(Command::MovePath {
+                group: 0,
+                waypoints: vec![vec![5.0, 5.0]],
+                max_speed: 10.0,
+                max_acceleration: 20.0,
+                max_deceleration: 30.0,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_movepath_rejects_axis_target() {
+        assert!(parse_command("movepath axis0 1 5").is_err());
+    }
+
+    #[test]
+    fn parse_command_movepath_rejects_zero_waypoints() {
+        assert!(parse_command("movepath axisGroup0 0").is_err());
+    }
+
+    #[test]
+    fn parse_command_movepath_rejects_wrong_coordinate_count() {
+        // 2 waypoints x 2 axes = 4 coordinates needed, only 3 given.
+        assert!(parse_command("movepath axisGroup0 2 10 0 10").is_err());
+    }
+
+    #[test]
+    fn parse_command_movepath_rejects_too_many_trailing_args() {
+        assert!(parse_command("movepath axisGroup0 1 5 5 10 20 30 40").is_err());
+    }
+
+    // --- parse_waypoint_lines (the file form's line-parsing, no filesystem
+    // touched — see read_waypoints_file for the thin wrapper that does) ---
+
+    #[test]
+    fn parse_waypoint_lines_parses_one_waypoint_per_line() {
+        assert_eq!(
+            parse_waypoint_lines("10 0\n10 10\n0 20\n", 2),
+            Ok(vec![vec![10.0, 0.0], vec![10.0, 10.0], vec![0.0, 20.0]])
+        );
+    }
+
+    #[test]
+    fn parse_waypoint_lines_skips_blank_lines() {
+        assert_eq!(
+            parse_waypoint_lines("\n10 0\n\n\n10 10\n\n", 2),
+            Ok(vec![vec![10.0, 0.0], vec![10.0, 10.0]])
+        );
+    }
+
+    #[test]
+    fn parse_waypoint_lines_rejects_wrong_coordinate_count() {
+        assert!(parse_waypoint_lines("10 0\n10\n", 2).is_err());
+    }
+
+    #[test]
+    fn parse_waypoint_lines_rejects_non_numeric_token() {
+        assert!(parse_waypoint_lines("10 abc\n", 2).is_err());
+    }
+
+    #[test]
+    fn parse_waypoint_lines_rejects_empty_input() {
+        assert!(parse_waypoint_lines("", 2).is_err());
+        assert!(parse_waypoint_lines("\n\n  \n", 2).is_err());
+    }
+
+    #[test]
+    fn parse_command_movepath_file_reads_waypoints() {
+        let path = std::env::temp_dir().join(format!(
+            "motion_project_movepath_test_{:?}.txt",
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "10 0\n10 10\n").unwrap();
+        let cmd = parse_command(&format!("movepath axisGroup0 file {} 30", path.display()));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            cmd,
+            Ok(Some(Command::MovePath {
+                group: 0,
+                waypoints: vec![vec![10.0, 0.0], vec![10.0, 10.0]],
+                max_speed: 30.0,
+                max_acceleration: DEFAULT_MAX_ACCELERATION,
+                max_deceleration: DEFAULT_MAX_ACCELERATION,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_movepath_file_missing_file_is_an_error() {
+        assert!(parse_command("movepath axisGroup0 file /no/such/path.txt").is_err());
     }
 }
