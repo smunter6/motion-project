@@ -91,6 +91,10 @@ pub enum TrajectoryError {
     /// `position` or `velocity` passed to [`StopRamp::new`] is NaN or
     /// +/-infinity.
     NonFiniteStopState { position: f64, velocity: f64 },
+    /// `start_velocity` passed to
+    /// [`TrapezoidalProfile::new_with_start_velocity`] is NaN or
+    /// +/-infinity.
+    NonFiniteStartVelocity(f64),
 }
 
 impl std::fmt::Display for TrajectoryError {
@@ -115,6 +119,10 @@ impl std::fmt::Display for TrajectoryError {
                 f,
                 "position ({position}) and velocity ({velocity}) must both be finite numbers"
             ),
+            TrajectoryError::NonFiniteStartVelocity(v) => write!(
+                f,
+                "start_velocity must be a finite number (got {v})"
+            ),
         }
     }
 }
@@ -137,10 +145,11 @@ impl std::error::Error for TrajectoryError {}
 pub struct TrapezoidalProfile {
     start: f64,
     end: f64,
-    /// Sign of travel: +1.0 if end >= start, else -1.0. Precomputed so the
-    /// phase math can be written for a positive move and then re-signed.
+    /// Sign of travel of the MAIN segment (see below): +1.0 if
+    /// `end >= main_start`, else -1.0.
     direction: f64,
-    /// Total distance travelled (always >= 0; direction is carried separately).
+    /// Total distance travelled by the main segment (always >= 0; direction
+    /// is carried separately).
     distance: f64,
 
     // Kinematic limits actually used for THIS move. `cruise_speed` may be
@@ -149,13 +158,51 @@ pub struct TrapezoidalProfile {
     decel: f64,
     cruise_speed: f64,
 
-    // Phase timing (all relative to move start, t = 0):
-    t_accel: f64, // end of acceleration phase == start of cruise
-    t_cruise_end: f64, // end of cruise phase == start of deceleration
-    t_total: f64, // move complete
+    // --- Prefix: killing a `start_velocity` the main segment can't use
+    // directly (opposite direction, or same direction but not enough room
+    // to stop before `end` — see `new_with_start_velocity`). Zero-duration
+    // (t_prefix_end == 0.0) whenever there's no prefix — true for every
+    // profile built via `new()`, and for `new_with_start_velocity` calls
+    // with enough room to ride the start velocity straight into the main
+    // segment. A real prefix decelerates `prefix_velocity` to rest at
+    // `prefix_decel`, exactly like `StopRamp`, landing at `main_start`.
+    prefix_velocity: f64,
+    prefix_decel: f64,
+    t_prefix_end: f64,
+    /// Position where the main segment begins: `start` when there's no
+    /// prefix, otherwise wherever the prefix's deceleration lands.
+    main_start: f64,
 
-    // Distance covered by the end of the acceleration phase (cached so the
-    // cruise/decel position formulas don't recompute it every query).
+    // --- Main segment: ramps from `main_start_velocity` (0, or the
+    // caller's start_velocity carried straight in when there's no prefix)
+    // up or down to `cruise_speed`, cruises, then decelerates to rest at
+    // `end`. Phase times below are ABSOLUTE (measured from the profile's
+    // own t = 0, i.e. already include t_prefix_end) — so for the
+    // overwhelmingly common no-prefix case these are exactly the fields
+    // the original rest-to-rest algorithm computed, unchanged.
+    main_start_velocity: f64,
+    t_accel: f64,      // end of phase 1 (accel or decel-to-cruise) == start of cruise
+    t_cruise_end: f64, // end of cruise phase == start of final deceleration
+    t_total: f64,      // move complete
+
+    // Distance covered by the end of phase 1 (cached so the cruise/decel
+    // position formulas don't recompute it every query).
+    d_accel: f64,
+}
+
+/// The main (rest-target) segment of a profile: ramps from some starting
+/// speed (0, in the plain rest-to-rest case) up or down to a cruise speed,
+/// cruises, then decelerates to rest — computed in isolation from wherever
+/// it actually begins, so both `new()` and `new_with_start_velocity` can
+/// build one and place it (directly, or after a prefix) into the outer
+/// `TrapezoidalProfile`.
+struct MainSegment {
+    direction: f64,
+    distance: f64,
+    cruise_speed: f64,
+    t_accel: f64,      // local: relative to the segment's own start
+    t_cruise_end: f64, // local
+    t_total: f64,      // local
     d_accel: f64,
 }
 
@@ -195,6 +242,132 @@ impl TrapezoidalProfile {
         max_acceleration: f64,
         max_deceleration: f64,
     ) -> Result<Self, TrajectoryError> {
+        Self::validate_limits(start, end, max_speed, max_acceleration, max_deceleration)?;
+        let seg = Self::build_main_segment(start, end, 0.0, max_speed, max_acceleration, max_deceleration);
+        Ok(Self::from_segment(
+            start,
+            end,
+            max_acceleration,
+            max_deceleration,
+            0.0, // rest-to-rest: no start velocity
+            None, // no prefix
+            seg,
+        ))
+    }
+
+    /// Build a profile for a move from `start` to `end`, but starting from a
+    /// nonzero `start_velocity` — the axis's actual current velocity, not
+    /// the rest-to-rest assumption `new()` makes. This is what backs
+    /// interrupting an in-flight move with a new target (PLCopen `BufferMode
+    /// ::Aborting`): the new move's own `max_speed`/`max_acceleration`/
+    /// `max_deceleration` govern the entire resulting profile, including any
+    /// preamble needed to reconcile `start_velocity` with the new target —
+    /// there's no blending or carryover of whatever move was superseded.
+    ///
+    /// Three kinematic cases fall out of the geometry, none requiring the
+    /// caller to pick a case explicitly:
+    ///
+    /// - **Same direction, room to spare**: `start_velocity` already points
+    ///   toward `end` and there's enough distance left to arrive at rest
+    ///   without exceeding `max_speed` or needing harder-than-`max_deceleration`
+    ///   braking. Ramps from `start_velocity` to a cruise speed (accelerating
+    ///   if `start_velocity` is below it, decelerating into cruise if it's
+    ///   already above `max_speed`), cruises, then decelerates to rest —
+    ///   the same trapezoid/triangle shape `new()` builds, just starting
+    ///   partway up (or down) the ramp instead of from rest.
+    /// - **Same direction, not enough room**: moving toward `end`, but too
+    ///   fast to stop before reaching it at `max_deceleration`. Physically
+    ///   has to overshoot: decelerate to rest past `end`, then a fresh
+    ///   rest-to-rest move back.
+    /// - **Opposite direction**: `start_velocity` points away from `end`.
+    ///   Decelerate to rest first, then a normal rest-to-rest move from
+    ///   wherever that lands.
+    ///
+    /// The last two cases are the same code path — both decelerate
+    /// `start_velocity` to rest, then hand off to a fresh rest-to-rest
+    /// segment; which side of `end` that landing spot falls on is what
+    /// distinguishes "overshoot and come back" from "reverse and go".
+    pub fn new_with_start_velocity(
+        start: f64,
+        start_velocity: f64,
+        end: f64,
+        max_speed: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
+    ) -> Result<Self, TrajectoryError> {
+        Self::validate_limits(start, end, max_speed, max_acceleration, max_deceleration)?;
+        if !start_velocity.is_finite() {
+            return Err(TrajectoryError::NonFiniteStartVelocity(start_velocity));
+        }
+
+        let delta = end - start;
+        let direction = if delta >= 0.0 { 1.0 } else { -1.0 };
+        let distance = delta.abs();
+        // Component of start_velocity along the direction of travel to
+        // `end`. Negative means start_velocity points away from `end`.
+        let v0_along = start_velocity * direction;
+        // The least distance physically possible to come to rest from
+        // v0_along at max_deceleration — if `end` is closer than this,
+        // there's no way to arrive there directly, no matter the profile
+        // shape.
+        let min_stop_distance = (v0_along * v0_along) / (2.0 * max_deceleration);
+
+        if v0_along > 0.0 && distance >= min_stop_distance {
+            // Same direction, room to spare: ride start_velocity straight
+            // into the main segment, no prefix needed.
+            let seg = Self::build_main_segment(
+                start,
+                end,
+                v0_along,
+                max_speed,
+                max_acceleration,
+                max_deceleration,
+            );
+            Ok(Self::from_segment(
+                start,
+                end,
+                max_acceleration,
+                max_deceleration,
+                v0_along,
+                None,
+                seg,
+            ))
+        } else {
+            // Not enough room, or start_velocity points the wrong way:
+            // decelerate it to rest first (mirrors StopRamp's math exactly),
+            // then a fresh rest-to-rest segment from wherever that lands.
+            let prefix_dir = start_velocity.signum();
+            let t_prefix_end = start_velocity.abs() / max_deceleration;
+            let prefix_distance = (start_velocity * start_velocity) / (2.0 * max_deceleration);
+            let main_start = start + prefix_dir * prefix_distance;
+
+            let seg = Self::build_main_segment(
+                main_start,
+                end,
+                0.0,
+                max_speed,
+                max_acceleration,
+                max_deceleration,
+            );
+            Ok(Self::from_segment(
+                start,
+                end,
+                max_acceleration,
+                max_deceleration,
+                0.0, // main segment starts from rest, after the prefix
+                Some((start_velocity, t_prefix_end, main_start)),
+                seg,
+            ))
+        }
+    }
+
+    fn validate_limits(
+        start: f64,
+        end: f64,
+        max_speed: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
+    ) -> Result<(), TrajectoryError> {
         if !start.is_finite() || !end.is_finite() {
             return Err(TrajectoryError::NonFinitePosition { start, end });
         }
@@ -207,101 +380,142 @@ impl TrapezoidalProfile {
         if !(max_deceleration.is_finite() && max_deceleration > 0.0) {
             return Err(TrajectoryError::InvalidMaxDeceleration(max_deceleration));
         }
+        Ok(())
+    }
 
+    /// Build the main (rest-target) segment: ramp from `start_velocity`
+    /// (>= 0, along the direction of travel) to a cruise speed, cruise,
+    /// decelerate to rest at `end`. Assumes the caller has already
+    /// established there's enough room — true by construction for both
+    /// callers (`new()`'s `start_velocity: 0.0`, and
+    /// `new_with_start_velocity`'s room-checked direct case or
+    /// zero-velocity post-prefix case).
+    fn build_main_segment(
+        start: f64,
+        end: f64,
+        start_velocity: f64,
+        max_speed: f64,
+        accel: f64,
+        decel: f64,
+    ) -> MainSegment {
         let delta = end - start;
         let distance = delta.abs();
         let direction = if delta >= 0.0 { 1.0 } else { -1.0 };
 
         // Degenerate move: already there. Everything is zero / start.
         if distance == 0.0 {
-            return Ok(Self {
-                start,
-                end,
+            return MainSegment {
                 direction,
                 distance: 0.0,
-                accel: max_acceleration,
-                decel: max_deceleration,
                 cruise_speed: 0.0,
                 t_accel: 0.0,
                 t_cruise_end: 0.0,
                 t_total: 0.0,
                 d_accel: 0.0,
-            });
+            };
         }
 
-        // --- Decide trapezoid vs. triangle -------------------------------
+        let v0 = start_velocity;
+
+        // --- Pick the cruise speed ----------------------------------------
         //
-        // Distance needed to accelerate from 0 up to max_speed, and
-        // (independently, since accel and decel rates may differ) the
-        // distance needed to decelerate from max_speed back to 0:
+        // If v0 is already above max_speed (only reachable from
+        // new_with_start_velocity, when the axis was moving faster than the
+        // *new* move's max_speed allows), the only way to respect max_speed
+        // going forward is to decelerate down to it — there's no "trapezoid
+        // vs triangle" choice, cruise_speed is just max_speed (the caller's
+        // room check guarantees there's space to decelerate through it and
+        // still stop by `end`, with possibly zero cruise distance).
         //
-        //   v^2 = 2 * a * d   =>   d = v^2 / (2a)
+        // Otherwise it's exactly the original trapezoid-vs-triangle
+        // decision, generalized to start from v0 instead of 0:
         //
-        // If accel distance + decel distance <= total distance, there's room to
-        // reach cruise speed: it's a trapezoid. Otherwise we top out below
-        // max_speed: it's a triangle.
-        let accel = max_acceleration;
-        let decel = max_deceleration;
-        let d_accel_full = (max_speed * max_speed) / (2.0 * accel);
-        let d_decel_full = (max_speed * max_speed) / (2.0 * decel);
-        let d_accel_plus_decel = d_accel_full + d_decel_full;
-
-        let (cruise_speed, t_accel, d_accel, t_cruise_end, t_total);
-
-        if d_accel_plus_decel <= distance {
-            // ---- Trapezoidal: we do reach max_speed ----
-            cruise_speed = max_speed;
-
-            // Time to accelerate to cruise: v = a * t  =>  t = v / a
-            t_accel = cruise_speed / accel;
-            d_accel = d_accel_full;
-            let t_decel = cruise_speed / decel;
-
-            // Cruise covers whatever distance is left after accel + decel.
-            let d_cruise = distance - d_accel_plus_decel;
-            let t_cruise = d_cruise / cruise_speed;
-
-            t_cruise_end = t_accel + t_cruise;
-            t_total = t_cruise_end + t_decel;
+        //   v^2 = v0^2 + 2*a*d   =>   d = (v^2 - v0^2) / (2a)
+        //
+        // which reduces to the v0 == 0 formulas exactly when v0 is 0.
+        let cruise_speed = if v0 <= max_speed {
+            let d_accel_full = (max_speed * max_speed - v0 * v0) / (2.0 * accel);
+            let d_decel_full = (max_speed * max_speed) / (2.0 * decel);
+            if d_accel_full + d_decel_full <= distance {
+                max_speed
+            } else {
+                // Triangular: peak speed where the ramp-from-v0 and
+                // decel-to-0 phases meet, d_ramp(v_peak) + d_decel(v_peak)
+                // == distance:
+                //   (v_peak^2 - v0^2)/(2*accel) + v_peak^2/(2*decel) = distance
+                //   => v_peak = sqrt((2*accel*decel*distance + v0^2*decel) / (accel + decel))
+                // (reduces to the original sqrt(2*distance*accel*decel/(accel+decel))
+                // when v0 == 0.)
+                ((2.0 * accel * decel * distance + v0 * v0 * decel) / (accel + decel)).sqrt()
+            }
         } else {
-            // ---- Triangular: peak speed is below max_speed ----
-            //
-            // Accelerate over d_accel, decelerate over d_decel, with
-            // d_accel + d_decel == distance and a single peak speed where
-            // the two phases meet:
-            //
-            //   d_accel = v_peak^2 / (2*accel)
-            //   d_decel = v_peak^2 / (2*decel)
-            //   d_accel + d_decel = distance
-            //     => v_peak = sqrt(2 * distance * accel * decel / (accel + decel))
-            //
-            // (reduces to the familiar sqrt(accel * distance) when
-            // accel == decel.)
-            cruise_speed =
-                (2.0 * distance * accel * decel / (accel + decel)).sqrt();
+            max_speed
+        };
 
-            t_accel = cruise_speed / accel;
-            d_accel = (cruise_speed * cruise_speed) / (2.0 * accel);
-            let t_decel = cruise_speed / decel;
+        // Phase 1 ramps from v0 to cruise_speed — accelerating if
+        // cruise_speed >= v0, decelerating into cruise otherwise (the
+        // v0 > max_speed case above).
+        let ramping_up = cruise_speed >= v0;
+        let rate1 = if ramping_up { accel } else { decel };
+        let t_accel = (cruise_speed - v0).abs() / rate1;
+        let d_accel = (cruise_speed * cruise_speed - v0 * v0).abs() / (2.0 * rate1);
 
-            // No cruise phase: cruise start == cruise end.
-            t_cruise_end = t_accel;
-            t_total = t_accel + t_decel;
-        }
+        let t_decel = cruise_speed / decel;
+        let d_decel = (cruise_speed * cruise_speed) / (2.0 * decel);
 
-        Ok(Self {
-            start,
-            end,
+        let d_cruise = distance - d_accel - d_decel;
+        let t_cruise = d_cruise / cruise_speed;
+
+        let t_cruise_end = t_accel + t_cruise;
+        let t_total = t_cruise_end + t_decel;
+
+        MainSegment {
             direction,
             distance,
-            accel,
-            decel,
             cruise_speed,
             t_accel,
             t_cruise_end,
             t_total,
             d_accel,
-        })
+        }
+    }
+
+    /// Assemble a `TrapezoidalProfile` from a `MainSegment`, placed either
+    /// directly at `start` (`prefix: None`, `main_start_velocity` is
+    /// whatever the caller rode straight into the segment) or after a
+    /// prefix `(prefix_velocity, t_prefix_end, main_start)` that decelerated
+    /// to rest first (`main_start_velocity` is then always 0.0). Converts
+    /// the segment's local phase times into the profile's absolute ones.
+    fn from_segment(
+        start: f64,
+        end: f64,
+        accel: f64,
+        decel: f64,
+        main_start_velocity: f64,
+        prefix: Option<(f64, f64, f64)>,
+        seg: MainSegment,
+    ) -> Self {
+        let (prefix_velocity, t_prefix_end, main_start) =
+            prefix.unwrap_or((0.0, 0.0, start));
+
+        Self {
+            start,
+            end,
+            direction: seg.direction,
+            distance: seg.distance,
+            accel,
+            decel,
+            cruise_speed: seg.cruise_speed,
+            prefix_velocity,
+            prefix_decel: decel,
+            t_prefix_end,
+            main_start,
+            main_start_velocity,
+            t_accel: t_prefix_end + seg.t_accel,
+            t_cruise_end: t_prefix_end + seg.t_cruise_end,
+            t_total: t_prefix_end + seg.t_total,
+            d_accel: seg.d_accel,
+        }
     }
 
     /// Total duration of the move in seconds. Needed later to coordinate
@@ -319,14 +533,26 @@ impl TrapezoidalProfile {
     ///
     /// Computed directly from the known phase-boundary times, so it's exact.
     /// For a triangular move the cruise window is empty (`t_accel ==
-    /// t_cruise_end`), so `Cruise` is simply never returned.
+    /// t_cruise_end`), so `Cruise` is simply never returned. When a
+    /// `new_with_start_velocity` prefix is decelerating an incompatible
+    /// start velocity to rest, that reports `Decel` too — it's genuinely
+    /// losing speed, same as the final approach to `end`. Phase 1 of the
+    /// main segment reports `Accel` or `Decel` depending on whether it's
+    /// ramping up to cruise or (only reachable when the start velocity was
+    /// already above the new move's `max_speed`) down into it.
     pub fn phase_at(&self, t: f64) -> MotionPhase {
         if t <= 0.0 || self.distance == 0.0 {
             MotionPhase::Pre
         } else if t >= self.t_total {
             MotionPhase::Done
+        } else if t < self.t_prefix_end {
+            MotionPhase::Decel
         } else if t < self.t_accel {
-            MotionPhase::Accel
+            if self.cruise_speed >= self.main_start_velocity {
+                MotionPhase::Accel
+            } else {
+                MotionPhase::Decel
+            }
         } else if t < self.t_cruise_end {
             MotionPhase::Cruise
         } else {
@@ -338,23 +564,29 @@ impl TrapezoidalProfile {
     /// move began).
     ///
     /// Times outside `[0, duration]` are clamped: `t < 0` returns the start
-    /// (at rest), `t > duration` returns the end (at rest). This makes the
-    /// "move already finished" case trivially correct — no completion flag to
-    /// manage.
+    /// (at whatever velocity the move actually began with — 0 for a plain
+    /// `new()` move), `t > duration` returns the end (at rest). This makes
+    /// the "move already finished" case trivially correct — no completion
+    /// flag to manage.
     ///
     /// NOTE (dt seam): the control loop will call this once per cycle with the
     /// *actual* elapsed time, then hand `sample.position` to the backend. The
     /// backend (sim plant model, later a real drive) is the stateful,
     /// dt-stepping layer that consumes this setpoint. This method stays pure.
     pub fn sample(&self, t: f64) -> TrajectorySample {
-        // Before the move (or zero-distance move): sit at start, at rest.
-        if t <= 0.0 || self.distance == 0.0 {
+        if t <= 0.0 {
+            let velocity = if self.t_prefix_end > 0.0 {
+                self.prefix_velocity
+            } else {
+                self.direction * self.main_start_velocity
+            };
             return TrajectorySample {
                 position: self.start,
-                velocity: 0.0,
+                velocity,
             };
         }
-        // After the move: sit at end, at rest.
+        // After the move (this also covers the zero-distance case, since
+        // then start == end and t_total == t_prefix_end): sit at end, at rest.
         if t >= self.t_total {
             return TrajectorySample {
                 position: self.end,
@@ -362,21 +594,47 @@ impl TrapezoidalProfile {
             };
         }
 
+        if t < self.t_prefix_end {
+            // --- Prefix: decelerating an incompatible start_velocity to
+            // rest, exactly like StopRamp's own math (see its `sample`).
+            let pd = self.prefix_velocity.signum();
+            return TrajectorySample {
+                position: self.start + self.prefix_velocity * t
+                    - pd * 0.5 * self.prefix_decel * t * t,
+                velocity: self.prefix_velocity - pd * self.prefix_decel * t,
+            };
+        }
+
+        // Main segment: measure local time from wherever it begins
+        // (main_start, at absolute time t_prefix_end).
+        let t_local = t - self.t_prefix_end;
+        let t_accel_local = self.t_accel - self.t_prefix_end;
+        let t_cruise_end_local = self.t_cruise_end - self.t_prefix_end;
+        let t_total_local = self.t_total - self.t_prefix_end;
+
         // Compute position/speed magnitude for a positive-direction move,
         // then re-sign into direction-aware position/velocity below.
-        let (pos_along, speed_along) = if t < self.t_accel {
-            // --- Acceleration phase ---
-            //   v(t) = a * t
-            //   x(t) = 1/2 * a * t^2
-            let v = self.accel * t;
-            let x = 0.5 * self.accel * t * t;
+        let (pos_along, speed_along) = if t_local < t_accel_local {
+            // --- Phase 1: ramp from main_start_velocity to cruise_speed ---
+            // Accelerating if cruise_speed >= main_start_velocity,
+            // decelerating into cruise otherwise.
+            //   v(t) = v0 + sign * rate * t
+            //   x(t) = v0 * t + 1/2 * sign * rate * t^2
+            let ramping_up = self.cruise_speed >= self.main_start_velocity;
+            let (sign, rate) = if ramping_up {
+                (1.0, self.accel)
+            } else {
+                (-1.0, self.decel)
+            };
+            let v = self.main_start_velocity + sign * rate * t_local;
+            let x = self.main_start_velocity * t_local + 0.5 * sign * rate * t_local * t_local;
             (x, v)
-        } else if t < self.t_cruise_end {
+        } else if t_local < t_cruise_end_local {
             // --- Cruise phase (constant speed) ---
             //   v(t) = cruise_speed
             //   x(t) = d_accel + cruise_speed * (t - t_accel)
             let v = self.cruise_speed;
-            let x = self.d_accel + self.cruise_speed * (t - self.t_accel);
+            let x = self.d_accel + self.cruise_speed * (t_local - t_accel_local);
             (x, v)
         } else {
             // --- Deceleration phase ---
@@ -386,14 +644,14 @@ impl TrapezoidalProfile {
             //   td = t_total - t              (time left)
             //   v(t) = decel * td
             //   x(t) = distance - 1/2 * decel * td^2
-            let td = self.t_total - t;
+            let td = t_total_local - t_local;
             let v = self.decel * td;
             let x = self.distance - 0.5 * self.decel * td * td;
             (x, v)
         };
 
         TrajectorySample {
-            position: self.start + self.direction * pos_along,
+            position: self.main_start + self.direction * pos_along,
             velocity: self.direction * speed_along,
         }
     }
@@ -901,5 +1159,181 @@ mod tests {
             }
             other => panic!("expected NonFiniteStopState, got {other:?}"),
         }
+    }
+
+    // --- new_with_start_velocity ------------------------------------------
+
+    #[test]
+    fn start_velocity_zero_matches_plain_new() {
+        // A thin-wrapper guarantee: start_velocity: 0.0 must reproduce
+        // new()'s output exactly, for every phase field new() exposes.
+        let a = TrapezoidalProfile::new(10.0, 250.0, 50.0, 100.0, 80.0).unwrap();
+        let b = TrapezoidalProfile::new_with_start_velocity(10.0, 0.0, 250.0, 50.0, 100.0, 80.0)
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn same_direction_with_room_reaches_cruise() {
+        // v0=20, distance=200, max_speed=50, accel=decel=100.
+        // d_accel = (50^2-20^2)/200 = 10.5, d_decel = 2500/200 = 12.5,
+        // sum=23 <= 200, so trapezoidal: cruise reaches the full max_speed.
+        let p = TrapezoidalProfile::new_with_start_velocity(
+            0.0, 20.0, 200.0, 50.0, 100.0, 100.0,
+        )
+        .unwrap();
+        assert!(approx(p.cruise_speed, 50.0));
+        // At t=0 the profile reports the actual (nonzero) start velocity,
+        // unlike a plain new() move.
+        assert!(approx(p.sample(0.0).position, 0.0));
+        assert!(approx(p.sample(0.0).velocity, 20.0));
+        // End of phase 1: velocity reaches cruise_speed, position matches
+        // the hand-derived accel distance.
+        assert!(approx(p.sample(p.t_accel).velocity, 50.0));
+        assert!(approx(p.sample(p.t_accel).position, 10.5));
+        // Still arrives exactly at rest at the target.
+        let at_end = p.sample(p.duration());
+        assert!(approx(at_end.position, 200.0));
+        assert!(approx(at_end.velocity, 0.0));
+        // No prefix needed for this case.
+        assert!(approx(p.t_prefix_end, 0.0));
+    }
+
+    #[test]
+    fn same_direction_with_room_stays_triangular_below_max_speed() {
+        // v0=10, distance=15, max_speed=50, accel=decel=100: reaching
+        // max_speed would need d_accel+d_decel = 12+12.5 = 24.5 > 15, so
+        // triangular. v_peak = sqrt((2*a*d*dist + v0^2*d)/(a+d))
+        //                     = sqrt((300000+10000)/200) = sqrt(1550).
+        let p =
+            TrapezoidalProfile::new_with_start_velocity(0.0, 10.0, 15.0, 50.0, 100.0, 100.0)
+                .unwrap();
+        let expected_peak = 1550.0_f64.sqrt();
+        assert!(approx(p.cruise_speed, expected_peak));
+        assert!(p.cruise_speed < 50.0);
+        assert!(p.cruise_speed > 10.0);
+        // No cruise phase.
+        assert!(approx(p.t_accel, p.t_cruise_end));
+        let at_end = p.sample(p.duration());
+        assert!(approx(at_end.position, 15.0));
+        assert!(approx(at_end.velocity, 0.0));
+    }
+
+    #[test]
+    fn same_direction_faster_than_new_max_speed_decelerates_into_cruise() {
+        // v0=80 exceeds the new move's max_speed=50: phase 1 must
+        // decelerate into cruise, not accelerate. min_stop_distance =
+        // 80^2/200 = 32 <= 500, so there's room.
+        let p = TrapezoidalProfile::new_with_start_velocity(
+            0.0, 80.0, 500.0, 50.0, 100.0, 100.0,
+        )
+        .unwrap();
+        assert!(approx(p.cruise_speed, 50.0));
+        assert!(approx(p.t_prefix_end, 0.0)); // rides straight in, no prefix
+        assert!(approx(p.sample(0.0).velocity, 80.0));
+        // Phase 1 is losing speed (decelerating into cruise), not gaining.
+        assert_eq!(p.phase_at(p.duration() * 0.01), MotionPhase::Decel);
+        let mid_phase1 = p.sample(p.t_accel / 2.0);
+        assert!(mid_phase1.velocity < 80.0 && mid_phase1.velocity > 50.0);
+        // Once phase 1 completes, velocity never exceeds the new max_speed.
+        let n = 1000;
+        for i in 0..=n {
+            let t = p.t_accel + (p.duration() - p.t_accel) * (i as f64) / (n as f64);
+            assert!(
+                p.sample(t).velocity <= 50.0 + 1e-6,
+                "velocity {} exceeded max_speed at t={}",
+                p.sample(t).velocity,
+                t
+            );
+        }
+        let at_end = p.sample(p.duration());
+        assert!(approx(at_end.position, 500.0));
+        assert!(approx(at_end.velocity, 0.0));
+    }
+
+    #[test]
+    fn same_direction_without_room_overshoots_then_reverses() {
+        // v0=50, end at 5: min_stop_distance = 2500/200 = 12.5 > 5, so no
+        // way to stop at the target directly. Must decelerate to rest
+        // (overshooting to 12.5) then come back.
+        let p =
+            TrapezoidalProfile::new_with_start_velocity(0.0, 50.0, 5.0, 50.0, 100.0, 100.0)
+                .unwrap();
+        assert!(approx(p.t_prefix_end, 0.5)); // 50/100
+        let prefix_end = p.sample(p.t_prefix_end);
+        assert!(approx(prefix_end.position, 12.5)); // overshoot past 5.0
+        assert!(approx(prefix_end.velocity, 0.0));
+        assert_eq!(p.phase_at(p.t_prefix_end / 2.0), MotionPhase::Decel);
+        // The fresh segment afterward reverses direction (12.5 -> 5.0).
+        let just_after = p.sample(p.t_prefix_end + 1e-6);
+        assert!(just_after.velocity < 0.0);
+        let at_end = p.sample(p.duration());
+        assert!(approx(at_end.position, 5.0));
+        assert!(approx(at_end.velocity, 0.0));
+    }
+
+    #[test]
+    fn opposite_direction_decelerates_then_reverses() {
+        // v0=-20 points away from end=100. Must decelerate to rest first
+        // (landing at -2.0, further from `end` than `start`), then a
+        // normal forward move.
+        let p =
+            TrapezoidalProfile::new_with_start_velocity(0.0, -20.0, 100.0, 50.0, 100.0, 100.0)
+                .unwrap();
+        assert!(approx(p.t_prefix_end, 0.2)); // 20/100
+        let prefix_end = p.sample(p.t_prefix_end);
+        assert!(approx(prefix_end.position, -2.0));
+        assert!(approx(prefix_end.velocity, 0.0));
+        assert!(approx(p.sample(0.0).velocity, -20.0));
+        assert_eq!(p.phase_at(0.1), MotionPhase::Decel);
+        let at_end = p.sample(p.duration());
+        assert!(approx(at_end.position, 100.0));
+        assert!(approx(at_end.velocity, 0.0));
+    }
+
+    #[test]
+    fn start_velocity_position_is_continuous_across_all_boundaries() {
+        // No jumps anywhere, including the new prefix/main-segment seam,
+        // for a profile that exercises overshoot-and-reverse.
+        let p =
+            TrapezoidalProfile::new_with_start_velocity(0.0, 50.0, 5.0, 50.0, 100.0, 100.0)
+                .unwrap();
+        for &boundary in &[p.t_prefix_end, p.t_accel, p.t_cruise_end] {
+            let just_before = p.sample(boundary - EPS).position;
+            let just_after = p.sample(boundary + EPS).position;
+            assert!(
+                (just_before - just_after).abs() < 1e-4,
+                "discontinuity at boundary {}: {} vs {}",
+                boundary,
+                just_before,
+                just_after
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_start_velocity() {
+        match TrapezoidalProfile::new_with_start_velocity(
+            0.0,
+            f64::NAN,
+            100.0,
+            50.0,
+            100.0,
+            100.0,
+        ) {
+            Err(TrajectoryError::NonFiniteStartVelocity(v)) => assert!(v.is_nan()),
+            other => panic!("expected NonFiniteStartVelocity, got {other:?}"),
+        }
+        assert_eq!(
+            TrapezoidalProfile::new_with_start_velocity(
+                0.0,
+                f64::INFINITY,
+                100.0,
+                50.0,
+                100.0,
+                100.0,
+            ),
+            Err(TrajectoryError::NonFiniteStartVelocity(f64::INFINITY))
+        );
     }
 }

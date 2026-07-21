@@ -24,7 +24,7 @@
 //!     cargo run -p app
 //!
 //! Commands (one per line on stdin):
-//!     move <axisN> <target_mm> [max_speed] [max_acceleration] [max_deceleration]
+//!     move <axisN> <target_mm> [max_speed] [max_acceleration] [max_deceleration] [aborting|buffered]
 //!     stop <axisN> [max_deceleration]
 //!     enable <axisN>
 //!     disable <axisN>
@@ -48,12 +48,19 @@
 //!
 //! `stop` interrupts whatever an axis is doing (active or queued) with a
 //! controlled deceleration to rest, built from the axis's *actual* current
-//! velocity (see `motion_core::StopRamp`) — the first piece of interrupting
-//! a move in progress, rather than the block-until-idle queuing every other
-//! command still uses. This is PLCopen `MC_Stop`, not DS402's Quick Stop
-//! (a distinct, typically emergency/safety-triggered mechanism) — the
-//! backend's `Ds402State` is unaffected; only the coarser `AxisState` (via
-//! `AxisSetpoint::stopping`) reports `Stopping` instead of `DiscreteMotion`.
+//! velocity (see `motion_core::StopRamp`). This is PLCopen `MC_Stop`, not
+//! DS402's Quick Stop (a distinct, typically emergency/safety-triggered
+//! mechanism) — the backend's `Ds402State` is unaffected; only the coarser
+//! `AxisState` (via `AxisSetpoint::stopping`) reports `Stopping` instead of
+//! `DiscreteMotion`.
+//!
+//! A `move`'s trailing `aborting`/`buffered` keyword picks its PLCopen
+//! `BufferMode`: `buffered` (the default) queues behind a busy axis, FIFO,
+//! and runs once earlier moves finish, same as always; `aborting` takes
+//! over immediately — active or queued — building the new move from the
+//! axis's actual position/velocity via
+//! `motion_core::TrapezoidalProfile::new_with_start_velocity` rather than
+//! waiting for it to come to rest first.
 //!
 //! `verbose` toggles the periodic per-cycle position/phase line printed
 //! while an axis is moving — off by default. Discrete events (move
@@ -65,6 +72,7 @@
 mod recording;
 mod viz;
 
+use std::collections::VecDeque;
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -74,7 +82,7 @@ use std::time::{Duration, Instant};
 
 use axis_backend::{AxisGroup, AxisSetpoint, AxisState, Ds402State};
 use backend_sim::SimAxisGroup;
-use motion_core::{MotionPhase, StopRamp, TrapezoidalProfile};
+use motion_core::{MotionPhase, StopRamp, TrajectoryError, TrapezoidalProfile};
 use recording::{History, RecordingAxisGroup};
 use viz::VizApp;
 
@@ -96,6 +104,25 @@ const HISTORY_SECONDS: f64 = 60.0;
 /// axes — everything else is `Vec`-driven.
 const NUM_AXES: usize = 2;
 
+/// PLCopen `BufferMode`-style dispatch policy for a move. Only
+/// `Aborting`/`Buffered` for this pass — the four blending variants
+/// (`BlendingLow`/`Previous`/`Next`/`High`) need a profile that's aware of
+/// an *adjacent* segment and never fully decelerates before handing off, a
+/// structurally different problem left for its own design pass (see the
+/// `plcopen-motion-goal` memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferMode {
+    /// Takes effect immediately regardless of idle/busy: clears anything
+    /// queued and replaces whatever's active right now, built from the
+    /// axis's *actual* current position/velocity (backend feedback, not a
+    /// commanded setpoint) via `TrapezoidalProfile::new_with_start_velocity`.
+    Aborting,
+    /// Queues behind the current move if the axis is busy (FIFO — every
+    /// buffered move queued eventually runs, in order); starts immediately
+    /// if idle. The default, so omitting a mode keeps today's behavior.
+    Buffered,
+}
+
 enum Command {
     Move {
         axis: usize,
@@ -103,6 +130,7 @@ enum Command {
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+        buffer_mode: BufferMode,
     },
     Enable {
         axis: usize,
@@ -210,22 +238,30 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
             max_deceleration: Some(parse_f64(decel)?),
         })),
         ["move", axis, target, rest @ ..] => {
-            if rest.len() > 3 {
+            // A trailing "aborting"/"buffered" keyword is the buffer mode,
+            // always last regardless of how many numeric args precede it;
+            // everything before it must be the usual up-to-3 numeric args.
+            let (buffer_mode, numeric_rest) = match rest.last() {
+                Some(&"aborting") => (BufferMode::Aborting, &rest[..rest.len() - 1]),
+                Some(&"buffered") => (BufferMode::Buffered, &rest[..rest.len() - 1]),
+                _ => (BufferMode::Buffered, rest),
+            };
+            if numeric_rest.len() > 3 {
                 return Err(format!("too many arguments: {line:?}"));
             }
-            let mut rest = rest.iter();
-            let max_speed = match rest.next() {
+            let mut numeric_rest = numeric_rest.iter();
+            let max_speed = match numeric_rest.next() {
                 Some(v) => parse_f64(v)?,
                 None => DEFAULT_MAX_SPEED,
             };
-            let max_acceleration = match rest.next() {
+            let max_acceleration = match numeric_rest.next() {
                 Some(a) => parse_f64(a)?,
                 None => DEFAULT_MAX_ACCELERATION,
             };
             // Deceleration defaults to whatever acceleration resolved to
             // (default or user-specified), so a symmetric move needs no
             // extra argument.
-            let max_deceleration = match rest.next() {
+            let max_deceleration = match numeric_rest.next() {
                 Some(d) => parse_f64(d)?,
                 None => max_acceleration,
             };
@@ -235,6 +271,7 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
                 max_speed,
                 max_acceleration,
                 max_deceleration,
+                buffer_mode,
             }))
         }
         _ => Err(format!(
@@ -289,10 +326,14 @@ fn print_help() {
     println!("commands:");
     println!(
         "  move <axisN> <target_mm> [max_speed_mm_s] [max_acceleration_mm_s2] \
-         [max_deceleration_mm_s2]"
+         [max_deceleration_mm_s2] [aborting|buffered]"
     );
     println!("      axisN is axis0..axis{}", NUM_AXES - 1);
     println!("      (deceleration defaults to the acceleration value if omitted)");
+    println!(
+        "      (buffered [default]: queues behind a busy axis, FIFO, and runs when it's \
+         idle; aborting: takes over right now, from the axis's actual position/velocity)"
+    );
     println!("  stop <axisN> [max_deceleration_mm_s2]  — decelerate to a stop now");
     println!("      (interrupts any active or queued move; decel defaults to the move default)");
     println!("  enable <axisN>         — power up and enable an axis (required before move)");
@@ -311,9 +352,8 @@ fn print_help() {
          reset, then enable again, to recover)"
     );
     println!(
-        "  (a move sent to an axis that's already moving is queued and starts \
-         the instant that axis's current move finishes — only the most \
-         recent queued move per axis is kept; axes are otherwise independent)"
+        "  (a buffered move sent to an axis that's already moving queues (FIFO) and \
+         starts once earlier queued/active moves finish; axes are otherwise independent)"
     );
     println!();
 }
@@ -360,6 +400,33 @@ impl Profile {
     }
 }
 
+/// Clears any queued moves and replaces whatever's active on `ax` with a
+/// fresh profile built from its *actual* current position/velocity —
+/// shared by `stop` (builds a `StopRamp`) and an `aborting` move (builds a
+/// `TrapezoidalProfile` via `new_with_start_velocity`). `build` receives
+/// (position, velocity), does its own success printing (it alone knows the
+/// right message and has the built profile's `duration()` to hand), and
+/// returns the `Profile` to install or a `TrajectoryError` to report the
+/// same way regardless of which case triggered it.
+fn abort_into(
+    ax: &mut AxisRuntime,
+    axis: usize,
+    action: &str,
+    build: impl FnOnce(f64, f64) -> Result<Profile, TrajectoryError>,
+) {
+    ax.pending.clear();
+    match build(ax.position, ax.velocity) {
+        Ok(profile) => {
+            ax.active = Some(ActiveMove {
+                profile,
+                started_at: Instant::now(),
+            });
+            ax.last_phase = None;
+        }
+        Err(e) => println!("  ! {}: {action} rejected: {e}", axis_label(axis)),
+    }
+}
+
 /// An in-progress move (or stop): the profile plus the wall-clock instant it
 /// began. Profiles themselves only know relative/elapsed time (see the
 /// `NOTE (dt seam)` comment in motion-core) — the loop is what anchors them
@@ -388,11 +455,10 @@ struct AxisRuntime {
     position: f64,
     velocity: f64,
     active: Option<ActiveMove>,
-    // Single-slot queue: at most one move waits for the current one to
-    // finish. This is the "block until idle" policy — deliberately simple
-    // for now; see plcopen-motion-goal memory for why not to bake in
-    // "always starts at rest" any harder than this in the API shape.
-    pending: Option<PendingMove>,
+    // FIFO queue of buffered moves waiting for the current one (and each
+    // other) to finish, in order. An `aborting` move bypasses this
+    // entirely — see `BufferMode` and `abort_into`.
+    pending: VecDeque<PendingMove>,
     last_status_print: Instant,
     last_phase: Option<MotionPhase>,
     // What the user last asked for via `enable`/`disable` — sent to the
@@ -426,7 +492,7 @@ impl AxisRuntime {
             position: 0.0,
             velocity: 0.0,
             active: None,
-            pending: None,
+            pending: VecDeque::new(),
             last_status_print: Instant::now(),
             last_phase: None,
             want_enabled: false,
@@ -455,40 +521,49 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
     let mut verbose = false;
 
     loop {
-        // 1. If idle and a move is queued, start it now.
+        // 1. If idle and moves are queued, start the next one now. A
+        //    rejected candidate (bad kinematic params) is dropped and the
+        //    next queued item is tried in the same cycle, rather than
+        //    retrying the same bad one forever; an axis that's no longer
+        //    enabled drops the whole queue at once with one message,
+        //    instead of one drop-message per item per cycle.
         for (i, ax) in axes.iter_mut().enumerate() {
-            if ax.active.is_none() {
-                if let Some(p) = ax.pending.take() {
-                    if !axis_operational(ax.axis_state) {
+            if ax.active.is_some() || ax.pending.is_empty() {
+                continue;
+            }
+            if !axis_operational(ax.axis_state) {
+                let dropped = ax.pending.len();
+                ax.pending.clear();
+                println!(
+                    "  ! {}: {dropped} queued move(s) dropped: axis is not enabled",
+                    axis_label(i)
+                );
+                continue;
+            }
+            while let Some(p) = ax.pending.pop_front() {
+                match TrapezoidalProfile::new(
+                    ax.position,
+                    p.target,
+                    p.max_speed,
+                    p.max_acceleration,
+                    p.max_deceleration,
+                ) {
+                    Ok(profile) => {
                         println!(
-                            "  ! {}: queued move dropped: axis is not enabled",
-                            axis_label(i)
+                            "  -> {}: starting queued move: {:.3} -> {:.3} mm ({:.3}s)",
+                            axis_label(i),
+                            ax.position,
+                            p.target,
+                            profile.duration()
                         );
-                        continue;
+                        ax.active = Some(ActiveMove {
+                            profile: Profile::Move(profile),
+                            started_at: Instant::now(),
+                        });
+                        break;
                     }
-                    match TrapezoidalProfile::new(
-                        ax.position,
-                        p.target,
-                        p.max_speed,
-                        p.max_acceleration,
-                        p.max_deceleration,
-                    ) {
-                        Ok(profile) => {
-                            println!(
-                                "  -> {}: starting queued move: {:.3} -> {:.3} mm ({:.3}s)",
-                                axis_label(i),
-                                ax.position,
-                                p.target,
-                                profile.duration()
-                            );
-                            ax.active = Some(ActiveMove {
-                                profile: Profile::Move(profile),
-                                started_at: Instant::now(),
-                            });
-                        }
-                        Err(e) => {
-                            println!("  ! {}: queued move rejected: {e}", axis_label(i));
-                        }
+                    Err(e) => {
+                        println!("  ! {}: queued move rejected: {e}", axis_label(i));
                     }
                 }
             }
@@ -651,6 +726,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_speed,
                     max_acceleration,
                     max_deceleration,
+                    buffer_mode,
                 } => {
                     let ax = &mut axes[axis];
                     if !axis_operational(ax.axis_state) {
@@ -658,41 +734,66 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             "  ! {}: move rejected: axis is disabled (enable it first)",
                             axis_label(axis)
                         );
-                    } else if ax.active.is_none() {
-                        match TrapezoidalProfile::new(
-                            ax.position,
-                            target,
-                            max_speed,
-                            max_acceleration,
-                            max_deceleration,
-                        ) {
-                            Ok(profile) => {
-                                println!(
-                                    "  -> {}: move: {:.3} -> {target:.3} mm ({:.3}s)",
-                                    axis_label(axis),
-                                    ax.position,
-                                    profile.duration()
-                                );
-                                ax.active = Some(ActiveMove {
-                                    profile: Profile::Move(profile),
-                                    started_at: Instant::now(),
+                    } else {
+                        match buffer_mode {
+                            BufferMode::Aborting => {
+                                abort_into(ax, axis, "move", move |position, velocity| {
+                                    let profile = TrapezoidalProfile::new_with_start_velocity(
+                                        position,
+                                        velocity,
+                                        target,
+                                        max_speed,
+                                        max_acceleration,
+                                        max_deceleration,
+                                    )?;
+                                    println!(
+                                        "  -> {}: move (aborting): {:.3} -> {target:.3} mm ({:.3}s)",
+                                        axis_label(axis),
+                                        position,
+                                        profile.duration()
+                                    );
+                                    Ok(Profile::Move(profile))
                                 });
                             }
-                            Err(e) => {
-                                println!("  ! {}: move rejected: {e}", axis_label(axis));
+                            BufferMode::Buffered if ax.active.is_none() => {
+                                match TrapezoidalProfile::new(
+                                    ax.position,
+                                    target,
+                                    max_speed,
+                                    max_acceleration,
+                                    max_deceleration,
+                                ) {
+                                    Ok(profile) => {
+                                        println!(
+                                            "  -> {}: move: {:.3} -> {target:.3} mm ({:.3}s)",
+                                            axis_label(axis),
+                                            ax.position,
+                                            profile.duration()
+                                        );
+                                        ax.active = Some(ActiveMove {
+                                            profile: Profile::Move(profile),
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        println!("  ! {}: move rejected: {e}", axis_label(axis));
+                                    }
+                                }
+                            }
+                            BufferMode::Buffered => {
+                                println!(
+                                    "  -> {}: busy: queuing move to {target:.3} mm ({} already queued)",
+                                    axis_label(axis),
+                                    ax.pending.len()
+                                );
+                                ax.pending.push_back(PendingMove {
+                                    target,
+                                    max_speed,
+                                    max_acceleration,
+                                    max_deceleration,
+                                });
                             }
                         }
-                    } else {
-                        println!(
-                            "  -> {}: busy: queuing move to {target:.3} mm",
-                            axis_label(axis)
-                        );
-                        ax.pending = Some(PendingMove {
-                            target,
-                            max_speed,
-                            max_acceleration,
-                            max_deceleration,
-                        });
                     }
                 }
                 Command::Stop {
@@ -702,33 +803,25 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     let ax = &mut axes[axis];
                     if !axis_operational(ax.axis_state) {
                         println!("  ! {}: stop rejected: axis is disabled", axis_label(axis));
+                    } else if ax.active.is_none() && ax.velocity.abs() < AT_REST_EPS {
+                        // Nothing queued survives this either way (see
+                        // abort_into), but there's genuinely nothing to
+                        // decelerate — short-circuit before building a
+                        // zero-duration StopRamp just to say so.
+                        ax.pending.clear();
+                        println!("  -> {}: already at rest", axis_label(axis));
                     } else {
-                        // A stop cancels anything queued too, not just
-                        // whatever's currently active.
-                        ax.pending = None;
-                        if ax.active.is_none() && ax.velocity.abs() < AT_REST_EPS {
-                            println!("  -> {}: already at rest", axis_label(axis));
-                        } else {
-                            let decel = max_deceleration.unwrap_or(DEFAULT_MAX_ACCELERATION);
-                            match StopRamp::new(ax.position, ax.velocity, decel) {
-                                Ok(ramp) => {
-                                    println!(
-                                        "  -> {}: stopping: {:.3} mm/s -> 0 (decel {decel:.3} mm/s^2, {:.3}s)",
-                                        axis_label(axis),
-                                        ax.velocity,
-                                        ramp.duration()
-                                    );
-                                    ax.active = Some(ActiveMove {
-                                        profile: Profile::Stop(ramp),
-                                        started_at: Instant::now(),
-                                    });
-                                    ax.last_phase = None;
-                                }
-                                Err(e) => {
-                                    println!("  ! {}: stop rejected: {e}", axis_label(axis));
-                                }
-                            }
-                        }
+                        let decel = max_deceleration.unwrap_or(DEFAULT_MAX_ACCELERATION);
+                        abort_into(ax, axis, "stop", move |position, velocity| {
+                            let ramp = StopRamp::new(position, velocity, decel)?;
+                            println!(
+                                "  -> {}: stopping: {:.3} mm/s -> 0 (decel {decel:.3} mm/s^2, {:.3}s)",
+                                axis_label(axis),
+                                velocity,
+                                ramp.duration()
+                            );
+                            Ok(Profile::Stop(ramp))
+                        });
                     }
                 }
                 Command::Enable { axis } => {
