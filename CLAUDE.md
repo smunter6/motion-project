@@ -60,7 +60,15 @@ over-produce; confirm direction at natural decision points.
   max_deceleration) -> Result<Self, TrajectoryError>` (fallible — validates
   finiteness and sign, doesn't panic on bad input). Accel/decel are
   independent rates. `.sample(t)`, `.duration()`, `.target()`, `.phase_at(t)`.
-  17 unit tests. `src/bin/demo_axis.rs` demos one move at 250 Hz.
+  `src/bin/demo_axis.rs` demos one move at 250 Hz. Also **`StopRamp`**
+  (added 2026-07-20): the rest-to-rest assumption baked into
+  `TrapezoidalProfile` (see `plcopen-motion-goal` memory) can't represent a
+  running-start deceleration, so this is a separate, much simpler type —
+  current-velocity-to-rest, one phase, no target position — rather than a
+  generalization of `TrapezoidalProfile`. Same `sample`/`phase_at`/`target`
+  shape; a zero-velocity ramp reports `Done` immediately (not `Pre` forever,
+  unlike `TrapezoidalProfile`'s zero-distance case — see its doc comment for
+  why the two cases differ). 24 unit tests total.
 - `axis-backend`: the `AxisGroup` trait seam (`exchange()`, one combined
   cyclic call) + `AxisSetpoint`/`AxisFeedback`/`AxisFault`/`AxisGroupError`.
   `AxisSetpoint` carries `enabled: bool` and `fault_reset: bool` — two
@@ -79,7 +87,14 @@ over-produce; confirm direction at natural decision points.
   inside `backend-sim`) since `backend-ethercat` will need the same shape
   later. Also carries `MotionFlags`
   (`accelerating`/`constant_velocity`/`decelerating`). `AxisFault` has one
-  real category so far: `DisabledWhileMoving`.
+  real category so far: `DisabledWhileMoving`. `AxisSetpoint` also carries
+  `stopping: bool` (added 2026-07-20, for the `stop` command): PLCopen
+  `MC_Stop` and DS402 Quick Stop are deliberately different things — a
+  commanded stop only flips the coarser `AxisState` to `Stopping` (replacing
+  `DiscreteMotion`), `Ds402State` is untouched and stays `OperationEnabled`,
+  since the drive itself sees nothing but an ordinary decelerating velocity
+  setpoint. `Ds402State::QuickStopActive` stays reserved — that's a distinct,
+  typically emergency/safety-triggered mechanism, not implemented.
 - `backend-sim`: `SimAxisGroup`, a software `AxisGroup` that integrates
   velocity into position each cycle (dt-stepping, not a pass-through), but
   only while `OperationEnabled` — a disabled (or faulted) axis ignores
@@ -95,22 +110,27 @@ over-produce; confirm direction at natural decision points.
   power stage mid-motion the way it can from rest. `Fault` only clears via
   `fault_reset` (DS402 transition 15, to `SwitchOnDisabled`); resetting
   does not itself re-enable the axis. Disabling from `StandStill` (never
-  actually moving) stays graceful, no fault. 18 unit tests total, including
-  dedicated coverage of the enable/disable sequence and the fault/reset
-  path (dev-dependency on `motion-core` lets some tests drive a real
+  actually moving) stays graceful, no fault. A commanded stop
+  (`AxisSetpoint::stopping`) only ever overrides `DiscreteMotion` ->
+  `Stopping` in the reported `AxisState`; `Ds402State` and the actual
+  velocity-integration physics are unaffected — `backend-sim` doesn't know
+  or care *why* a decelerating velocity was commanded, only whether it was.
+  20 unit tests total, including dedicated coverage of the enable/disable
+  sequence, the fault/reset path, and the stopping-flag override (dev-
+  dependency on `motion-core` lets some tests drive a real
   `TrapezoidalProfile`'s sampled velocity through the sim rather than
   hand-crafted sequences).
 - `app`: a continuously-running, multi-axis (`axis0`, `axis1`, `NUM_AXES`)
-  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]`, `enable
-  <axisN>`, `disable <axisN>`, `reset <axisN>`, `status`, `help`, `quit`.
-  Fixed 250 Hz control loop on its own thread, decoupled from blocking
-  stdin by a channel. Each cycle samples the active trajectory (or holds at
-  rest if idle) into an `AxisSetpoint` per axis, calls
-  `SimAxisGroup::exchange` once, and treats the returned feedback as ground
-  truth for position/velocity — a new move's start is the axis's *actual*
-  (backend) position, not the last commanded one. Moves queue (single slot
-  per axis) while an axis is busy, block-until-idle. Axes are fully
-  independent — see Step 2, deferred. Axes start disabled (DS402
+  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]`, `stop <axisN>
+  [decel]`, `enable <axisN>`, `disable <axisN>`, `reset <axisN>`, `status`,
+  `help`, `quit`. Fixed 250 Hz control loop on its own thread, decoupled
+  from blocking stdin by a channel. Each cycle samples the active
+  trajectory (or holds at rest if idle) into an `AxisSetpoint` per axis,
+  calls `SimAxisGroup::exchange` once, and treats the returned feedback as
+  ground truth for position/velocity — a new move's start is the axis's
+  *actual* (backend) position, not the last commanded one. Moves queue
+  (single slot per axis) while an axis is busy, block-until-idle. Axes are
+  fully independent — see Step 2, deferred. Axes start disabled (DS402
   `SwitchOnDisabled`, matching real drive power-up); `move` on a disabled
   axis is rejected, not queued. Disabling a moving axis faults it (position
   freezes where it was, `Command::Enable` refuses outright while faulted —
@@ -120,6 +140,34 @@ over-produce; confirm direction at natural decision points.
   `enable` afterward, same as the backend. DS402 transitions print to the
   terminal as the backend confirms them, and `status` shows the current
   `Ds402State`.
+  **`stop`** (added 2026-07-20, the first piece of interrupting a move in
+  progress rather than queuing behind it — a single-axis concern, distinct
+  from Step 2's multi-axis coordination; see the `plcopen-motion-goal`
+  memory's long-term abort/buffer/blend goal): builds a
+  `motion_core::StopRamp` from the axis's *actual*
+  position/velocity and replaces whatever's active (also clearing anything
+  queued). A local `Profile` enum (`Move(TrapezoidalProfile)` /
+  `Stop(StopRamp)`) is what lets the rest of the loop treat "whatever's
+  currently active" uniformly — completion/abort/fault messages still
+  differentiate ("stopped at" vs "reached", "stop faulted" vs "move
+  faulted") via `Profile::is_stop()`. Rejected on a disabled axis; a
+  short-circuit for an axis already at rest. `stop` deliberately does *not*
+  touch `Ds402State`/DS402 Quick Stop — see the `axis-backend` entry above.
+  **`verbose`** toggles the periodic per-cycle position/phase heartbeat
+  printed while an axis is moving (off by default — the viz window already
+  plots target-vs-actual continuously, so it's usually redundant on the
+  terminal). Discrete events (move started/finished/aborted, enable/
+  disable, faults, DS402 transitions) always print regardless; only the
+  repetitive heartbeat is gated.
+  **Layering rule (settled 2026-07-21, see `feedback_axis_state_layering`
+  memory)**: `app`'s business logic — move/stop rejection, queue
+  promotion, `enable`/`disable`/`reset` gating — checks `AxisState` only,
+  via a small `axis_operational()` helper, never `Ds402State` directly.
+  `AxisRuntime` carries both fields, but `ds402_state` is read *only* to
+  detect and print DS402 transitions for traceability; nothing branches on
+  it. Keeps `app` backend-agnostic the same way the trait seam itself is —
+  a `backend-ethercat` swap-in only has to report the same `AxisState`
+  values, not replicate `backend-sim`'s exact DS402 timing.
 - `app`'s viz window (`app/src/viz.rs` + `app/src/recording.rs`): an
   eframe/egui_plot window baked into the `app` binary itself, not a separate
   crate. Input stays entirely terminal-driven — viz has no controls, it only
