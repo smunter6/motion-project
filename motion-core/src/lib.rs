@@ -24,6 +24,8 @@
 //! software sim backend, simple visualization, and eventually an EtherCRAB +
 //! CiA 402 backend for real drives.
 
+pub mod linear_move;
 pub mod trajectory;
 
+pub use linear_move::{LinearMove, LinearMoveError, LinearMoveSample, MAX_GROUP_AXES};
 pub use trajectory::{MotionPhase, StopRamp, TrajectoryError, TrajectorySample, TrapezoidalProfile};
