@@ -68,7 +68,26 @@ over-produce; confirm direction at natural decision points.
   generalization of `TrapezoidalProfile`. Same `sample`/`phase_at`/`target`
   shape; a zero-velocity ramp reports `Done` immediately (not `Pre` forever,
   unlike `TrapezoidalProfile`'s zero-distance case — see its doc comment for
-  why the two cases differ). 24 unit tests total.
+  why the two cases differ). Also
+  **`TrapezoidalProfile::new_with_start_velocity(start, start_velocity, end,
+  max_speed, max_acceleration, max_deceleration)`** (added 2026-07-21): this
+  *does* extend `TrapezoidalProfile` itself rather than adding a second type
+  — the user's explicit correction, overriding the `StopRamp` precedent (see
+  `plcopen-motion-goal` memory). Handles interrupting an in-flight move with
+  a new target (backs `app`'s `BufferMode::Aborting`), covering three cases
+  through one unified internal path rather than a case-by-case dispatch: a
+  private `build_main_segment` helper generalizes the rest-to-rest
+  ramp/cruise/decel math to start from an arbitrary speed (including the
+  sub-case where `start_velocity` already exceeds the *new* move's
+  `max_speed`, so phase 1 decelerates into cruise instead of accelerating),
+  and an optional decel-to-rest "prefix" (`StopRamp`-style math) handles
+  both the same-direction-overshoot and opposite-direction cases — which
+  turn out to be the identical code path, distinguished only by which side
+  of the target the deceleration happens to land on. The new move's own
+  max_speed/max_acceleration/max_deceleration govern the *entire* resulting
+  profile, including any reversal preamble — no blending or carryover from
+  whatever move was superseded. `new()` is now a verified bit-identical thin
+  wrapper (`start_velocity: 0.0`). 32 unit tests total.
 - `axis-backend`: the `AxisGroup` trait seam (`exchange()`, one combined
   cyclic call) + `AxisSetpoint`/`AxisFeedback`/`AxisFault`/`AxisGroupError`.
   `AxisSetpoint` carries `enabled: bool` and `fault_reset: bool` — two
@@ -121,16 +140,16 @@ over-produce; confirm direction at natural decision points.
   `TrapezoidalProfile`'s sampled velocity through the sim rather than
   hand-crafted sequences).
 - `app`: a continuously-running, multi-axis (`axis0`, `axis1`, `NUM_AXES`)
-  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]`, `stop <axisN>
-  [decel]`, `enable <axisN>`, `disable <axisN>`, `reset <axisN>`, `status`,
-  `help`, `quit`. Fixed 250 Hz control loop on its own thread, decoupled
-  from blocking stdin by a channel. Each cycle samples the active
-  trajectory (or holds at rest if idle) into an `AxisSetpoint` per axis,
-  calls `SimAxisGroup::exchange` once, and treats the returned feedback as
-  ground truth for position/velocity — a new move's start is the axis's
-  *actual* (backend) position, not the last commanded one. Moves queue
-  (single slot per axis) while an axis is busy, block-until-idle. Axes are
-  fully independent — see Step 2, deferred. Axes start disabled (DS402
+  terminal app — `move <axisN> <target> [vmax] [amax] [dmax]
+  [aborting|buffered]`, `stop <axisN> [decel]`, `enable <axisN>`, `disable
+  <axisN>`, `reset <axisN>`, `status`, `help`, `quit`. Fixed 250 Hz control
+  loop on its own thread, decoupled from blocking stdin by a channel. Each
+  cycle samples the active trajectory (or holds at rest if idle) into an
+  `AxisSetpoint` per axis, calls `SimAxisGroup::exchange` once, and treats
+  the returned feedback as ground truth for position/velocity — a new
+  move's start is the axis's *actual* (backend) position, not the last
+  commanded one. Axes are fully independent — see Step 2, deferred. Axes
+  start disabled (DS402
   `SwitchOnDisabled`, matching real drive power-up); `move` on a disabled
   axis is rejected, not queued. Disabling a moving axis faults it (position
   freezes where it was, `Command::Enable` refuses outright while faulted —
@@ -153,6 +172,26 @@ over-produce; confirm direction at natural decision points.
   faulted") via `Profile::is_stop()`. Rejected on a disabled axis; a
   short-circuit for an axis already at rest. `stop` deliberately does *not*
   touch `Ds402State`/DS402 Quick Stop — see the `axis-backend` entry above.
+  **`BufferMode` (added 2026-07-21, see `plcopen-motion-goal` memory)**:
+  `Command::Move` takes an optional trailing `aborting`/`buffered` keyword
+  (default `Buffered`, so omitting it keeps prior behavior).
+  `AxisRuntime.pending` is a real `VecDeque<PendingMove>` FIFO now (was a
+  single replace-only slot) — a deliberate behavior change, every buffered
+  move queued eventually runs, in order, rather than only the most recent
+  being kept; queue promotion pops and tries moves one at a time (a
+  kinematically-invalid one is dropped and the next tried the same cycle,
+  rather than retried forever), and an axis that stops being enabled drops
+  its *entire* queue at once with one summary message.
+  `BufferMode::Aborting` bypasses the queue entirely — active or idle,
+  immediately — via a shared `abort_into` helper (clears `pending`, builds a
+  fresh profile from the axis's *actual* position/velocity, replaces
+  `ax.active`, reports build errors uniformly) also used by `stop`.
+  `Aborting` moves are built with
+  `motion_core::TrapezoidalProfile::new_with_start_velocity`, so an
+  in-flight move can be redirected to a new target — same-direction or
+  reversed — without waiting for it to reach rest first. Only
+  `Aborting`/`Buffered` so far; the four PLCopen blending variants are a
+  deferred, structurally different problem (see the memory).
   **`verbose`** toggles the periodic per-cycle position/phase heartbeat
   printed while an axis is moving (off by default — the viz window already
   plots target-vs-actual continuously, so it's usually redundant on the
