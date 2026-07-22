@@ -34,6 +34,26 @@
 //! degenerates to precisely the straight line between them — the sanity
 //! check this module's tests lean on.
 //!
+//! # Blending onto an in-flight path (`new_with_start_direction`)
+//!
+//! The reflected phantom is really just an *assumption*: "the incoming
+//! direction was a straight-line approach toward P1" — reasonable when a
+//! path starts from rest, wrong when it's replacing a move that was already
+//! in motion. [`WaypointPath::new_with_start_direction`] swaps that
+//! assumption for the truth when one is known: the leading phantom is
+//! placed behind `P0` along the given direction instead of via reflection,
+//! at the same characteristic distance (`|P0-P1|`) the reflection would
+//! have used — same phantom-point *slot*, same Catmull-Rom evaluation, same
+//! knot-spacing math, just a different formula for what fills it. This is
+//! *not* an exact tangent match (a Catmull-Rom tangent at `P0` is a blend
+//! of the phantom *and* `P1`, not the phantom's direction alone) — a small,
+//! accepted approximation, deliberately consistent with the rest of this
+//! module's tradeoffs (see `tangent_at_arc_length`'s own docs) rather than
+//! a mathematically exact alternative (e.g. an explicit Hermite tangent).
+//! An all-zero (or omitted) direction falls back to the ordinary reflected
+//! phantom exactly as before — nothing to blend from if the incoming
+//! velocity was zero.
+//!
 //! # Arc length has no closed form for a cubic
 //!
 //! so each segment gets its own lookup table, built once at construction:
@@ -93,6 +113,12 @@ pub enum WaypointPathError {
     /// which both the centripetal knot formula and a `Line` segment can't
     /// represent meaningfully.
     CoincidentWaypoints { segment_index: usize },
+    /// `start_direction` (passed to
+    /// [`WaypointPath::new_with_start_direction`]) has a different number
+    /// of axes than the waypoints.
+    StartDirectionDimensionMismatch { expected: usize, got: usize },
+    /// A `start_direction` coordinate is NaN or +/-infinity.
+    NonFiniteStartDirection { axis_index: usize, value: f64 },
 }
 
 impl std::fmt::Display for WaypointPathError {
@@ -132,6 +158,14 @@ impl std::fmt::Display for WaypointPathError {
                 f,
                 "waypoints {segment_index} and {} are identical (zero-length segment)",
                 segment_index + 1
+            ),
+            WaypointPathError::StartDirectionDimensionMismatch { expected, got } => write!(
+                f,
+                "start_direction has {got} axes, expected {expected} (from the waypoints)"
+            ),
+            WaypointPathError::NonFiniteStartDirection { axis_index, value } => write!(
+                f,
+                "start_direction axis {axis_index}: must be a finite number (got {value})"
             ),
         }
     }
@@ -182,13 +216,13 @@ fn lerp_param(pa: &Point, pb: &Point, ta: f64, tb: f64, t: f64, axes: usize) -> 
 /// One arc-length lookup table entry, local to a segment: `u` (the
 /// segment-local parameter, `0.0..=1.0`) paired with the true Euclidean
 /// distance traveled from the segment's start to reach it.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct LutEntry {
     u: f64,
     local_arc_length: f64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Segment {
     kind: SegmentKind,
     /// Catmull-Rom control points (only meaningful for `Spline`; `p1`/`p2`
@@ -229,7 +263,7 @@ fn evaluate_segment(seg: &Segment, axes: usize, u: f64) -> Point {
 /// arc-length approach. Geometry only: [`crate::path_profile::PathProfile`]
 /// composes this with a scalar [`crate::TrapezoidalProfile`] over arc length
 /// to add time.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct WaypointPath {
     axes: usize,
     segments: Vec<Segment>,
@@ -244,8 +278,28 @@ impl WaypointPath {
     /// same N), with `segment_kinds[i]` governing the segment from
     /// `waypoints[i]` to `waypoints[i+1]` (so `segment_kinds.len()` must be
     /// exactly `waypoints.len() - 1`).
+    ///
+    /// A thin wrapper — `new_with_start_direction` with an all-zero
+    /// direction — exactly mirroring this crate's other `new`/
+    /// `new_with_start_velocity` pairs.
     pub fn new(
         waypoints: Vec<Vec<f64>>,
+        segment_kinds: Vec<SegmentKind>,
+    ) -> Result<Self, WaypointPathError> {
+        let start_direction = vec![0.0; waypoints.first().map_or(0, |w| w.len())];
+        Self::new_with_start_direction(waypoints, start_direction, segment_kinds)
+    }
+
+    /// Build a path the same way `new` does, except the path's very first
+    /// phantom control point (see the module docs' "Blending" section) is
+    /// placed along `start_direction` — the group's actual incoming
+    /// velocity, typically — instead of via reflection, so the path's own
+    /// start tangent leans toward matching an in-flight move it's
+    /// replacing. An all-zero `start_direction` (including the all-zero
+    /// vector `new` passes) falls back to the ordinary reflected phantom.
+    pub fn new_with_start_direction(
+        waypoints: Vec<Vec<f64>>,
+        start_direction: Vec<f64>,
         segment_kinds: Vec<SegmentKind>,
     ) -> Result<Self, WaypointPathError> {
         let n = waypoints.len();
@@ -281,6 +335,20 @@ impl WaypointPath {
                 segment_kinds: segment_kinds.len(),
             });
         }
+        if start_direction.len() != axes {
+            return Err(WaypointPathError::StartDirectionDimensionMismatch {
+                expected: axes,
+                got: start_direction.len(),
+            });
+        }
+        for (a, &v) in start_direction.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(WaypointPathError::NonFiniteStartDirection {
+                    axis_index: a,
+                    value: v,
+                });
+            }
+        }
 
         let wp_arr: Vec<Point> = waypoints
             .iter()
@@ -297,10 +365,23 @@ impl WaypointPath {
             }
         }
 
-        // Reflected phantom endpoints, then every segment's 4 control
-        // points are just a sliding window over [phantom_start, P0..Pn-1,
-        // phantom_end].
-        let phantom_start = reflect(&wp_arr[0], &wp_arr[1], axes);
+        // The leading phantom: placed along start_direction (at the same
+        // characteristic distance a reflection would use) whenever a
+        // nonzero direction was given, otherwise the ordinary reflected
+        // phantom — see the module docs' "Blending" section.
+        let mut dir_arr = [0.0; MAX_GROUP_AXES];
+        dir_arr[..axes].copy_from_slice(&start_direction);
+        let dir_norm: f64 = dir_arr[..axes].iter().map(|v| v * v).sum::<f64>().sqrt();
+        let phantom_start = if dir_norm > 0.0 {
+            let d = dist(&wp_arr[0], &wp_arr[1], axes);
+            let mut p = [0.0; MAX_GROUP_AXES];
+            for i in 0..axes {
+                p[i] = wp_arr[0][i] - (dir_arr[i] / dir_norm) * d;
+            }
+            p
+        } else {
+            reflect(&wp_arr[0], &wp_arr[1], axes)
+        };
         let phantom_end = reflect(&wp_arr[n - 1], &wp_arr[n - 2], axes);
         let mut extended: Vec<Point> = Vec::with_capacity(n + 2);
         extended.push(phantom_start);
@@ -687,5 +768,93 @@ mod tests {
         let after = path.position_at_arc_length(path.total_length() + 5.0);
         let end = path.position_at_arc_length(path.total_length());
         assert!(approx(after[0], end[0]) && approx(after[1], end[1]));
+    }
+
+    // --- new_with_start_direction ("blend") -----------------------------
+
+    #[test]
+    fn new_is_thin_wrapper_of_new_with_start_direction() {
+        let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
+        let segment_kinds = vec![SegmentKind::Spline, SegmentKind::Spline];
+        let a = WaypointPath::new(waypoints.clone(), segment_kinds.clone()).unwrap();
+        let b = WaypointPath::new_with_start_direction(waypoints, vec![0.0, 0.0], segment_kinds)
+            .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn start_direction_places_leading_phantom_along_given_direction() {
+        // Direction (1, 0) at characteristic distance |P0-P1| = 5 should
+        // place the phantom exactly 5 units in -X from P0 = (10, 20).
+        let path = WaypointPath::new_with_start_direction(
+            vec![vec![10.0, 20.0], vec![15.0, 20.0], vec![15.0, 30.0]],
+            vec![1.0, 0.0],
+            vec![SegmentKind::Spline, SegmentKind::Spline],
+        )
+        .unwrap();
+        let phantom = path.segments[0].p0;
+        assert!(approx(phantom[0], 5.0));
+        assert!(approx(phantom[1], 20.0));
+    }
+
+    #[test]
+    fn zero_start_direction_falls_back_to_reflection() {
+        let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
+        let segment_kinds = vec![SegmentKind::Spline, SegmentKind::Spline];
+        let reflected = WaypointPath::new(waypoints.clone(), segment_kinds.clone()).unwrap();
+        let blended = WaypointPath::new_with_start_direction(waypoints, vec![0.0, 0.0], segment_kinds)
+            .unwrap();
+        assert_eq!(reflected, blended);
+    }
+
+    #[test]
+    fn start_direction_tangent_is_close_to_given_direction() {
+        // Not exact (see module docs), but should land much closer to the
+        // requested direction than the plain reflected-phantom tangent
+        // would for a path that turns sharply away from it.
+        let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, -10.0]];
+        let segment_kinds = vec![SegmentKind::Spline, SegmentKind::Spline];
+        // Incoming direction is +Y, even though the path immediately heads
+        // toward +X then -Y — a deliberately sharp mismatch with the
+        // default reflection (which would point along +X).
+        let blended = WaypointPath::new_with_start_direction(
+            waypoints,
+            vec![0.0, 1.0],
+            segment_kinds,
+        )
+        .unwrap();
+        let tangent = blended.tangent_at_arc_length(0.0);
+        // Cosine similarity to (0, 1) should be strongly positive (tangent
+        // leans toward +Y), unlike the default reflection's tangent which
+        // would point along +X (cosine ~= 0 against (0,1)).
+        assert!(tangent[1] > 0.5, "tangent {tangent:?} doesn't lean toward the given direction");
+    }
+
+    #[test]
+    fn rejects_start_direction_dimension_mismatch() {
+        assert_eq!(
+            WaypointPath::new_with_start_direction(
+                vec![vec![0.0, 0.0], vec![1.0, 1.0]],
+                vec![1.0, 2.0, 3.0],
+                vec![SegmentKind::Spline],
+            )
+            .unwrap_err(),
+            WaypointPathError::StartDirectionDimensionMismatch { expected: 2, got: 3 }
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_start_direction() {
+        match WaypointPath::new_with_start_direction(
+            vec![vec![0.0, 0.0], vec![1.0, 1.0]],
+            vec![f64::NAN, 0.0],
+            vec![SegmentKind::Spline],
+        ) {
+            Err(WaypointPathError::NonFiniteStartDirection { axis_index, value }) => {
+                assert_eq!(axis_index, 0);
+                assert!(value.is_nan());
+            }
+            other => panic!("expected NonFiniteStartDirection, got {other:?}"),
+        }
     }
 }

@@ -127,12 +127,16 @@ const AXIS_GROUPS: &[AxisGroupDef] = &[AxisGroupDef {
     axes: &[0, 1],
 }];
 
-/// PLCopen `BufferMode`-style dispatch policy for a move. Only
-/// `Aborting`/`Buffered` for this pass — the four blending variants
-/// (`BlendingLow`/`Previous`/`Next`/`High`) need a profile that's aware of
-/// an *adjacent* segment and never fully decelerates before handing off, a
-/// structurally different problem left for its own design pass (see the
-/// `plcopen-motion-goal` memory).
+/// PLCopen `BufferMode`-style dispatch policy for a move. `Aborting`/
+/// `Buffered` apply to every move target (`move`/`movegroup`/`movepath`);
+/// `Blend` is `movepath`-only (see `Command::MovePath`'s docs) — the four
+/// real PLCopen blending variants (`BlendingLow`/`Previous`/`Next`/`High`)
+/// are still their own, structurally different deferred problem (a profile
+/// aware of an *adjacent* segment that never fully decelerates before
+/// handing off — see the `plcopen-motion-goal` memory); `Blend` here is a
+/// narrower, `movepath`-specific thing: smoothly transitioning the path's
+/// own *geometry* onto a new one, not blending across two independent move
+/// segments in general.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferMode {
     /// Takes effect immediately regardless of idle/busy: clears anything
@@ -144,6 +148,15 @@ enum BufferMode {
     /// buffered move queued eventually runs, in order); starts immediately
     /// if idle. The default, so omitting a mode keeps today's behavior.
     Buffered,
+    /// `movepath` only: like `Aborting` (takes effect immediately), but
+    /// built via `motion_core::PathProfile::new_blended` instead of
+    /// `new_with_start_velocity` — the new path's own start tangent leans
+    /// toward the group's actual incoming velocity direction (via
+    /// `WaypointPath::new_with_start_direction`), instead of assuming a
+    /// straight approach toward its own first waypoint, so the transition
+    /// is smoother than `Aborting`'s hard redirect. Not exact velocity
+    /// continuity — see `PathProfile::new_blended`'s docs.
+    Blend,
 }
 
 #[derive(Debug, PartialEq)]
@@ -193,18 +206,28 @@ enum Command {
     /// A multi-waypoint move for a group, smoothly blended through every
     /// waypoint via `motion_core::PathProfile` (centripetal Catmull-Rom).
     /// `waypoints` are the points *after* the group's current position —
-    /// the actual current position is always prepended as the path's own
-    /// start (see `install_path_move`), the same "start is the axes'
-    /// actual position, not a commanded one" rule every other move here
-    /// follows. Deliberately idle-group-only for this first pass — see the
-    /// control loop's `Command::MovePath` arm — so there's no `buffer_mode`
-    /// field here the way `MoveGroup` has one.
+    /// the actual current position (and actual velocity, via whichever of
+    /// `PathProfile::new_with_start_velocity`/`new_blended` `buffer_mode`
+    /// picks) is always prepended as the path's own start (see
+    /// `install_path_move_impl`), the same "start is the axes' actual
+    /// state, not a commanded one" rule every other move here follows.
+    /// `buffer_mode`: `Buffered` queues FIFO behind a busy group, same as
+    /// `MoveGroup`; `Aborting` and `Blend` both redirect immediately
+    /// (mid-flight, from wherever the group actually is) and only differ
+    /// in *how* the new path's geometry is built — `Aborting` via
+    /// `install_path_move` (assumes a straight approach to the new path's
+    /// first waypoint, same as a redirected `move`), `Blend` via
+    /// `install_path_move_blended` (leans the new path's own start tangent
+    /// toward the actual incoming velocity direction instead, for a
+    /// visibly smoother transition — see `PathProfile::new_blended`'s
+    /// docs for why it's a close match, not an exact one).
     MovePath {
         group: usize,
         waypoints: Vec<Vec<f64>>,
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+        buffer_mode: BufferMode,
     },
     Verbose,
     Status,
@@ -363,32 +386,8 @@ fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>
         .map(|c| parse_f64(c))
         .collect::<Result<_, _>>()?;
 
-    // A trailing "aborting"/"buffered" keyword is the buffer mode, always
-    // last regardless of how many numeric args precede it; everything
-    // before it must be the usual up-to-3 numeric kinematic-limit args.
-    let (buffer_mode, numeric_rest) = match rest.last() {
-        Some(&"aborting") => (BufferMode::Aborting, &rest[..rest.len() - 1]),
-        Some(&"buffered") => (BufferMode::Buffered, &rest[..rest.len() - 1]),
-        _ => (BufferMode::Buffered, rest),
-    };
-    if numeric_rest.len() > 3 {
-        return Err(format!("too many arguments: {line:?}"));
-    }
-    let mut numeric_rest = numeric_rest.iter();
-    let max_speed = match numeric_rest.next() {
-        Some(v) => parse_f64(v)?,
-        None => DEFAULT_MAX_SPEED,
-    };
-    let max_acceleration = match numeric_rest.next() {
-        Some(a) => parse_f64(a)?,
-        None => DEFAULT_MAX_ACCELERATION,
-    };
-    // Deceleration defaults to whatever acceleration resolved to (default
-    // or user-specified), so a symmetric move needs no extra argument.
-    let max_deceleration = match numeric_rest.next() {
-        Some(d) => parse_f64(d)?,
-        None => max_acceleration,
-    };
+    let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
+        parse_buffer_mode_and_limits(rest, line)?;
 
     match target {
         Target::Axis(axis) => Ok(Some(Command::Move {
@@ -438,8 +437,9 @@ fn parse_move_path(target: &str, rest: &[&str], line: &str) -> Result<Option<Com
 
 /// The inline `movepath` form: a required waypoint count, then that many
 /// waypoints' worth of coordinates (`coord_count` each), then the usual
-/// up-to-3 numeric kinematic-limit args. No trailing `aborting`/`buffered`
-/// keyword — see `Command::MovePath`'s docs for why.
+/// up-to-3 numeric kinematic-limit args and an optional trailing
+/// `aborting`/`buffered`/`blend` keyword — same shape `move`'s trailing
+/// args have, plus the `movepath`-only `blend` option.
 fn parse_move_path_inline(
     group: usize,
     coord_count: usize,
@@ -466,23 +466,26 @@ fn parse_move_path_inline(
     let flat: Vec<f64> = coords.iter().map(|c| parse_f64(c)).collect::<Result<_, _>>()?;
     let waypoints: Vec<Vec<f64>> = flat.chunks(coord_count).map(|c| c.to_vec()).collect();
 
-    let (max_speed, max_acceleration, max_deceleration) = parse_kinematic_limits(rest, line)?;
+    let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
+        parse_movepath_buffer_mode_and_limits(rest, line)?;
     Ok(Some(Command::MovePath {
         group,
         waypoints,
         max_speed,
         max_acceleration,
         max_deceleration,
+        buffer_mode,
     }))
 }
 
 /// The file `movepath` form: waypoints read from `path` (see
 /// `read_waypoints_file`), followed by the usual up-to-3 numeric
-/// kinematic-limit args — everything else is identical to the inline form.
+/// kinematic-limit args and an optional trailing `aborting`/`buffered`/
+/// `blend` keyword — everything else is identical to the inline form.
 /// Reading happens here, on the stdin-reading thread (same as every other
 /// parse error), not in the control loop — `Command::MovePath` ends up
-/// identical either way, so nothing downstream needs to know which form was
-/// used.
+/// identical either way, so nothing downstream needs to know which form
+/// was used.
 fn parse_move_path_file(
     group: usize,
     coord_count: usize,
@@ -491,13 +494,15 @@ fn parse_move_path_file(
     line: &str,
 ) -> Result<Option<Command>, String> {
     let waypoints = read_waypoints_file(path, coord_count)?;
-    let (max_speed, max_acceleration, max_deceleration) = parse_kinematic_limits(rest, line)?;
+    let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
+        parse_movepath_buffer_mode_and_limits(rest, line)?;
     Ok(Some(Command::MovePath {
         group,
         waypoints,
         max_speed,
         max_acceleration,
         max_deceleration,
+        buffer_mode,
     }))
 }
 
@@ -540,6 +545,44 @@ fn parse_waypoint_lines(contents: &str, coord_count: usize) -> Result<Vec<Vec<f6
         return Err("no waypoints found (file is empty or all-blank)".to_string());
     }
     Ok(waypoints)
+}
+
+/// A trailing optional `aborting`/`buffered` keyword (always last,
+/// regardless of how many numeric args precede it) followed by the usual
+/// up-to-3 numeric kinematic-limit args — shared by `move`/`movegroup`.
+/// `blend` is deliberately not recognized here — it's meaningless for a
+/// straight-line move (see `parse_movepath_buffer_mode_and_limits`, which
+/// both `movepath` forms use instead).
+fn parse_buffer_mode_and_limits(
+    rest: &[&str],
+    line: &str,
+) -> Result<(BufferMode, f64, f64, f64), String> {
+    let (buffer_mode, numeric_rest) = match rest.last() {
+        Some(&"aborting") => (BufferMode::Aborting, &rest[..rest.len() - 1]),
+        Some(&"buffered") => (BufferMode::Buffered, &rest[..rest.len() - 1]),
+        _ => (BufferMode::Buffered, rest),
+    };
+    let (max_speed, max_acceleration, max_deceleration) =
+        parse_kinematic_limits(numeric_rest, line)?;
+    Ok((buffer_mode, max_speed, max_acceleration, max_deceleration))
+}
+
+/// `movepath`'s own version of `parse_buffer_mode_and_limits` — identical
+/// except it also recognizes the trailing `blend` keyword
+/// (`BufferMode::Blend`, movepath-only; see `Command::MovePath`'s docs).
+fn parse_movepath_buffer_mode_and_limits(
+    rest: &[&str],
+    line: &str,
+) -> Result<(BufferMode, f64, f64, f64), String> {
+    let (buffer_mode, numeric_rest) = match rest.last() {
+        Some(&"aborting") => (BufferMode::Aborting, &rest[..rest.len() - 1]),
+        Some(&"buffered") => (BufferMode::Buffered, &rest[..rest.len() - 1]),
+        Some(&"blend") => (BufferMode::Blend, &rest[..rest.len() - 1]),
+        _ => (BufferMode::Buffered, rest),
+    };
+    let (max_speed, max_acceleration, max_deceleration) =
+        parse_kinematic_limits(numeric_rest, line)?;
+    Ok((buffer_mode, max_speed, max_acceleration, max_deceleration))
 }
 
 /// The trailing up-to-3 numeric kinematic-limit args shared by both
@@ -655,11 +698,11 @@ fn print_help() {
         "start or redirect a move",
     );
     cmd_line(
-        "movepath <groupName> <n> <coord>... [vmax] [amax] [dmax]",
-        "smooth multi-waypoint move, waypoints inline (idle groups only)",
+        "movepath <groupName> <n> <coord>... [vmax] [amax] [dmax] [aborting|buffered|blend]",
+        "smooth multi-waypoint group move, waypoints inline",
     );
     cmd_line(
-        "movepath <groupName> file <path> [vmax] [amax] [dmax]",
+        "movepath <groupName> file <path> [vmax] [amax] [dmax] [aborting|buffered|blend]",
         "same, waypoints read from a file (one per line)",
     );
     cmd_line("stop <target> [decel]", "decelerate to a stop");
@@ -989,11 +1032,16 @@ fn install_group_move(
 /// first pass doesn't expose a per-segment `Line` override from the command
 /// line, though `motion_core::WaypointPath` itself supports one.
 ///
-/// Deliberately has no `new_with_start_velocity` counterpart: unlike
-/// `install_group_move`, this only ever runs against an idle group (see the
-/// control loop's `Command::MovePath` arm), so there's no in-flight
-/// velocity to reconcile with the path's initial tangent.
-fn install_path_move(
+/// `build` is which `PathProfile` constructor to use — always given each
+/// member's current *actual* velocity, exactly like `install_group_move`
+/// always uses `LinearMove::new_with_start_velocity` (an idle group's
+/// velocity is simply 0, which reduces to ordinary rest-to-rest behavior,
+/// so there's no separate idle-only code path). `install_path_move` and
+/// `install_path_move_blended` are both thin callers of this, differing
+/// only in which constructor they pass — `Aborting` vs `Blend` is entirely
+/// a choice of geometry-building strategy, not a different installation
+/// mechanism.
+fn install_path_move_impl(
     axes: &mut [AxisRuntime],
     group: usize,
     members: &'static [usize],
@@ -1001,15 +1049,25 @@ fn install_path_move(
     max_speed: f64,
     max_acceleration: f64,
     max_deceleration: f64,
+    build: impl FnOnce(
+        Vec<Vec<f64>>,
+        Vec<f64>,
+        Vec<SegmentKind>,
+        f64,
+        f64,
+        f64,
+    ) -> Result<PathProfile, PathProfileError>,
 ) -> Result<f64, PathProfileError> {
     let start: Vec<f64> = members.iter().map(|&a| axes[a].position).collect();
+    let velocities: Vec<f64> = members.iter().map(|&a| axes[a].velocity).collect();
     let mut all_waypoints = Vec::with_capacity(waypoints.len() + 1);
     all_waypoints.push(start);
     all_waypoints.extend(waypoints);
     let segment_kinds = vec![SegmentKind::Spline; all_waypoints.len() - 1];
 
-    let profile = PathProfile::new(
+    let profile = build(
         all_waypoints,
+        velocities,
         segment_kinds,
         max_speed,
         max_acceleration,
@@ -1035,6 +1093,52 @@ fn install_path_move(
         ax.last_phase = None;
     }
     Ok(duration)
+}
+
+/// `BufferMode::Aborting` (and idle/`Buffered`) path installation: built via
+/// `PathProfile::new_with_start_velocity` — see `install_path_move_impl`.
+fn install_path_move(
+    axes: &mut [AxisRuntime],
+    group: usize,
+    members: &'static [usize],
+    waypoints: Vec<Vec<f64>>,
+    max_speed: f64,
+    max_acceleration: f64,
+    max_deceleration: f64,
+) -> Result<f64, PathProfileError> {
+    install_path_move_impl(
+        axes,
+        group,
+        members,
+        waypoints,
+        max_speed,
+        max_acceleration,
+        max_deceleration,
+        PathProfile::new_with_start_velocity,
+    )
+}
+
+/// `BufferMode::Blend` path installation: built via `PathProfile::new_blended`
+/// instead — see `install_path_move_impl`.
+fn install_path_move_blended(
+    axes: &mut [AxisRuntime],
+    group: usize,
+    members: &'static [usize],
+    waypoints: Vec<Vec<f64>>,
+    max_speed: f64,
+    max_acceleration: f64,
+    max_deceleration: f64,
+) -> Result<f64, PathProfileError> {
+    install_path_move_impl(
+        axes,
+        group,
+        members,
+        waypoints,
+        max_speed,
+        max_acceleration,
+        max_deceleration,
+        PathProfile::new_blended,
+    )
 }
 
 /// Per-axis command handlers, extracted so a hard-coded axis group (see
@@ -1122,12 +1226,23 @@ struct PendingMove {
 /// group's own FIFO queue (`run_control_loop`'s `group_pending`, not part
 /// of `AxisRuntime`: a group's queued move needs every member
 /// simultaneously idle to promote, which doesn't fit inside any single
-/// axis's own state).
-struct PendingGroupMove {
-    targets: Vec<f64>,
-    max_speed: f64,
-    max_acceleration: f64,
-    max_deceleration: f64,
+/// axis's own state). An enum, not a single struct, so a group's queue can
+/// mix `move`s and `movepath`s in the order they were issued — the
+/// promotion loop matches on the variant to call `install_group_move` or
+/// `install_path_move` as appropriate.
+enum PendingGroupMove {
+    Move {
+        targets: Vec<f64>,
+        max_speed: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
+    },
+    Path {
+        waypoints: Vec<Vec<f64>>,
+        max_speed: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
+    },
 }
 
 /// All runtime state for one axis. Axes are independent: each has its own
@@ -1289,15 +1404,42 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                 continue;
             }
             while let Some(p) = group_pending[g].pop_front() {
-                match install_group_move(
-                    &mut axes,
-                    g,
-                    members,
-                    p.targets,
-                    p.max_speed,
-                    p.max_acceleration,
-                    p.max_deceleration,
-                ) {
+                // Both install_* return different error types (LinearMoveError
+                // vs PathProfileError) — .to_string() unifies them, since the
+                // caller only ever needs to print whichever it got.
+                let result = match p {
+                    PendingGroupMove::Move {
+                        targets,
+                        max_speed,
+                        max_acceleration,
+                        max_deceleration,
+                    } => install_group_move(
+                        &mut axes,
+                        g,
+                        members,
+                        targets,
+                        max_speed,
+                        max_acceleration,
+                        max_deceleration,
+                    )
+                    .map_err(|e| e.to_string()),
+                    PendingGroupMove::Path {
+                        waypoints,
+                        max_speed,
+                        max_acceleration,
+                        max_deceleration,
+                    } => install_path_move(
+                        &mut axes,
+                        g,
+                        members,
+                        waypoints,
+                        max_speed,
+                        max_acceleration,
+                        max_deceleration,
+                    )
+                    .map_err(|e| e.to_string()),
+                };
+                match result {
                     Ok(duration) => {
                         println!("  -> {}: starting queued move ({duration:.3}s)", group.name);
                         break;
@@ -1491,7 +1633,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         );
                     } else {
                         match buffer_mode {
-                            BufferMode::Aborting => {
+                            // Blend is movepath-only and never actually
+                            // produced by move's own parser (see
+                            // parse_buffer_mode_and_limits) — grouped with
+                            // Aborting here purely so this match stays
+                            // exhaustive over BufferMode's 3 variants;
+                            // genuinely unreachable via any real command.
+                            BufferMode::Aborting | BufferMode::Blend => {
                                 // If this axis was part of an active group
                                 // move, redirecting it alone leaves that
                                 // group meaning nothing — cascade the rest
@@ -1648,7 +1796,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             group_label(group),
                             group_pending[group].len()
                         );
-                        group_pending[group].push_back(PendingGroupMove {
+                        group_pending[group].push_back(PendingGroupMove::Move {
                             targets,
                             max_speed,
                             max_acceleration,
@@ -1684,6 +1832,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_speed,
                     max_acceleration,
                     max_deceleration,
+                    buffer_mode,
                 } => {
                     let members = AXIS_GROUPS[group].axes;
                     let all_operational = members
@@ -1699,24 +1848,49 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             "  ! {}: movepath rejected: not every member is enabled",
                             group_label(group)
                         );
-                    } else if busy {
-                        // No queueing for movepath yet (see Command::MovePath's
-                        // docs) — unlike move/movegroup, there's no buffer_mode
-                        // to choose Aborting here either.
+                    } else if busy && buffer_mode == BufferMode::Buffered {
                         println!(
-                            "  ! {}: movepath rejected: group is busy (movepath doesn't queue or abort yet — stop first, or wait for idle)",
-                            group_label(group)
+                            "  -> {}: busy: queuing path move ({} already queued)",
+                            group_label(group),
+                            group_pending[group].len()
                         );
-                    } else {
-                        match install_path_move(
-                            &mut axes,
-                            group,
-                            members,
+                        group_pending[group].push_back(PendingGroupMove::Path {
                             waypoints,
                             max_speed,
                             max_acceleration,
                             max_deceleration,
-                        ) {
+                        });
+                    } else {
+                        // Either idle, or Aborting/Blend redirecting a busy
+                        // group right now (mid-flight, from wherever it
+                        // actually is) — either way, seizing control clears
+                        // anything this group had queued, same as
+                        // MoveGroup. Only the choice of install function
+                        // differs between Aborting and Blend — see
+                        // install_path_move_impl's docs.
+                        group_pending[group].clear();
+                        let result = if buffer_mode == BufferMode::Blend {
+                            install_path_move_blended(
+                                &mut axes,
+                                group,
+                                members,
+                                waypoints,
+                                max_speed,
+                                max_acceleration,
+                                max_deceleration,
+                            )
+                        } else {
+                            install_path_move(
+                                &mut axes,
+                                group,
+                                members,
+                                waypoints,
+                                max_speed,
+                                max_acceleration,
+                                max_deceleration,
+                            )
+                        };
+                        match result {
                             Ok(duration) => {
                                 println!(
                                     "  -> {}: path move through {n_waypoints} waypoint(s) ({duration:.3}s)",
@@ -1999,6 +2173,7 @@ mod tests {
                 max_speed: DEFAULT_MAX_SPEED,
                 max_acceleration: DEFAULT_MAX_ACCELERATION,
                 max_deceleration: DEFAULT_MAX_ACCELERATION,
+                buffer_mode: BufferMode::Buffered,
             }))
         );
     }
@@ -2013,8 +2188,59 @@ mod tests {
                 max_speed: 10.0,
                 max_acceleration: 20.0,
                 max_deceleration: 30.0,
+                buffer_mode: BufferMode::Buffered,
             }))
         );
+    }
+
+    #[test]
+    fn parse_command_movepath_buffer_mode_keyword_always_trailing() {
+        assert_eq!(
+            parse_command("movepath axisGroup0 1 5 5 10 20 30 aborting"),
+            Ok(Some(Command::MovePath {
+                group: 0,
+                waypoints: vec![vec![5.0, 5.0]],
+                max_speed: 10.0,
+                max_acceleration: 20.0,
+                max_deceleration: 30.0,
+                buffer_mode: BufferMode::Aborting,
+            }))
+        );
+        // Works with no numeric args at all too.
+        assert_eq!(
+            parse_command("movepath axisGroup0 1 5 5 aborting"),
+            Ok(Some(Command::MovePath {
+                group: 0,
+                waypoints: vec![vec![5.0, 5.0]],
+                max_speed: DEFAULT_MAX_SPEED,
+                max_acceleration: DEFAULT_MAX_ACCELERATION,
+                max_deceleration: DEFAULT_MAX_ACCELERATION,
+                buffer_mode: BufferMode::Aborting,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_movepath_accepts_blend_keyword() {
+        assert_eq!(
+            parse_command("movepath axisGroup0 1 5 5 10 20 30 blend"),
+            Ok(Some(Command::MovePath {
+                group: 0,
+                waypoints: vec![vec![5.0, 5.0]],
+                max_speed: 10.0,
+                max_acceleration: 20.0,
+                max_deceleration: 30.0,
+                buffer_mode: BufferMode::Blend,
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_move_does_not_accept_blend_keyword() {
+        // "blend" isn't a recognized keyword for plain move — it falls
+        // through to being parsed as a numeric kinematic-limit arg, and
+        // fails as "not a number", not as a buffer mode.
+        assert!(parse_command("move axis0 100 blend").is_err());
     }
 
     #[test]
@@ -2080,7 +2306,10 @@ mod tests {
             std::thread::current().id()
         ));
         std::fs::write(&path, "10 0\n10 10\n").unwrap();
-        let cmd = parse_command(&format!("movepath axisGroup0 file {} 30", path.display()));
+        let cmd = parse_command(&format!(
+            "movepath axisGroup0 file {} 30 buffered",
+            path.display()
+        ));
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             cmd,
@@ -2090,6 +2319,7 @@ mod tests {
                 max_speed: 30.0,
                 max_acceleration: DEFAULT_MAX_ACCELERATION,
                 max_deceleration: DEFAULT_MAX_ACCELERATION,
+                buffer_mode: BufferMode::Buffered,
             }))
         );
     }

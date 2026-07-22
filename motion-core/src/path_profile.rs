@@ -13,8 +13,12 @@ use crate::linear_move::MAX_GROUP_AXES;
 pub enum PathProfileError {
     /// The waypoint geometry itself was rejected.
     Path(WaypointPathError),
+    /// `start_velocity` (passed to
+    /// [`PathProfile::new_with_start_velocity`]) has a different number of
+    /// axes than the waypoints.
+    StartVelocityDimensionMismatch { expected: usize, got: usize },
     /// The scalar speed profile over the path's total arc length was
-    /// rejected (bad kinematic limits).
+    /// rejected (bad kinematic limits, or a non-finite start velocity).
     Speed(TrajectoryError),
 }
 
@@ -22,6 +26,10 @@ impl std::fmt::Display for PathProfileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PathProfileError::Path(e) => write!(f, "{e}"),
+            PathProfileError::StartVelocityDimensionMismatch { expected, got } => write!(
+                f,
+                "start_velocity has {got} axes, expected {expected} (from the waypoints)"
+            ),
             PathProfileError::Speed(e) => write!(f, "{e}"),
         }
     }
@@ -57,7 +65,7 @@ impl PathSample {
 /// velocity is that one path speed projected onto the path's local tangent
 /// direction at the current arc length — constant progress along the route,
 /// not independent per-axis profiles.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PathProfile {
     path: WaypointPath,
     speed: TrapezoidalProfile,
@@ -68,6 +76,11 @@ impl PathProfile {
     /// and end at rest), shaped per-segment by `segment_kinds`, at a single
     /// scalar `max_speed`/`max_acceleration`/`max_deceleration` applied to
     /// progress *along the path* (not to any individual axis).
+    ///
+    /// A thin wrapper — `new_with_start_velocity` with an all-zero start
+    /// velocity — exactly mirroring `TrapezoidalProfile::new`'s and
+    /// `LinearMove::new`'s own relationship to their
+    /// `new_with_start_velocity` counterparts.
     pub fn new(
         waypoints: Vec<Vec<f64>>,
         segment_kinds: Vec<SegmentKind>,
@@ -75,9 +88,110 @@ impl PathProfile {
         max_acceleration: f64,
         max_deceleration: f64,
     ) -> Result<Self, PathProfileError> {
+        let start_velocity = vec![0.0; waypoints.first().map_or(0, |w| w.len())];
+        Self::new_with_start_velocity(
+            waypoints,
+            start_velocity,
+            segment_kinds,
+            max_speed,
+            max_acceleration,
+            max_deceleration,
+        )
+    }
+
+    /// Build a path move through `waypoints`, starting from the group's
+    /// actual `start_velocity` (backend feedback, an N-dimensional vector
+    /// covering the same axes as `waypoints`) rather than assuming rest —
+    /// what backs redirecting an in-flight group move onto a new path
+    /// (PLCopen `BufferMode::Aborting`).
+    ///
+    /// `start_velocity` is projected onto the new path's own initial
+    /// tangent direction (`WaypointPath::tangent_at_arc_length(0.0)` on the
+    /// freshly built path — no separate geometry needed) via a dot product,
+    /// reducing to the same scalar problem
+    /// `TrapezoidalProfile::new_with_start_velocity` already solves
+    /// completely — exactly the pattern `LinearMove::new_with_start_velocity`
+    /// established for a straight line, just with the path's own local
+    /// tangent standing in for a line's fixed unit direction. **Same known
+    /// limitation**: the component of `start_velocity` perpendicular to
+    /// that initial tangent is discarded, not reconciled — a velocity
+    /// discontinuity at `t = 0` if the group's actual velocity wasn't
+    /// already parallel to the path's own start direction.
+    pub fn new_with_start_velocity(
+        waypoints: Vec<Vec<f64>>,
+        start_velocity: Vec<f64>,
+        segment_kinds: Vec<SegmentKind>,
+        max_speed: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
+    ) -> Result<Self, PathProfileError> {
         let path = WaypointPath::new(waypoints, segment_kinds).map_err(PathProfileError::Path)?;
-        let speed = TrapezoidalProfile::new(0.0, path.total_length(), max_speed, max_acceleration, max_deceleration)
-            .map_err(PathProfileError::Speed)?;
+        if start_velocity.len() != path.axis_count() {
+            return Err(PathProfileError::StartVelocityDimensionMismatch {
+                expected: path.axis_count(),
+                got: start_velocity.len(),
+            });
+        }
+        let tangent0 = path.tangent_at_arc_length(0.0);
+        let mut v0_along = 0.0;
+        for i in 0..path.axis_count() {
+            v0_along += start_velocity[i] * tangent0[i];
+        }
+        let speed = TrapezoidalProfile::new_with_start_velocity(
+            0.0,
+            v0_along,
+            path.total_length(),
+            max_speed,
+            max_acceleration,
+            max_deceleration,
+        )
+        .map_err(PathProfileError::Speed)?;
+        Ok(Self { path, speed })
+    }
+
+    /// Build a path move through `waypoints`, **blending** onto it from the
+    /// group's actual `start_velocity` rather than redirecting onto it —
+    /// what backs `BufferMode::Blend`, distinct from (and smoother than)
+    /// `new_with_start_velocity`'s `Aborting` behavior.
+    ///
+    /// The difference is entirely in how the geometry is built: this uses
+    /// [`WaypointPath::new_with_start_direction`] (with `start_velocity`
+    /// itself as the direction) instead of plain [`WaypointPath::new`], so
+    /// the new path's own leading phantom control point — and so its start
+    /// tangent — already leans toward the incoming velocity direction,
+    /// instead of the ordinary reflected phantom's "assume a straight
+    /// approach toward the first real waypoint." `start_velocity` is then
+    /// projected onto that (now closely-matching) tangent exactly the same
+    /// way `new_with_start_velocity` does, so the composed velocity at
+    /// `t = 0` ends up close to the *full* `start_velocity` vector, not
+    /// just whatever component happened to be parallel to an
+    /// unrelated default tangent. **Still not an exact match** — see
+    /// `WaypointPath`'s module docs on why a Catmull-Rom tangent can't be
+    /// pinned exactly via phantom placement alone — but a close one.
+    pub fn new_blended(
+        waypoints: Vec<Vec<f64>>,
+        start_velocity: Vec<f64>,
+        segment_kinds: Vec<SegmentKind>,
+        max_speed: f64,
+        max_acceleration: f64,
+        max_deceleration: f64,
+    ) -> Result<Self, PathProfileError> {
+        let path = WaypointPath::new_with_start_direction(waypoints, start_velocity.clone(), segment_kinds)
+            .map_err(PathProfileError::Path)?;
+        let tangent0 = path.tangent_at_arc_length(0.0);
+        let mut v0_along = 0.0;
+        for i in 0..path.axis_count() {
+            v0_along += start_velocity[i] * tangent0[i];
+        }
+        let speed = TrapezoidalProfile::new_with_start_velocity(
+            0.0,
+            v0_along,
+            path.total_length(),
+            max_speed,
+            max_acceleration,
+            max_deceleration,
+        )
+        .map_err(PathProfileError::Speed)?;
         Ok(Self { path, speed })
     }
 
@@ -246,5 +360,207 @@ mod tests {
             Err(PathProfileError::Path(WaypointPathError::TooFewWaypoints(1))) => {}
             other => panic!("expected Path(TooFewWaypoints), got {other:?}"),
         }
+    }
+
+    // --- new_with_start_velocity --------------------------------------
+
+    #[test]
+    fn new_is_thin_wrapper_of_new_with_start_velocity() {
+        let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
+        let segment_kinds = vec![SegmentKind::Spline, SegmentKind::Spline];
+        let a = PathProfile::new(waypoints.clone(), segment_kinds.clone(), 10.0, 50.0, 50.0).unwrap();
+        let b = PathProfile::new_with_start_velocity(
+            waypoints,
+            vec![0.0, 0.0],
+            segment_kinds,
+            10.0,
+            50.0,
+            50.0,
+        )
+        .unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn start_velocity_aligned_with_initial_tangent_reduces_to_scalar_case() {
+        // Straight line along +X; start velocity is purely along it too, so
+        // this should exactly match LinearMove's own start-velocity case.
+        let start_velocity = vec![3.0, 0.0];
+        let linear = LinearMove::new_with_start_velocity(
+            vec![0.0, 0.0],
+            start_velocity.clone(),
+            vec![10.0, 0.0],
+            5.0,
+            10.0,
+            10.0,
+        )
+        .unwrap();
+        let path = PathProfile::new_with_start_velocity(
+            vec![vec![0.0, 0.0], vec![10.0, 0.0]],
+            start_velocity,
+            vec![SegmentKind::Spline],
+            5.0,
+            10.0,
+            10.0,
+        )
+        .unwrap();
+        assert!(approx_eps(path.duration(), linear.duration(), 1e-6));
+
+        let n = 200;
+        for i in 0..=n {
+            let t = linear.duration() * (i as f64) / (n as f64);
+            let l = linear.sample(t);
+            let p = path.sample(t);
+            assert!(approx_eps(l.position()[0], p.position()[0], 1e-2));
+            assert!(approx_eps(l.position()[1], p.position()[1], 1e-2));
+            assert!(approx_eps(l.velocity()[0], p.velocity()[0], 1e-2));
+            assert!(approx_eps(l.velocity()[1], p.velocity()[1], 1e-2));
+        }
+    }
+
+    #[test]
+    fn start_velocity_perpendicular_component_is_dropped() {
+        // Path starts along +X; start_velocity = (3, 5) has a parallel
+        // component (3, preserved) and a perpendicular component (5,
+        // discarded) — same documented limitation LinearMove has.
+        let path = PathProfile::new_with_start_velocity(
+            vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]],
+            vec![3.0, 5.0],
+            vec![SegmentKind::Spline, SegmentKind::Spline],
+            10.0,
+            50.0,
+            50.0,
+        )
+        .unwrap();
+        let at_start = path.sample(0.0);
+        assert!(approx_eps(at_start.velocity()[0], 3.0, 1e-2));
+        assert!(approx_eps(at_start.velocity()[1], 0.0, 1e-2));
+        // No NaN/panic anywhere across the whole move.
+        let n = 200;
+        for i in 0..=n {
+            let t = path.duration() * (i as f64) / (n as f64);
+            let s = path.sample(t);
+            assert!(s.position().iter().all(|v| v.is_finite()));
+            assert!(s.velocity().iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn rejects_start_velocity_dimension_mismatch() {
+        assert_eq!(
+            PathProfile::new_with_start_velocity(
+                vec![vec![0.0, 0.0], vec![10.0, 0.0]],
+                vec![1.0, 2.0, 3.0],
+                vec![SegmentKind::Spline],
+                10.0,
+                10.0,
+                10.0,
+            ),
+            Err(PathProfileError::StartVelocityDimensionMismatch { expected: 2, got: 3 })
+        );
+    }
+
+    // --- new_blended ------------------------------------------------------
+
+    #[test]
+    fn blended_velocity_is_continuous_across_a_real_transition() {
+        // The discriminating test: build an "old" path move, sample its
+        // actual velocity mid-flight, then blend a "new" path move from
+        // that exact (position, velocity) state. The composed velocity
+        // vector at the instant of transition should closely match the old
+        // path's velocity at that instant — both direction *and*
+        // magnitude, not just speed continuity. Realistic geometry: the new
+        // path's first real waypoint continues roughly the same direction
+        // the old path was already heading (a gentle bend, not a hairpin)
+        // — the actual use case this mode is for, and where the phantom
+        // approximation is tightest (see WaypointPath's module docs: the
+        // approximation blends the given direction *with* the direction to
+        // the next real waypoint, so it's tightest when those roughly
+        // agree, loosest when they sharply disagree).
+        let old = PathProfile::new(
+            vec![vec![0.0, 0.0], vec![100.0, 0.0]],
+            vec![SegmentKind::Spline],
+            20.0,
+            40.0,
+            40.0,
+        )
+        .unwrap();
+        let t_mid = old.duration() * 0.5; // well into cruise: velocity ~= (20, 0) exactly
+        let at_transition = old.sample(t_mid);
+        let start_position: Vec<f64> = at_transition.position().to_vec();
+        let start_velocity: Vec<f64> = at_transition.velocity().to_vec();
+
+        let new = PathProfile::new_blended(
+            vec![start_position, vec![150.0, 10.0], vec![200.0, 50.0]],
+            start_velocity.clone(),
+            vec![SegmentKind::Spline, SegmentKind::Spline],
+            20.0,
+            40.0,
+            40.0,
+        )
+        .unwrap();
+        let at_start = new.sample(0.0);
+
+        let old_speed: f64 = start_velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let new_speed: f64 = at_start.velocity().iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            approx_eps(old_speed, new_speed, old_speed * 0.05),
+            "speed discontinuity: old {old_speed} vs new {new_speed}"
+        );
+        let dot: f64 = start_velocity
+            .iter()
+            .zip(at_start.velocity().iter())
+            .map(|(a, b)| a * b)
+            .sum();
+        let cos_similarity = dot / (old_speed * new_speed);
+        assert!(
+            cos_similarity > 0.98,
+            "direction discontinuity: cosine similarity {cos_similarity} (old {start_velocity:?}, new {:?})",
+            at_start.velocity()
+        );
+    }
+
+    #[test]
+    fn blended_velocity_direction_still_reasonable_on_a_sharp_mismatch() {
+        // The adversarial case: the new path's first real waypoint heads
+        // somewhere quite different from the incoming velocity. Blend
+        // isn't exact here (see the module docs), but it should still stay
+        // sane — no NaN, no direction flip, no huge speed blow-up — a real
+        // improvement over Aborting's outright-dropped perpendicular
+        // component, just not a tight match.
+        let start_velocity = vec![20.0, 0.0]; // heading +X
+        let new = PathProfile::new_blended(
+            vec![vec![0.0, 0.0], vec![50.0, 50.0], vec![0.0, 100.0]], // sharp turn toward +Y
+            start_velocity.clone(),
+            vec![SegmentKind::Spline, SegmentKind::Spline],
+            20.0,
+            40.0,
+            40.0,
+        )
+        .unwrap();
+        let at_start = new.sample(0.0);
+        assert!(at_start.velocity().iter().all(|v| v.is_finite()));
+        let new_speed: f64 = at_start.velocity().iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(new_speed <= 20.0 + 1e-6, "speed grew past the incoming magnitude: {new_speed}");
+        // Still leans toward the incoming +X direction rather than
+        // snapping straight to the new path's own +Y-ish heading.
+        assert!(at_start.velocity()[0] > 0.0);
+    }
+
+    #[test]
+    fn blended_reduces_to_reflection_when_velocity_is_zero() {
+        let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
+        let segment_kinds = vec![SegmentKind::Spline, SegmentKind::Spline];
+        let plain = PathProfile::new(waypoints.clone(), segment_kinds.clone(), 10.0, 50.0, 50.0).unwrap();
+        let blended = PathProfile::new_blended(
+            waypoints,
+            vec![0.0, 0.0],
+            segment_kinds,
+            10.0,
+            50.0,
+            50.0,
+        )
+        .unwrap();
+        assert_eq!(plain, blended);
     }
 }
