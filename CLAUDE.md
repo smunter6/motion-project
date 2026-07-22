@@ -375,9 +375,95 @@ over-produce; confirm direction at natural decision points.
   the built binary: a 4-waypoint file drove the group through to the exact
   final waypoint, and a missing file produced a clean rejection message
   without touching loop state.
+  **`movepath` queueing/aborting** (added 2026-07-21, right after — a
+  scaled-back version of a broader "transition mode" idea the user asked
+  about but hadn't finished specifying; agreed to land queueing/aborting
+  first and revisit the rest separately): `Command::MovePath` gained a
+  `buffer_mode: BufferMode` field and the control loop's dispatch now
+  mirrors `MoveGroup`'s exactly (busy + `Buffered` -> queue; busy +
+  `Aborting`, or idle -> install immediately). This needed
+  `motion_core::PathProfile::new_with_start_velocity` (mirrors
+  `LinearMove::new_with_start_velocity` exactly: the group's actual
+  velocity is projected onto the *path's own* initial tangent —
+  `WaypointPath::tangent_at_arc_length(0.0)`, no new geometry needed — then
+  handed to `TrapezoidalProfile::new_with_start_velocity` over arc length;
+  same documented "perpendicular component dropped" limitation).
+  `PathProfile::new()` became a thin wrapper the same way
+  `TrapezoidalProfile`/`LinearMove`'s did, verified bit-identical
+  (`WaypointPath`/`PathProfile` gained `PartialEq` for this). `app`'s
+  `install_path_move` now always uses the velocity-aware constructor —
+  same simplification `install_group_move` already had, since an idle
+  group's velocity is just 0 — so the old idle-group-only restriction is
+  gone entirely, not just widened. **Queueing needed
+  `PendingGroupMove` to become an enum** (`Move{..} | Path{..}`, was a
+  single struct) so one group's FIFO can interleave `move`s and
+  `movepath`s in issue order; the promotion loop matches on the variant and
+  calls `install_group_move`/`install_path_move` accordingly, unifying
+  their different error types via `.to_string()`. Trailing
+  `aborting`/`buffered` keyword parsing was extracted into a shared
+  `parse_buffer_mode_and_limits`, used by `move` and both `movepath` forms.
+  The existing `ActiveGroupMove`-generalized interruption cascade needed no
+  changes — it already covered `Profile::Path`. 4 new motion-core tests
+  (69 total) plus 2 new app parser tests. Live-verified: a queue mixing
+  `movepath`/`move`/`movepath` behind a busy group ran all three in FIFO
+  order, each reaching its correct target; an `aborting` `movepath` issued
+  mid-flight (heading one way) redirected immediately toward an opposite-
+  direction target, correctly showing a `decel` phase first (the group's
+  actual velocity reconciled against the new path, not just dropped).
+  **`BufferMode::Blend`** (added 2026-07-21, right after — the "transition
+  mode" idea above, clarified: smoothly transition the path's own
+  *geometry* onto a new one while it's actively running, not the four real
+  PLCopen blending variants). The insight that made this tractable: the
+  existing reflected phantom control point used for a path's first/last
+  waypoint is just an *assumption* ("the incoming approach was a straight
+  line toward the first real waypoint") — swap that assumption for the
+  truth when a real incoming velocity is known, and everything else
+  (Catmull-Rom evaluation, arc-length LUT, the scalar speed profile) is
+  unchanged. `WaypointPath::new_with_start_direction` (`waypoints`,
+  `segment_kinds`, was `new`'s whole signature) places the leading phantom
+  along a given direction at the same characteristic distance (`|P0-P1|`)
+  the reflection would have used, instead of reflecting; an all-zero
+  direction (including the one `new()` now passes as a thin wrapper) falls
+  back to the ordinary reflection exactly as before. **Explicitly not an
+  exact tangent match** — confirmed with the user rather than guessed: a
+  Catmull-Rom tangent at `P0` is a blend of the phantom *and* `P1`, so
+  matching the given direction closely (not exactly) is consistent with
+  "match the existing spline generation's own behavior," which is what was
+  actually asked for, not a mathematically exact fix like an explicit
+  Hermite tangent override would have been. `PathProfile::new_blended`
+  (mirrors `new_with_start_velocity`'s shape exactly) builds via this new
+  constructor instead of plain `new`, then projects the same actual
+  velocity onto the resulting (now much closer) tangent — same projection
+  math as `new_with_start_velocity`, just starting from a much better
+  tangent. Empirically the closeness depends on how well the new path's
+  *own* first-leg direction agrees with the given direction (tight when
+  they roughly agree — the realistic "continue roughly forward" case this
+  exists for — looser on a deliberately sharp mismatch, but still bounded
+  and sane, never worse than a plain redirect). `app`: `BufferMode` gained
+  a third variant, `Blend`, but it's `movepath`-only — `move`/`movegroup`
+  have no spline to lean a tangent into, so their own parser
+  (`parse_buffer_mode_and_limits`) still only recognizes
+  `aborting`/`buffered`; `movepath` uses a separate
+  `parse_movepath_buffer_mode_and_limits` that also recognizes `blend`.
+  `install_path_move`/`install_path_move_blended` are both thin callers of
+  a new shared `install_path_move_impl`, differing only in which
+  `PathProfile` constructor they pass — `Aborting` vs `Blend` is purely a
+  choice of geometry-building strategy, not a different installation
+  mechanism. 8 new motion-core tests (82 total) including the
+  discriminating one: sample an "old" path's actual velocity mid-flight,
+  blend a "new" path from that exact state, and check the composed
+  velocity vector at the transition instant is close in *both* direction
+  and magnitude — not just speed. Live-verified against the built binary:
+  redirecting from a curving path onto a new target with `blend` landed
+  already in the `cruise` phase (full speed, matching the incoming
+  velocity), while the identical redirect via `aborting` landed in `accel`
+  (well below cruise, having to build speed back up) — a clear, measurable
+  difference confirming the tangent-leaning actually works, not just
+  "doesn't crash."
   **What's left**: per-segment `Line` override CLI syntax (from either
-  `movepath` form), `movepath` queueing/aborting, file-format comments
-  (deliberately out of scope so far).
+  `movepath` form), file-format comments, and the four real PLCopen
+  blending variants (`BlendingLow`/`Previous`/`Next`/`High`) — still their
+  own deferred, structurally different problem, unaffected by any of this.
 - `app`'s viz window (`app/src/viz.rs` + `app/src/recording.rs`): an
   eframe/egui_plot window baked into the `app` binary itself, not a separate
   crate. Input stays entirely terminal-driven — viz has no controls, it only
