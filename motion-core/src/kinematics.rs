@@ -152,6 +152,59 @@ impl std::fmt::Display for KinematicsError {
 
 impl std::error::Error for KinematicsError {}
 
+/// Upper bound on the points in a [`Linkage`]: one per joint, plus the
+/// base.
+pub const MAX_LINKAGE_POINTS: usize = MAX_GROUP_AXES + 1;
+
+/// The physical arrangement of a mechanism at one pose: a polyline in task
+/// space running from the base outward to the tool, with one point per
+/// joint origin along the way.
+///
+/// This exists purely so a mechanism can be *drawn*. It is the one thing a
+/// viewer needs that the rest of this interface can't provide —
+/// [`forward_position`] gives the tool point, and nothing gives the elbow
+/// in between. Deriving it outside the model would mean re-implementing the
+/// model's own geometry next to it, which is exactly the duplication this
+/// trait exists to prevent.
+///
+/// Fixed-size and `Copy`, like everything else here. A model with nothing
+/// meaningful to draw returns [`Linkage::EMPTY`].
+///
+/// [`forward_position`]: KinematicModel::forward_position
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Linkage {
+    points: [KinematicVector; MAX_LINKAGE_POINTS],
+    len: usize,
+}
+
+impl Linkage {
+    /// No drawable structure — what a model returns when its "mechanism"
+    /// isn't a linkage at all.
+    pub const EMPTY: Self = Self {
+        points: [KinematicVector {
+            values: [0.0; MAX_GROUP_AXES],
+            len: 0,
+        }; MAX_LINKAGE_POINTS],
+        len: 0,
+    };
+
+    /// The polyline, base first, tool last.
+    pub fn points(&self) -> &[KinematicVector] {
+        &self.points[..self.len]
+    }
+
+    /// Whether there is anything to draw.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Internal constructor — same "values a model just computed" role as
+    /// [`KinematicVector::from_parts`].
+    fn from_parts(points: [KinematicVector; MAX_LINKAGE_POINTS], len: usize) -> Self {
+        Self { points, len }
+    }
+}
+
 /// An opaque, model-defined selector for one of the several joint poses
 /// that reach the same task-space point.
 ///
@@ -220,6 +273,16 @@ pub trait KinematicModel {
         joint_position: KinematicVector,
         task_velocity: KinematicVector,
     ) -> Result<KinematicVector, KinematicsError>;
+
+    /// Where this mechanism physically *is* at the given pose, as a
+    /// drawable polyline from base to tool — see [`Linkage`].
+    ///
+    /// Defaults to [`Linkage::EMPTY`], because most of what this trait does
+    /// has nothing to do with drawing and a model shouldn't have to answer
+    /// this to exist. Overriding it is how a mechanism becomes visible.
+    fn linkage(&self, _joint: KinematicVector) -> Linkage {
+        Linkage::EMPTY
+    }
 }
 
 /// The pass-through model: joint values *are* task-space coordinates.
@@ -487,6 +550,28 @@ impl KinematicModel for ScaraKinematics {
         out[1] = (-j[1][0] * v[0] + j[0][0] * v[1]) / det;
         Ok(KinematicVector::from_parts(out, 2))
     }
+
+    /// Three points: the base at the origin, the elbow at the end of link
+    /// 1, and the tool at the end of link 2. The tool point is
+    /// [`forward_position`] itself, so the drawn arm always ends exactly
+    /// where the rest of the system thinks the TCP is — they cannot drift
+    /// apart, because it is the same call.
+    ///
+    /// [`forward_position`]: KinematicModel::forward_position
+    fn linkage(&self, joint: KinematicVector) -> Linkage {
+        debug_assert_eq!(joint.len(), 2, "ScaraKinematics is a 2-DOF model");
+        let q1 = joint.as_slice()[0];
+
+        let mut elbow = [0.0; MAX_GROUP_AXES];
+        elbow[0] = self.l1 * q1.cos();
+        elbow[1] = self.l1 * q1.sin();
+
+        let mut points =
+            [KinematicVector::from_parts([0.0; MAX_GROUP_AXES], 2); MAX_LINKAGE_POINTS];
+        points[1] = KinematicVector::from_parts(elbow, 2);
+        points[2] = self.forward_position(joint);
+        Linkage::from_parts(points, 3)
+    }
 }
 
 #[cfg(test)]
@@ -735,6 +820,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn linkage_is_base_elbow_tool_with_the_right_link_lengths() {
+        let arm = arm();
+        for &(q1, q2) in &[(0.0, 0.0), (0.7, -0.4), (-1.2, 0.9), (2.5, 0.3)] {
+            let joint = v(&[q1, q2]);
+            let linkage = arm.linkage(joint);
+            let points = linkage.points();
+            assert_eq!(points.len(), 3);
+
+            // Base at the origin.
+            assert!(approx(points[0].as_slice()[0], 0.0));
+            assert!(approx(points[0].as_slice()[1], 0.0));
+
+            // Each drawn segment is exactly its link's length, which is the
+            // property that makes the picture a picture of *this* arm.
+            let segment = |a: KinematicVector, b: KinematicVector| {
+                let (a, b) = (a.as_slice(), b.as_slice());
+                ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
+            };
+            assert!(approx(segment(points[0], points[1]), L));
+            assert!(approx(segment(points[1], points[2]), L));
+
+            // The tool point is forward kinematics, not a second
+            // computation of it.
+            let tcp = arm.forward_position(joint);
+            assert_eq!(points[2], tcp);
+        }
+    }
+
+    #[test]
+    fn identity_has_nothing_to_draw() {
+        let model = IdentityKinematics::new(2);
+        assert!(model.linkage(v(&[1.0, 2.0])).is_empty());
+        assert_eq!(model.linkage(v(&[1.0, 2.0])).points().len(), 0);
     }
 
     #[test]

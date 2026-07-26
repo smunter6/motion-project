@@ -31,8 +31,8 @@ pub mod trajectory;
 pub mod waypoint_path;
 
 pub use kinematics::{
-    IdentityKinematics, KinematicBranch, KinematicModel, KinematicVector, KinematicsError,
-    ScaraKinematics,
+    IdentityKinematics, KinematicBranch, KinematicModel, KinematicVector, KinematicsError, Linkage,
+    MAX_LINKAGE_POINTS, ScaraKinematics,
 };
 pub use linear_move::{LinearMove, LinearMoveError, LinearMoveSample, MAX_GROUP_AXES};
 pub use path_profile::{PathProfile, PathProfileError, PathSample};

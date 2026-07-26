@@ -7,9 +7,27 @@ use std::sync::{Arc, Mutex};
 
 use axis_backend::{AxisState, MotionFlags};
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Line, MarkerShape, Plot, PlotPoints, Points};
 
 use crate::recording::History;
+
+/// How often the window redraws. The control loop writes new samples at
+/// `CONTROL_RATE_HZ` (250 Hz) regardless — this is purely how often that
+/// data is *drawn*, so raising it costs frames, not control fidelity.
+///
+/// 60 Hz rather than anything higher: eframe's vsync caps the useful value
+/// at the monitor refresh anyway.
+///
+/// Note this is a *ceiling*, not a guarantee — what the window actually
+/// achieves is set by frame cost, which is why [`MAX_PLOT_POINTS`] exists
+/// and matters far more than this constant does. Lowering this period is
+/// almost never the fix for a window that feels slow.
+const VIZ_REFRESH_PERIOD: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// The drawn mechanism: warm and opaque, so it reads as a physical object
+/// on top of the two thin trace lines rather than as a third trace.
+const ARM_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 145, 45);
+const JOINT_COLOR: egui::Color32 = egui::Color32::from_rgb(250, 250, 250);
 
 /// A short, human-readable label for an axis's current [`AxisState`],
 /// folding in [`MotionFlags`] where they add information (only meaningful
@@ -35,6 +53,61 @@ fn state_label(state: AxisState, motion: MotionFlags) -> &'static str {
         AxisState::SynchronizedMotion => "synchronized",
         AxisState::Homing => "homing",
     }
+}
+
+/// Roughly how many points any one plotted line is allowed to carry.
+///
+/// The control loop records at 250 Hz and the buffer holds a minute of it,
+/// so a line would otherwise be 15,000 points wide — around 60 per
+/// horizontal pixel, all tessellated and painted every frame, across ~20
+/// lines. That is what made the window feel slow, and it got worse the
+/// longer it ran: **measured**, frame build time grew with the buffer
+/// (6.4 ms at 2,200 samples to 24 ms at 19,700) while the window fell from
+/// ~38 fps to ~9. Lock contention with the control loop was never a factor
+/// at any point — 0.04 ms per frame throughout.
+///
+/// All samples are still *recorded*; this governs only how many are
+/// *drawn*. At 400 the cost stops growing with the buffer entirely
+/// (measured: ~5.7 ms build, ~40 fps, flat past 19,000 samples), and it is
+/// still comfortably more points than these plots are pixels wide — they
+/// sit four to a row in a 1000px window. Raising it buys nothing visible
+/// and costs frames roughly linearly.
+///
+/// Plain striding rather than a min/max envelope per pixel bucket: these
+/// are smooth trajectories, not noisy signals with transients that a stride
+/// could step over.
+const MAX_PLOT_POINTS: usize = 400;
+
+/// How many samples to skip between plotted points to stay under
+/// [`MAX_PLOT_POINTS`]. Always at least 1 (plot everything).
+fn plot_stride(len: usize) -> usize {
+    (len / MAX_PLOT_POINTS).max(1)
+}
+
+/// Collects points that arrive **newest first** into plot order.
+///
+/// Decimation walks the buffer backwards so the stride is anchored at the
+/// live end: the newest sample is always plotted, and any remainder falls
+/// off the old end where nobody is looking. Striding forwards instead would
+/// leave the leading tip of every trace up to a stride stale — small, but
+/// visible as a lag between the drawn arm (which uses the true latest pose)
+/// and the trace it's supposed to be drawing.
+fn in_plot_order(points: impl Iterator<Item = [f64; 2]>) -> PlotPoints<'static> {
+    let mut points: Vec<[f64; 2]> = points.collect();
+    points.reverse();
+    PlotPoints::from(points)
+}
+
+/// The most recent *measured* joint values for a 2-axis group, or `None`
+/// before any feedback has arrived. Feedback, not setpoint: the drawn
+/// mechanism should show where the machine is, which is the one place in
+/// viz that difference is visible as a shape rather than a gap between two
+/// lines.
+fn latest_joints(history: &History, group: &crate::AxisGroupDef) -> Option<[f64; 2]> {
+    Some([
+        history.axis(group.axes[0]).back()?.feedback.position,
+        history.axis(group.axes[1]).back()?.feedback.position,
+    ])
 }
 
 /// A group's task-space (TCP) point from its members' joint values, via the
@@ -100,6 +173,13 @@ impl eframe::App for VizApp {
                             continue;
                         }
                         let (x_axis, y_axis) = (group.axes[0], group.axes[1]);
+                        // The mechanism's current pose, drawn over the
+                        // traces. Empty for a Cartesian group, which has no
+                        // linkage to show.
+                        let pose = latest_joints(&history, group)
+                            .and_then(|joints| motion_core::KinematicVector::from_slice(&joints).ok())
+                            .map(|joints| group.kinematics.linkage(joints))
+                            .filter(|linkage| !linkage.is_empty());
                         ui.vertical(|ui| {
                             ui.heading(format!(
                                 "{} — TCP X/Y (axis{x_axis}, axis{y_axis})",
@@ -113,34 +193,68 @@ impl eframe::App for VizApp {
                             // *are* X and Y — and the whole point for an
                             // arm, whose joint angles plotted raw would
                             // trace nothing meaningful.
-                            Plot::new(format!("xy_plot_{}", group.name))
+                            let plot = Plot::new(format!("xy_plot_{}", group.name))
                                 .view_aspect(1.5)
-                                .height(220.0)
-                                .show(ui, |plot_ui| {
-                                    let target: PlotPoints = history
-                                        .axis(x_axis)
-                                        .iter()
-                                        .zip(history.axis(y_axis).iter())
-                                        .filter_map(|(a, b)| {
-                                            tcp_xy(
-                                                group,
-                                                [a.setpoint.position, b.setpoint.position],
-                                            )
-                                        })
-                                        .collect();
-                                    let actual: PlotPoints = history
-                                        .axis(x_axis)
-                                        .iter()
-                                        .zip(history.axis(y_axis).iter())
-                                        .filter_map(|(a, b)| {
-                                            tcp_xy(
-                                                group,
-                                                [a.feedback.position, b.feedback.position],
-                                            )
-                                        })
-                                        .collect();
+                                .height(220.0);
+                            // A drawn mechanism needs equal scaling on both
+                            // axes or its links change length as the plot
+                            // rescales — a rigid arm that visibly stretches
+                            // is worse than no picture. Only applied where
+                            // there's something to draw, so the plots that
+                            // existed before this keep their auto-fit.
+                            let plot = if pose.is_some() {
+                                plot.data_aspect(1.0)
+                            } else {
+                                plot
+                            };
+                            plot.show(ui, |plot_ui| {
+                                    // Both buffers are written the same
+                                    // cycle, so zipping them reversed pairs
+                                    // each sample with its own counterpart
+                                    // from the newest end backwards.
+                                    let stride = plot_stride(history.axis(x_axis).len());
+                                    let pairs = || {
+                                        history
+                                            .axis(x_axis)
+                                            .iter()
+                                            .rev()
+                                            .zip(history.axis(y_axis).iter().rev())
+                                            .step_by(stride)
+                                    };
+                                    let target = in_plot_order(pairs().filter_map(|(a, b)| {
+                                        tcp_xy(group, [a.setpoint.position, b.setpoint.position])
+                                    }));
+                                    let actual = in_plot_order(pairs().filter_map(|(a, b)| {
+                                        tcp_xy(group, [a.feedback.position, b.feedback.position])
+                                    }));
                                     plot_ui.line(Line::new("target", target));
                                     plot_ui.line(Line::new("actual", actual));
+
+                                    // Drawn last so the arm sits on top of
+                                    // its own traces.
+                                    if let Some(linkage) = &pose {
+                                        let points: Vec<[f64; 2]> = linkage
+                                            .points()
+                                            .iter()
+                                            .map(|p| [p.as_slice()[0], p.as_slice()[1]])
+                                            .collect();
+                                        plot_ui.line(
+                                            Line::new("arm", PlotPoints::from(points.clone()))
+                                                .width(4.0)
+                                                .color(ARM_COLOR),
+                                        );
+                                        // Base, elbow and tool as visible
+                                        // pivots — without them an arm
+                                        // folded near-straight reads as a
+                                        // single line.
+                                        plot_ui.points(
+                                            Points::new("joints", PlotPoints::from(points))
+                                                .radius(5.0)
+                                                .shape(MarkerShape::Circle)
+                                                .filled(true)
+                                                .color(JOINT_COLOR),
+                                        );
+                                    }
                                 });
                         });
                     }
@@ -240,22 +354,29 @@ impl eframe::App for VizApp {
                         ui.vertical(|ui| {
                             ui.heading(format!("axis{axis}"));
                             let units = crate::AXIS_CONFIGS[axis].units;
+                            let stride = plot_stride(history.axis(axis).len());
 
                             ui.label(format!("position ({units})"));
                             Plot::new(format!("pos_plot_{axis}"))
                                 .width(col_width)
                                 .height(160.0)
                                 .show(ui, |plot_ui| {
-                                    let target: PlotPoints = history
-                                        .axis(axis)
-                                        .iter()
-                                        .map(|s| [s.t, s.setpoint.position])
-                                        .collect();
-                                    let actual: PlotPoints = history
-                                        .axis(axis)
-                                        .iter()
-                                        .map(|s| [s.t, s.feedback.position])
-                                        .collect();
+                                    let target = in_plot_order(
+                                        history
+                                            .axis(axis)
+                                            .iter()
+                                            .rev()
+                                            .step_by(stride)
+                                            .map(|s| [s.t, s.setpoint.position]),
+                                    );
+                                    let actual = in_plot_order(
+                                        history
+                                            .axis(axis)
+                                            .iter()
+                                            .rev()
+                                            .step_by(stride)
+                                            .map(|s| [s.t, s.feedback.position]),
+                                    );
                                     plot_ui.line(Line::new("target", target));
                                     plot_ui.line(Line::new("actual", actual));
                                 });
@@ -265,16 +386,22 @@ impl eframe::App for VizApp {
                                 .width(col_width)
                                 .height(160.0)
                                 .show(ui, |plot_ui| {
-                                    let target: PlotPoints = history
-                                        .axis(axis)
-                                        .iter()
-                                        .map(|s| [s.t, s.setpoint.velocity])
-                                        .collect();
-                                    let actual: PlotPoints = history
-                                        .axis(axis)
-                                        .iter()
-                                        .map(|s| [s.t, s.feedback.velocity])
-                                        .collect();
+                                    let target = in_plot_order(
+                                        history
+                                            .axis(axis)
+                                            .iter()
+                                            .rev()
+                                            .step_by(stride)
+                                            .map(|s| [s.t, s.setpoint.velocity]),
+                                    );
+                                    let actual = in_plot_order(
+                                        history
+                                            .axis(axis)
+                                            .iter()
+                                            .rev()
+                                            .step_by(stride)
+                                            .map(|s| [s.t, s.feedback.velocity]),
+                                    );
                                     plot_ui.line(Line::new("target", target));
                                     plot_ui.line(Line::new("actual", actual));
                                 });
@@ -287,6 +414,6 @@ impl eframe::App for VizApp {
 
         // The control loop writes new samples continuously (250 Hz); repaint
         // on a timer rather than only on input so the plots keep animating.
-        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        ctx.request_repaint_after(VIZ_REFRESH_PERIOD);
     }
 }
