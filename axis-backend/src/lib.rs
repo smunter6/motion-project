@@ -37,26 +37,19 @@ pub struct AxisSetpoint {
     pub position: f64,
     pub velocity: f64,
     /// Requested power-stage state: `true` to (request to) enable, `false`
-    /// to (request to) disable. Mirrors a CiA 402 controlword's enable
-    /// bits, simplified to one flag the same way the trait stays in `f64`
-    /// engineering units rather than raw encoder counts (decision #4) —
-    /// sequencing the real multi-step DS402 transitions to get there is
-    /// each backend's own business. Sent every cycle, like the real
-    /// controlword, not as a one-off command.
+    /// to (request to) disable. Sequencing the real multi-step DS402
+    /// transitions to get there is each backend's own business. Sent every
+    /// cycle, not as a one-off command.
     pub enabled: bool,
-    /// Requests clearing a latched fault (see [`AxisFeedback::fault`]),
-    /// mirroring CiA 402's edge-triggered "Fault Reset" controlword bit
-    /// (transition 15: `Fault` -> `SwitchOnDisabled`) — a distinct bit from
-    /// `enabled`, since resetting a fault and requesting enable are
-    /// different real controlword bits, not the same request. Only has any
-    /// effect while [`AxisFeedback::ds402_state`] is [`Ds402State::Fault`];
-    /// harmless otherwise. Resetting clears the fault but does *not*
-    /// re-enable the axis — a fresh `enabled: true` afterward still has to
-    /// run the normal sequence, the same way a real operator has to
-    /// acknowledge a fault before re-enabling.
+    /// Requests clearing a latched fault (see [`AxisFeedback::fault`]) — a
+    /// distinct bit from `enabled`, since resetting a fault and requesting
+    /// enable are different requests. Only has any effect while
+    /// [`AxisFeedback::ds402_state`] is [`Ds402State::Fault`]; harmless
+    /// otherwise. Resetting clears the fault but does *not* re-enable the
+    /// axis — a fresh `enabled: true` afterward still has to run the normal
+    /// sequence.
     pub fault_reset: bool,
-    /// True while a commanded stop (PLCopen `MC_Stop`) is decelerating this
-    /// axis to rest.
+    /// True while a commanded stop is decelerating this axis to rest.
     ///
     /// Deliberately **not** DS402's Quick Stop — that's a distinct,
     /// typically emergency/safety-triggered mechanism with its own
@@ -65,7 +58,7 @@ pub struct AxisSetpoint {
     /// still just an ordinary decelerating velocity setpoint sent every
     /// cycle in `OperationEnabled`, same as the tail end of any move. This
     /// flag only changes what [`AxisFeedback::state`] reports at the
-    /// coarser PLCopen layer (`Stopping` instead of `DiscreteMotion`) —
+    /// coarser layer (`Stopping` instead of `DiscreteMotion`) —
     /// `ds402_state` is unaffected by it entirely.
     pub stopping: bool,
 }
@@ -90,17 +83,14 @@ pub struct AxisFeedback {
     pub ds402_state: Ds402State,
 }
 
-/// One axis's motion-control state, loosely modeled on the PLCopen
-/// (IEC 61131-3 Part 4) `MC_ReadStatus` state machine — not an exact match,
-/// but a useful reference set of states, since `backend-ethercat` will
-/// eventually need to report a real CiA 402 drive's state through this same
-/// shape. Mutually exclusive by construction (an enum, not a pile of bools),
-/// unlike PLCopen's own flat `BOOL` outputs.
+/// One axis's motion-control state — a coarse status enum,
+/// mutually exclusive by construction, that `backend-ethercat` will
+/// eventually need to report a real drive's state through as well.
 ///
 /// Several variants aren't raised by any backend yet — `backend-sim` only
 /// ever reports `Disabled`, `StandStill`, `DiscreteMotion`, `Stopping`, or
 /// `ErrorStop`. They're included now so this type doesn't need reshaping
-/// later, when homing, jogging, or coordinated moves (Step 2, deferred)
+/// later, when homing, jogging, or coordinated moves (still deferred)
 /// arrive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxisState {
@@ -111,8 +101,8 @@ pub enum AxisState {
     ErrorStop,
     /// Decelerating to a controlled stop after a commanded stop (see
     /// [`AxisSetpoint::stopping`]) — reported instead of `DiscreteMotion`
-    /// while decelerating for that reason. Not the same thing as DS402's
-    /// `QuickStopActive`; see `stopping`'s own docs for why.
+    /// while decelerating for that reason. Not the same thing as
+    /// `Ds402State::QuickStopActive`; see `stopping`'s own docs for why.
     Stopping,
     /// At rest, no fault, ready to accept a move.
     StandStill,
@@ -121,23 +111,21 @@ pub enum AxisState {
     /// Executing a jog/velocity-mode move. Not raised by any backend yet.
     ContinuousMotion,
     /// Executing a coordinated multi-axis move. Not raised by any backend
-    /// yet — coordinated moves are Step 2, explicitly deferred.
+    /// yet — coordinated moves are still deferred.
     SynchronizedMotion,
     /// Executing a homing sequence. Not raised by any backend yet.
     Homing,
 }
 
-/// One axis's real CiA 402 (DS402) power-state machine state — the actual
-/// state a servo drive's statusword reports, one layer more detailed than
+/// One axis's real DS402 power-state machine state — the actual state a
+/// servo drive's statusword reports, one layer more detailed than
 /// [`AxisState`].
 ///
-/// The relationship between the two mirrors PLCopen itself: a real PLCopen
-/// motion controller manages a drive's DS402 state machine internally and
-/// exposes only the coarser `MC_ReadStatus` view (`AxisState`) to the
-/// application — the detailed drive state is exactly what PLCopen's own
-/// `ST_AxisStatus` structure exists to carry, as backend/vendor-specific
-/// detail beneath the standard bits. See [`Ds402State::axis_state`] for that
-/// mapping.
+/// The two layers exist because a real motion controller manages a drive's
+/// DS402 state machine internally and exposes only a coarser view
+/// (`AxisState`) to the application; the detailed drive state is
+/// backend/vendor-specific detail beneath the standard bits. See
+/// [`Ds402State::axis_state`] for that mapping.
 ///
 /// Omits DS402's transient `Not Ready to Switch On` pseudo-state (occupied
 /// only for an instant right after power-on, before self-test completes) —
@@ -186,10 +174,9 @@ impl Ds402State {
     }
 }
 
-/// Sub-flags describing motion in progress, alongside [`AxisState`].
-/// Unlike `AxisState`'s variants, these three are meant to mirror PLCopen's
-/// own flat bools directly — they're not a state machine, just "which part
-/// of the velocity profile is this axis in right now."
+/// Sub-flags describing motion in progress, alongside [`AxisState`]. Not a
+/// state machine, just "which part of the velocity profile is this axis in
+/// right now."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MotionFlags {
     pub accelerating: bool,

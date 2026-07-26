@@ -3,48 +3,32 @@
 //!
 //! # Why this exists
 //!
-//! A servo drive running in CSP mode (Cyclic Synchronous Position) wants exactly
-//! one thing from us every control cycle: the *target position for this instant*.
-//! It does not want "go to B eventually" — it wants "be at 12.47 mm right now",
-//! then 4 ms later "be at 12.83 mm right now", and so on. Our job is to produce
-//! that stream of setpoints so the sequence adds up to smooth, physically
-//! reasonable motion.
+//! A servo drive wants exactly one thing from us every control cycle: the
+//! *target position for this instant* — not "go to B eventually" but "be at
+//! 12.47 mm right now", then 4 ms later "be at 12.83 mm right now".
 //!
 //! # The model: trapezoidal velocity profile
 //!
-//! An axis can't teleport and can't change speed instantly (that would need
-//! infinite acceleration / infinite force). So a well-behaved move has up to
-//! three phases:
+//! An axis can't teleport or change speed instantly, so a well-behaved move
+//! has up to three phases: accelerate to a max speed, cruise, decelerate to
+//! zero exactly at the target. Plotted as speed-vs-time this is a trapezoid
+//! (direction is constant through a move and applied separately — see
+//! `direction`). Position, the integral of signed velocity, comes out as a
+//! smooth S-curve.
 //!
-//! 1. **Accelerate** at a constant rate until reaching a maximum speed.
-//! 2. **Cruise** at that maximum speed.
-//! 3. **Decelerate** at a constant rate, arriving exactly as speed hits zero.
-//!
-//! Plotted as speed-vs-time this is a trapezoid (ramp up, flat top, ramp
-//! down) — "speed" because the shape only comes out trapezoidal for the
-//! *magnitude* of motion; direction is constant throughout a single move
-//! and is applied separately (see `direction`). Position — the integral of
-//! signed velocity — comes out as a smooth S-ish curve.
-//!
-//! # The triangular special case
-//!
-//! If the move is short, the axis may never reach `max_speed`: it accelerates
-//! and must *already* start decelerating to stop in time. The trapezoid loses its
-//! flat top and becomes a triangle. We detect and handle this explicitly — the
-//! boundary between the two cases is one of the genuinely instructive parts.
+//! If the move is too short to reach `max_speed`, the trapezoid loses its
+//! flat top and becomes a triangle. That case is detected and handled
+//! explicitly.
 //!
 //! # Time model: absolute-time query (not dt-stepping)
 //!
-//! This generator is a **pure function of elapsed time**: you ask "where should
+//! This generator is a **pure function of elapsed time**: ask "where should
 //! the axis be at t = 0.348 s?" and it computes the answer from closed-form
-//! kinematics. It holds no mutable state. This gives us:
-//!   - no accumulated integration error (exact at every instant),
-//!   - easy-to-verify invariants (test any instant independently),
-//!   - robustness to loop-timing jitter (ask for the *actual* elapsed time).
+//! kinematics, with no mutable state. That gives exact results at any
+//! instant, easy-to-verify invariants, and robustness to loop-timing jitter.
 //!
-//! The *stateful*, dt-stepping model belongs to a different layer — the sim
-//! plant model / real servo loop — which we build later. See `NOTE (dt seam)`
-//! below for exactly where the two layers will meet.
+//! The *stateful*, dt-stepping model belongs to a different layer (sim plant
+//! / real servo loop). See `NOTE (dt seam)` below for where the two meet.
 
 /// Which phase of the trapezoidal profile a given instant falls in.
 ///
@@ -67,17 +51,12 @@ pub enum MotionPhase {
 
 /// Reasons a `TrapezoidalProfile` could not be constructed.
 ///
-/// A typed enum (not a bare `String`) so callers — including a future
-/// coordinator resolving several axes' moves at once, where "impossible to
-/// resolve" won't always reduce to a single bad number — can match on
-/// *which* constraint failed, not just that something did.
+/// A typed enum (not a bare `String`) so callers can match on *which*
+/// constraint failed, not just that something did.
 ///
-/// Finiteness is checked alongside sign/positivity: a NaN or infinite input
-/// wouldn't trip a bare `> 0.0` check (`NaN > 0.0` is `false`, so it would
-/// still be caught, but `f64::INFINITY > 0.0` is `true` and would sail
-/// through) and would instead silently propagate into every downstream
-/// position/velocity as NaN or infinity — a worse failure mode than an
-/// explicit, early rejection.
+/// Finiteness is checked alongside sign/positivity: `f64::INFINITY > 0.0` is
+/// `true`, so a bare `> 0.0` check would let infinity through to propagate
+/// as NaN/infinity downstream instead of failing fast here.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrajectoryError {
     /// `start` or `end` is NaN or +/-infinity — not a real position.
@@ -132,15 +111,12 @@ impl std::error::Error for TrajectoryError {}
 /// A single-axis point-to-point move described by a trapezoidal (or, for short
 /// moves, triangular) velocity profile.
 ///
-/// Units are deliberately unspecified but must be *self-consistent*. Throughout
-/// the project we treat linear axes as millimetres and seconds, so:
-///   - positions in mm
-///   - `max_speed` in mm/s
-///   - `max_acceleration` in mm/s^2
+/// Units are deliberately unspecified but must be *self-consistent*: mm,
+/// mm/s, mm/s^2 throughout this project.
 ///
 /// The core stays in `f64` for clean, readable math. Conversion to integer
-/// encoder counts (what a real drive actually wants) is the job of the EtherCAT
-/// backend at the hardware seam — not of this planner.
+/// encoder counts is the backend's job at the hardware seam, not this
+/// planner's.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrapezoidalProfile {
     start: f64,
@@ -158,14 +134,12 @@ pub struct TrapezoidalProfile {
     decel: f64,
     cruise_speed: f64,
 
-    // --- Prefix: killing a `start_velocity` the main segment can't use
-    // directly (opposite direction, or same direction but not enough room
-    // to stop before `end` — see `new_with_start_velocity`). Zero-duration
-    // (t_prefix_end == 0.0) whenever there's no prefix — true for every
-    // profile built via `new()`, and for `new_with_start_velocity` calls
-    // with enough room to ride the start velocity straight into the main
-    // segment. A real prefix decelerates `prefix_velocity` to rest at
-    // `prefix_decel`, exactly like `StopRamp`, landing at `main_start`.
+    // --- Prefix: kills a `start_velocity` the main segment can't use
+    // directly (opposite direction, or not enough room to stop before
+    // `end` — see `new_with_start_velocity`). Zero-duration
+    // (t_prefix_end == 0.0) whenever there's no prefix. A real prefix
+    // decelerates `prefix_velocity` to rest at `prefix_decel`, exactly like
+    // `StopRamp`, landing at `main_start`.
     prefix_velocity: f64,
     prefix_decel: f64,
     t_prefix_end: f64,
@@ -173,13 +147,9 @@ pub struct TrapezoidalProfile {
     /// prefix, otherwise wherever the prefix's deceleration lands.
     main_start: f64,
 
-    // --- Main segment: ramps from `main_start_velocity` (0, or the
-    // caller's start_velocity carried straight in when there's no prefix)
-    // up or down to `cruise_speed`, cruises, then decelerates to rest at
-    // `end`. Phase times below are ABSOLUTE (measured from the profile's
-    // own t = 0, i.e. already include t_prefix_end) — so for the
-    // overwhelmingly common no-prefix case these are exactly the fields
-    // the original rest-to-rest algorithm computed, unchanged.
+    // --- Main segment: ramps from `main_start_velocity` up or down to
+    // `cruise_speed`, cruises, then decelerates to rest at `end`. Phase
+    // times below are ABSOLUTE (already include t_prefix_end).
     main_start_velocity: f64,
     t_accel: f64,      // end of phase 1 (accel or decel-to-cruise) == start of cruise
     t_cruise_end: f64, // end of cruise phase == start of final deceleration
@@ -191,11 +161,10 @@ pub struct TrapezoidalProfile {
 }
 
 /// The main (rest-target) segment of a profile: ramps from some starting
-/// speed (0, in the plain rest-to-rest case) up or down to a cruise speed,
-/// cruises, then decelerates to rest — computed in isolation from wherever
-/// it actually begins, so both `new()` and `new_with_start_velocity` can
-/// build one and place it (directly, or after a prefix) into the outer
-/// `TrapezoidalProfile`.
+/// speed up or down to a cruise speed, cruises, then decelerates to rest —
+/// computed in isolation from wherever it actually begins, so both `new()`
+/// and `new_with_start_velocity` can build one and place it (directly, or
+/// after a prefix) into the outer `TrapezoidalProfile`.
 struct MainSegment {
     direction: f64,
     distance: f64,
@@ -212,10 +181,8 @@ struct MainSegment {
 pub struct TrajectorySample {
     /// Target position at the queried time (same units as the profile).
     pub position: f64,
-    /// Target velocity at the queried time. Cheap to compute and makes the
-    /// profile's behaviour legible (you can watch it ramp up, flatten, ramp
-    /// down). A real CSP drive only strictly needs position, but velocity
-    /// feed-forward is useful later.
+    /// Target velocity at the queried time. Useful as a feed-forward signal
+    /// even though position alone drives the move.
     pub velocity: f64,
 }
 
@@ -224,17 +191,13 @@ impl TrapezoidalProfile {
     ///
     /// `max_speed`, `max_acceleration`, and `max_deceleration` must all be
     /// finite and > 0, and `start`/`end` must both be finite; otherwise this
-    /// returns `Err` rather than panicking or producing a silently-broken
-    /// profile. See [`TrajectoryError`] for why finiteness is checked, not
-    /// just sign. These limits represent the physical limits of the axis
-    /// (ultimately set by motor torque / current limits on real hardware;
-    /// chosen numbers in sim). Keeping them explicit means sim exercises the
-    /// same limits real hardware will impose. Acceleration and deceleration
-    /// are independent — many real axes (and PLCopen-style motion function
-    /// blocks) allow a faster ramp-up than ramp-down, or vice versa.
+    /// returns `Err` rather than panicking. See [`TrajectoryError`] for why
+    /// finiteness is checked, not just sign. Acceleration and deceleration
+    /// are independent, since many real axes allow a faster ramp-up than
+    /// ramp-down (or vice versa).
     ///
-    /// A zero-distance move is valid and produces a profile that simply reports
-    /// `start` for all time with zero velocity (total duration 0).
+    /// A zero-distance move is valid and produces a profile that simply
+    /// reports `start` for all time with zero velocity (total duration 0).
     pub fn new(
         start: f64,
         end: f64,
@@ -258,35 +221,30 @@ impl TrapezoidalProfile {
     /// Build a profile for a move from `start` to `end`, but starting from a
     /// nonzero `start_velocity` — the axis's actual current velocity, not
     /// the rest-to-rest assumption `new()` makes. This is what backs
-    /// interrupting an in-flight move with a new target (PLCopen `BufferMode
-    /// ::Aborting`): the new move's own `max_speed`/`max_acceleration`/
-    /// `max_deceleration` govern the entire resulting profile, including any
-    /// preamble needed to reconcile `start_velocity` with the new target —
-    /// there's no blending or carryover of whatever move was superseded.
+    /// interrupting an in-flight move with a new target: the new move's own
+    /// `max_speed`/`max_acceleration`/`max_deceleration` govern the entire
+    /// resulting profile, including any preamble needed to reconcile
+    /// `start_velocity` with the new target — no blending or carryover from
+    /// whatever move was superseded.
     ///
     /// Three kinematic cases fall out of the geometry, none requiring the
     /// caller to pick a case explicitly:
     ///
-    /// - **Same direction, room to spare**: `start_velocity` already points
-    ///   toward `end` and there's enough distance left to arrive at rest
-    ///   without exceeding `max_speed` or needing harder-than-`max_deceleration`
-    ///   braking. Ramps from `start_velocity` to a cruise speed (accelerating
-    ///   if `start_velocity` is below it, decelerating into cruise if it's
-    ///   already above `max_speed`), cruises, then decelerates to rest —
-    ///   the same trapezoid/triangle shape `new()` builds, just starting
+    /// - **Same direction, room to spare**: ramps from `start_velocity` to a
+    ///   cruise speed (accelerating, or decelerating into cruise if
+    ///   `start_velocity` is already above `max_speed`), cruises, then
+    ///   decelerates to rest — same shape `new()` builds, just starting
     ///   partway up (or down) the ramp instead of from rest.
-    /// - **Same direction, not enough room**: moving toward `end`, but too
-    ///   fast to stop before reaching it at `max_deceleration`. Physically
-    ///   has to overshoot: decelerate to rest past `end`, then a fresh
-    ///   rest-to-rest move back.
-    /// - **Opposite direction**: `start_velocity` points away from `end`.
-    ///   Decelerate to rest first, then a normal rest-to-rest move from
-    ///   wherever that lands.
+    /// - **Same direction, not enough room**: too fast to stop before `end`
+    ///   at `max_deceleration`. Overshoots: decelerates to rest past `end`,
+    ///   then a fresh rest-to-rest move back.
+    /// - **Opposite direction**: decelerates to rest first, then a normal
+    ///   rest-to-rest move from wherever that lands.
     ///
-    /// The last two cases are the same code path — both decelerate
-    /// `start_velocity` to rest, then hand off to a fresh rest-to-rest
-    /// segment; which side of `end` that landing spot falls on is what
-    /// distinguishes "overshoot and come back" from "reverse and go".
+    /// The last two cases are the same code path — decelerate to rest, then
+    /// hand off to a fresh rest-to-rest segment; which side of `end` the
+    /// landing spot falls on distinguishes "overshoot and come back" from
+    /// "reverse and go".
     pub fn new_with_start_velocity(
         start: f64,
         start_velocity: f64,
@@ -419,33 +377,23 @@ impl TrapezoidalProfile {
 
         // --- Pick the cruise speed ----------------------------------------
         //
-        // If v0 is already above max_speed (only reachable from
-        // new_with_start_velocity, when the axis was moving faster than the
-        // *new* move's max_speed allows), the only way to respect max_speed
-        // going forward is to decelerate down to it — there's no "trapezoid
-        // vs triangle" choice, cruise_speed is just max_speed (the caller's
-        // room check guarantees there's space to decelerate through it and
-        // still stop by `end`, with possibly zero cruise distance).
+        // If v0 already exceeds max_speed (only reachable from
+        // new_with_start_velocity), cruise_speed is just max_speed — the
+        // caller's room check guarantees space to decelerate through it and
+        // still stop by `end`.
         //
-        // Otherwise it's exactly the original trapezoid-vs-triangle
-        // decision, generalized to start from v0 instead of 0:
-        //
-        //   v^2 = v0^2 + 2*a*d   =>   d = (v^2 - v0^2) / (2a)
-        //
-        // which reduces to the v0 == 0 formulas exactly when v0 is 0.
+        // Otherwise it's the trapezoid-vs-triangle decision, generalized to
+        // start from v0 instead of 0: v^2 = v0^2 + 2*a*d => d = (v^2-v0^2)/(2a),
+        // reducing to the v0 == 0 formulas when v0 is 0.
         let cruise_speed = if v0 <= max_speed {
             let d_accel_full = (max_speed * max_speed - v0 * v0) / (2.0 * accel);
             let d_decel_full = (max_speed * max_speed) / (2.0 * decel);
             if d_accel_full + d_decel_full <= distance {
                 max_speed
             } else {
-                // Triangular: peak speed where the ramp-from-v0 and
-                // decel-to-0 phases meet, d_ramp(v_peak) + d_decel(v_peak)
-                // == distance:
-                //   (v_peak^2 - v0^2)/(2*accel) + v_peak^2/(2*decel) = distance
-                //   => v_peak = sqrt((2*accel*decel*distance + v0^2*decel) / (accel + decel))
-                // (reduces to the original sqrt(2*distance*accel*decel/(accel+decel))
-                // when v0 == 0.)
+                // Triangular: peak speed where ramp-from-v0 and decel-to-0
+                // meet: (v_peak^2-v0^2)/(2*accel) + v_peak^2/(2*decel) = distance
+                // => v_peak = sqrt((2*accel*decel*distance + v0^2*decel)/(accel+decel)).
                 ((2.0 * accel * decel * distance + v0 * v0 * decel) / (accel + decel)).sqrt()
             }
         } else {
@@ -453,8 +401,7 @@ impl TrapezoidalProfile {
         };
 
         // Phase 1 ramps from v0 to cruise_speed — accelerating if
-        // cruise_speed >= v0, decelerating into cruise otherwise (the
-        // v0 > max_speed case above).
+        // cruise_speed >= v0, decelerating into cruise otherwise.
         let ramping_up = cruise_speed >= v0;
         let rate1 = if ramping_up { accel } else { decel };
         let t_accel = (cruise_speed - v0).abs() / rate1;
@@ -481,11 +428,10 @@ impl TrapezoidalProfile {
     }
 
     /// Assemble a `TrapezoidalProfile` from a `MainSegment`, placed either
-    /// directly at `start` (`prefix: None`, `main_start_velocity` is
-    /// whatever the caller rode straight into the segment) or after a
-    /// prefix `(prefix_velocity, t_prefix_end, main_start)` that decelerated
-    /// to rest first (`main_start_velocity` is then always 0.0). Converts
-    /// the segment's local phase times into the profile's absolute ones.
+    /// directly at `start` (`prefix: None`) or after a prefix
+    /// `(prefix_velocity, t_prefix_end, main_start)` that decelerated to
+    /// rest first (`main_start_velocity` is then always 0.0). Converts the
+    /// segment's local phase times into the profile's absolute ones.
     fn from_segment(
         start: f64,
         end: f64,
@@ -533,13 +479,10 @@ impl TrapezoidalProfile {
     ///
     /// Computed directly from the known phase-boundary times, so it's exact.
     /// For a triangular move the cruise window is empty (`t_accel ==
-    /// t_cruise_end`), so `Cruise` is simply never returned. When a
-    /// `new_with_start_velocity` prefix is decelerating an incompatible
-    /// start velocity to rest, that reports `Decel` too — it's genuinely
-    /// losing speed, same as the final approach to `end`. Phase 1 of the
-    /// main segment reports `Accel` or `Decel` depending on whether it's
-    /// ramping up to cruise or (only reachable when the start velocity was
-    /// already above the new move's `max_speed`) down into it.
+    /// t_cruise_end`), so `Cruise` is never returned. A `new_with_start_velocity`
+    /// prefix decelerating an incompatible start velocity reports `Decel`
+    /// too. Phase 1 of the main segment reports `Accel` or `Decel` depending
+    /// on whether it's ramping up to cruise or down into it.
     pub fn phase_at(&self, t: f64) -> MotionPhase {
         if t <= 0.0 || self.distance == 0.0 {
             MotionPhase::Pre
@@ -660,12 +603,11 @@ impl TrapezoidalProfile {
 /// A controlled deceleration to rest from wherever an axis actually is right
 /// now — the mirror image of [`TrapezoidalProfile`]'s rest-to-rest move.
 ///
-/// This is what backs a commanded stop (PLCopen `MC_Stop`): unlike a move,
-/// there's no target position to aim for and no accel/cruise phase, just
-/// "decelerate from `start_velocity` to zero at `max_deceleration`, holding
-/// wherever that lands." `TrapezoidalProfile` can't represent this itself —
-/// it always assumes both ends are at rest — hence a separate, much simpler
-/// type rather than generalizing it.
+/// This is what backs a commanded stop: unlike a move, there's no target
+/// position to aim for and no accel/cruise phase, just "decelerate from
+/// `start_velocity` to zero at `max_deceleration`, holding wherever that
+/// lands." `TrapezoidalProfile` always assumes both ends are at rest, so
+/// this is a separate, much simpler type rather than a generalization of it.
 ///
 /// Same absolute-time, pure-function-of-`t` model as `TrapezoidalProfile`
 /// (see the module docs' "Time model" section) — no mutable state here

@@ -1,25 +1,17 @@
-//! A straight-line move across several axes at once — the kinematic
-//! foundation for a hard-coded axis group (see `app`'s `AxisGroup`
-//! command handling): "move this Cartesian pair/triple/etc. from here to
-//! there in a straight line" rather than "move this one axis."
+//! A straight-line move across several axes at once: "move this group from
+//! here to there in a straight line" rather than "move this one axis."
 //!
 //! # Why this exists, and why it isn't `WaypointPath`/`PathProfile`
 //!
 //! A multi-axis straight-line move is a special case of general path
-//! following: one segment, always a line, no blending. Rather than build
-//! the full spline/arc-length machinery a general path-follower would need,
-//! this type is deliberately the minimal thing that satisfies the actual
-//! requirement: one scalar [`TrapezoidalProfile`] over the Euclidean
-//! distance between the start and end points, composed with a fixed unit
-//! direction vector. If a general path-following feature is built later,
-//! this type is a natural candidate to be subsumed by (or reimplemented as
-//! a thin wrapper over) a two-waypoint, straight-line-only path — but nothing
-//! here builds toward that; it's just not precluded.
+//! following: one segment, always a line, no blending. Rather than the
+//! full spline/arc-length machinery a general path-follower needs, this is
+//! the minimal thing that satisfies it: one scalar [`TrapezoidalProfile`]
+//! over the Euclidean distance between the start and end points, composed
+//! with a fixed unit direction vector.
 //!
-//! # Same absolute-time model as `TrapezoidalProfile`
-//!
-//! No dt-stepping state here either — `sample(t)` is a pure function of
-//! elapsed time, exactly like every other profile type in this crate.
+//! Same absolute-time model as `TrapezoidalProfile` — no dt-stepping state
+//! here either, `sample(t)` is a pure function of elapsed time.
 
 use crate::trajectory::{MotionPhase, TrajectoryError, TrapezoidalProfile};
 
@@ -152,19 +144,13 @@ impl LinearMove {
     ///
     /// The N-dimensional `start_velocity` is projected onto the new line's
     /// unit direction via a dot product, reducing to the same scalar
-    /// problem `TrapezoidalProfile::new_with_start_velocity` already solves
-    /// completely (same-direction-with-room, overshoot-then-reverse,
-    /// opposite-direction, and start-velocity-exceeding-max-speed all fall
-    /// out for free). **Known limitation**: the component of
-    /// `start_velocity` perpendicular to the new line is discarded, not
-    /// reconciled — if the axes' actual velocity isn't already parallel to
-    /// the new line, there is a genuine velocity discontinuity at `t = 0`
-    /// (unlike `TrapezoidalProfile::new_with_start_velocity`, which is
-    /// velocity-continuous at `t = 0` by construction). Accepted as a v1
-    /// simplification for redirecting a moving axis group onto a new line;
-    /// the perpendicular component is simply not reachable from a single
-    /// straight line, so full reconciliation would need a genuinely
-    /// different (curved, blended) transition, not a bigger version of this
+    /// problem `TrapezoidalProfile::new_with_start_velocity` already solves.
+    /// **Known limitation**: the component of `start_velocity` perpendicular
+    /// to the new line is discarded, not reconciled — if the axes' actual
+    /// velocity isn't already parallel to the new line, there's a genuine
+    /// velocity discontinuity at `t = 0`. Accepted as a simplification for
+    /// redirecting a moving axis group onto a new line; full reconciliation
+    /// would need a curved/blended transition, not a bigger version of this
     /// type.
     pub fn new_with_start_velocity(
         start: Vec<f64>,

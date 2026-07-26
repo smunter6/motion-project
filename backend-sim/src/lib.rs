@@ -20,15 +20,14 @@
 //! dead-reckoning position from commanded velocity, not tracking a position
 //! target. That's the opposite of how a real EtherCAT drive in CSP mode
 //! actually works (position is the primary command there; the drive's own
-//! internal servo loop is what supplies velocity feed-forward and is where
-//! real following error comes from). `backend-ethercat`, when it exists,
-//! will consume these fields the other way around. This sim is a stand-in
-//! for exercising the dt-stepping seam now, not a faithful physical model —
-//! that's what Step 6 ("richer sim") is for.
+//! internal servo loop supplies velocity feed-forward and is where real
+//! following error comes from). `backend-ethercat`, when it exists, will
+//! consume these fields the other way around. This sim is a stand-in for
+//! exercising the dt-stepping seam now, not a faithful physical model.
 //!
 //! Richer dynamics (second-order lag, following-error limits) are a
-//! deliberately later step — see CLAUDE.md's roadmap. Faults are no longer
-//! entirely deferred: see `step_ds402` for the one fault this sim can raise.
+//! deliberately later step. See `step_ds402` for the one fault this sim can
+//! raise.
 
 use axis_backend::{
     AxisFault, AxisFeedback, AxisGroup, AxisGroupError, AxisSetpoint, AxisState, Ds402State,
@@ -54,24 +53,17 @@ const ACCEL_EPS: f64 = 1e-9;
 ///
 /// Real masters negotiate this the same way: each controlword write moves
 /// the drive at most one standard transition, confirmed by the next
-/// statusword read, rather than jumping straight there — so stepping one
-/// state per `exchange()` cycle here isn't a simplification for its own
-/// sake, it's what the real protocol actually does. Coming down, DS402 also
-/// offers direct multi-state shortcuts (e.g. "Disable Voltage" drops
-/// straight to `SwitchOnDisabled` from any of the three states above it) —
-/// this always takes the granular one-state-at-a-time path instead, since
-/// that's the more interesting (and more testable) case, and a real master
-/// is free to choose either.
+/// statusword read, rather than jumping straight there. DS402 also offers
+/// direct multi-state shortcuts coming down, but this always takes the
+/// granular one-state-at-a-time path, since that's the more interesting
+/// (and testable) case, and a real master is free to choose either.
 ///
 /// `fault_detected` (computed by the caller — see `exchange`) preempts
-/// everything else, from any state, the same way a real fault does (DS402
-/// transition 13). From there: `FaultReactionActive` always advances
-/// automatically to `Fault` one cycle later (transition 14) — no
+/// everything else, from any state. From there: `FaultReactionActive`
+/// always advances automatically to `Fault` one cycle later — no
 /// controlword input needed, mirroring a real drive's brief internal
-/// fault-handling window. `Fault` only leaves via `fault_reset`
-/// (transition 15, to `SwitchOnDisabled`); toggling `enabled` alone does
-/// nothing there, matching a real operator having to acknowledge a fault
-/// before re-enabling.
+/// fault-handling window. `Fault` only leaves via `fault_reset` (back to
+/// `SwitchOnDisabled`); toggling `enabled` alone does nothing there.
 ///
 /// `QuickStopActive` isn't reachable yet — no quick-stop command exists —
 /// held in place if ever reached. Unlike the fault path, a *commanded*
@@ -406,8 +398,7 @@ mod tests {
 
         let dt = 1.0 / 250.0;
         // max_speed=50, accel=decel=200 => accel phase 0..0.25s, cruise
-        // 0.25..2.0s, decel 2.0..2.25s, total 2.25s duration (same numbers
-        // as CLAUDE.md's worked 0->100mm example).
+        // 0.25..2.0s, decel 2.0..2.25s, total 2.25s duration.
         let profile = TrapezoidalProfile::new(start, end, 50.0, 200.0, 200.0).unwrap();
         let mut sim = SimAxisGroup::new(1, dt);
         warm_up_enabled(&mut sim, 1);
@@ -651,7 +642,7 @@ mod tests {
         assert_eq!(fb[0].velocity, 0.0);
 
         // One cycle later, FaultReactionActive automatically advances to
-        // Fault (DS402 transition 14) — no controlword input needed.
+        // Fault — no controlword input needed.
         let fb = sim.exchange(&[disable_setpoint]).unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::Fault);
         assert_eq!(fb[0].fault, Some(AxisFault::DisabledWhileMoving));
@@ -779,8 +770,7 @@ mod tests {
         assert_eq!(fb[0].ds402_state, Ds402State::OperationEnabled);
         assert!(fb[0].motion.decelerating);
 
-        // Once at rest, StandStill — the stopping flag no longer matters,
-        // same as PLCopen's Stopping -> StandStill once the stop completes.
+        // Once at rest, StandStill — the stopping flag no longer matters.
         let fb = sim
             .exchange(&[AxisSetpoint {
                 position: 0.0,
