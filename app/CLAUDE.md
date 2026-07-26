@@ -1,0 +1,31 @@
+# `app` — environment gotchas
+
+Loaded only when working under `app/`. Design rationale for the control loop,
+profiles, and group cascade lives in the root `CLAUDE.md`.
+
+## Viz renderer: use `glow`, not the default `wgpu`
+
+eframe's default `wgpu` renderer **fails at startup in this WSL setup**
+(`WinitEventLoop(ExitFailure(1))`) — there's no `/dev/dri` render node and no
+Vulkan ICD, only WSL's `/dev/dxg` GPU passthrough. `glow` (OpenGL) via Mesa,
+through `/dev/dxg`, works. Don't "fix" the dependency back to `wgpu`.
+
+eframe's default `accesskit` feature is also dropped — AT-SPI/D-Bus
+screen-reader integration is unneeded for a dev plotting tool, and it was
+itself failing on a missing D-Bus session daemon during startup diagnosis.
+
+## Running a GUI app on a fresh WSL setup
+
+WSLg provides the compositor, **not** the client-side libraries. Install:
+
+```
+apt-get install libwayland-client0 libwayland-egl1 libwayland-cursor0 \
+                libxkbcommon0 libegl1 libgl1
+```
+
+## Window sizing
+
+`ViewportBuilder::with_inner_size([1000.0, 900.0])` in `main()` — eframe's
+unset default is too short for the current plot count. The `CentralPanel`'s
+content is wrapped in `egui::ScrollArea::vertical()` so growing content stays
+reachable regardless of window size or axis count.

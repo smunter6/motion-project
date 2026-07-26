@@ -1,7 +1,9 @@
 # CLAUDE.md — project context for Claude Code
 
-This file orients a fresh Claude Code session. It was carried over from an
-earlier planning/design conversation. Read it before making changes.
+This file orients a fresh Claude Code session. It records *why* things are the
+way they are — decisions, gotchas, and deferrals that the code itself can't
+explain. Current implementation state is derivable from the source and
+`git log`; don't re-narrate it here.
 
 ## What this project is
 
@@ -26,15 +28,17 @@ over-produce; confirm direction at natural decision points.
 
 1. **Clean seam between motion logic and backend.** The planner never knows
    whether a simulation or real EtherCAT drives are behind it. Both implement
-   the same (future) `AxisGroup` trait. Sim now, EtherCAT later, swappable.
+   the same `AxisGroup` trait. Sim now, EtherCAT later, swappable.
 2. **`motion-core` is I/O-free and dependency-free.** Pure math only
    (trajectory, kinematics, types). This is what we unit-test on the host and
    reuse unchanged on the Pi / potentially RP2350. Nothing touching a NIC, a
-   drive, or a window goes in here.
+   drive, or a window goes in here. No heap allocation in the per-cycle hot
+   path (hence the fixed-size, `Copy` sample structs bounded by
+   `MAX_GROUP_AXES = 6`).
 3. **Absolute-time trajectory vs. dt-stepping plant.** The trajectory generator
    is a *pure function of elapsed time* (exact, testable, jitter-robust). The
    *stateful, dt-stepping* model belongs to the plant layer (sim model / real
-   servo), added later. They meet at the setpoint each control cycle. See the
+   servo). They meet at the setpoint each control cycle. See the
    `NOTE (dt seam)` comment in `motion-core/src/trajectory.rs::sample`.
 4. **f64 in the core.** Real drives use integer encoder counts; that conversion
    is the backend's job at the hardware seam, not the planner's.
@@ -42,459 +46,198 @@ over-produce; confirm direction at natural decision points.
    other kinematic models (e.g., 2-link arm) can drop in later.
 6. **Control rate: 250 Hz** (4 ms cycle) to start.
 
-## Deployment context (for later steps)
+## Deployment context
 
-- Develop/test in **WSL** (Linux filesystem, not /mnt/c). Cross-compile for a
-  Raspberry Pi target (`aarch64-unknown-linux-gnu` for 64-bit Pi OS) via
-  `cross` or `cargo-zigbuild`. Deploy loop: build → rsync → ssh run.
-- Real EtherCAT bus testing happens on the **Pi**, not in WSL (WSL2's
-  virtualized NAT networking can't do raw L2 EtherCAT reliably). WSL is for
+- Develop/test in **WSL** (Linux filesystem, not /mnt/c). See the
+  `deploy-to-pi` skill for the cross-compile/deploy loop.
+- **Real EtherCAT bus testing happens on the Pi, not in WSL** — WSL2's
+  virtualized NAT networking can't do raw L2 EtherCAT reliably. WSL is for
   code + host-side unit tests of pure logic.
 - EtherCRAB is `no_std`-capable, so the same crate could later target an
   RP2350-based master with an embedded TX/RX transport.
 
-## Current state — Steps 1–5 done (2 deferred)
+## Design rationale — why the code looks the way it does
 
-- `motion-core`: single-axis **trapezoidal velocity profile**,
-  `TrapezoidalProfile::new(start, end, max_speed, max_acceleration,
-  max_deceleration) -> Result<Self, TrajectoryError>` (fallible — validates
-  finiteness and sign, doesn't panic on bad input). Accel/decel are
-  independent rates. `.sample(t)`, `.duration()`, `.target()`, `.phase_at(t)`.
-  `src/bin/demo_axis.rs` demos one move at 250 Hz. Also **`StopRamp`**
-  (added 2026-07-20): the rest-to-rest assumption baked into
-  `TrapezoidalProfile` (see `plcopen-motion-goal` memory) can't represent a
-  running-start deceleration, so this is a separate, much simpler type —
-  current-velocity-to-rest, one phase, no target position — rather than a
-  generalization of `TrapezoidalProfile`. Same `sample`/`phase_at`/`target`
-  shape; a zero-velocity ramp reports `Done` immediately (not `Pre` forever,
-  unlike `TrapezoidalProfile`'s zero-distance case — see its doc comment for
-  why the two cases differ). Also
-  **`TrapezoidalProfile::new_with_start_velocity(start, start_velocity, end,
-  max_speed, max_acceleration, max_deceleration)`** (added 2026-07-21): this
-  *does* extend `TrapezoidalProfile` itself rather than adding a second type
-  — the user's explicit correction, overriding the `StopRamp` precedent (see
-  `plcopen-motion-goal` memory). Handles interrupting an in-flight move with
-  a new target (backs `app`'s `BufferMode::Aborting`), covering three cases
-  through one unified internal path rather than a case-by-case dispatch: a
-  private `build_main_segment` helper generalizes the rest-to-rest
-  ramp/cruise/decel math to start from an arbitrary speed (including the
-  sub-case where `start_velocity` already exceeds the *new* move's
-  `max_speed`, so phase 1 decelerates into cruise instead of accelerating),
-  and an optional decel-to-rest "prefix" (`StopRamp`-style math) handles
-  both the same-direction-overshoot and opposite-direction cases — which
-  turn out to be the identical code path, distinguished only by which side
-  of the target the deceleration happens to land on. The new move's own
-  max_speed/max_acceleration/max_deceleration govern the *entire* resulting
-  profile, including any reversal preamble — no blending or carryover from
-  whatever move was superseded. `new()` is now a verified bit-identical thin
-  wrapper (`start_velocity: 0.0`). Also **`LinearMove`** (added 2026-07-21,
-  `src/linear_move.rs`): a straight-line move across several axes at once —
-  the kinematic foundation for `app`'s hard-coded axis groups. Deliberately
-  *not* the general spline/waypoint path-following design drafted (but
-  shelved) earlier the same day — that's full Catmull-Rom + arc-length-LUT
-  machinery, overkill for what's fundamentally one scalar
-  `TrapezoidalProfile` over the Euclidean distance between an N-dimensional
-  start and end point, composed with a fixed unit-direction vector per axis
-  (`position[i] = start[i] + unit_direction[i] * scalar.position`, velocity
-  likewise) — reusing `TrapezoidalProfile`/`new_with_start_velocity`
-  completely unchanged, the same "reuse the existing scalar profile" pattern
-  `StopRamp` and path-following would also use. `new_with_start_velocity`
-  projects the actual N-dimensional velocity onto the new line's unit
-  direction via a dot product, reducing straight back to the scalar
-  problem `TrapezoidalProfile::new_with_start_velocity` already solves
-  completely. **Known, accepted limitation**: the velocity component
-  perpendicular to the new line is discarded, not reconciled — a genuine
-  velocity discontinuity (not just an acceleration one) at the redirect
-  instant if the axes' actual velocity wasn't already parallel to the new
-  line; only reachable via `app`'s `aborting` group moves (the cascade path,
-  where other members get their own `StopRamp`, is fully vector-correct and
-  unaffected). `MAX_GROUP_AXES = 6` bounds the per-cycle `LinearMoveSample`
-  to a fixed-size, `Copy`, zero-allocation struct, matching this crate's
-  no-heap-in-the-hot-path discipline. 43 unit tests total.
-- `axis-backend`: the `AxisGroup` trait seam (`exchange()`, one combined
-  cyclic call) + `AxisSetpoint`/`AxisFeedback`/`AxisFault`/`AxisGroupError`.
-  `AxisSetpoint` carries `enabled: bool` and `fault_reset: bool` — two
-  distinct cyclic fields, like real CiA 402 controlword bits (enable vs. the
-  edge-triggered Fault Reset bit), not one-off commands. `AxisFeedback`
-  carries a motion-control state machine at two layers: `AxisState`
-  (PLCopen `MC_ReadStatus`-flavored: `Disabled`/`StandStill`/
-  `DiscreteMotion`/`ErrorStop`/etc.) and, one layer more detailed,
-  `Ds402State` (the real CiA 402 power-state machine: `SwitchOnDisabled` ->
-  `ReadyToSwitchOn` -> `SwitchedOn` -> `OperationEnabled`, plus
-  `FaultReactionActive`/`Fault` — both now reachable — and reserved
-  `QuickStopActive`) — `Ds402State::axis_state()` maps the former from the
-  latter. Design settled 2026-07-20: the DS402 detail mirrors what
-  PLCopen's own `ST_AxisStatus` field exists for (vendor/backend-specific
-  detail beneath the standard bits), and lives at the trait level (not just
-  inside `backend-sim`) since `backend-ethercat` will need the same shape
-  later. Also carries `MotionFlags`
-  (`accelerating`/`constant_velocity`/`decelerating`). `AxisFault` has one
-  real category so far: `DisabledWhileMoving`. `AxisSetpoint` also carries
-  `stopping: bool` (added 2026-07-20, for the `stop` command): PLCopen
-  `MC_Stop` and DS402 Quick Stop are deliberately different things — a
-  commanded stop only flips the coarser `AxisState` to `Stopping` (replacing
-  `DiscreteMotion`), `Ds402State` is untouched and stays `OperationEnabled`,
-  since the drive itself sees nothing but an ordinary decelerating velocity
-  setpoint. `Ds402State::QuickStopActive` stays reserved — that's a distinct,
-  typically emergency/safety-triggered mechanism, not implemented.
-- `backend-sim`: `SimAxisGroup`, a software `AxisGroup` that integrates
-  velocity into position each cycle (dt-stepping, not a pass-through), but
-  only while `OperationEnabled` — a disabled (or faulted) axis ignores
-  commanded velocity entirely, matching a real drive's power stage being
-  off. Steps the DS402 machine at most one transition per `exchange()`
-  cycle in either direction (enabling takes 3 cycles, ~12ms at 250 Hz), the
-  same way a real master/drive negotiate it one controlword write at a
-  time — not a simplification for its own sake, see `step_ds402`'s doc
-  comment. Design settled 2026-07-20: disabling a *moving* axis raises
-  `AxisFault::DisabledWhileMoving` and routes through
-  `FaultReactionActive` (held exactly one cycle) into latched `Fault`,
-  rather than gracefully stepping down — a real drive can't safely cut its
-  power stage mid-motion the way it can from rest. `Fault` only clears via
-  `fault_reset` (DS402 transition 15, to `SwitchOnDisabled`); resetting
-  does not itself re-enable the axis. Disabling from `StandStill` (never
-  actually moving) stays graceful, no fault. A commanded stop
-  (`AxisSetpoint::stopping`) only ever overrides `DiscreteMotion` ->
-  `Stopping` in the reported `AxisState`; `Ds402State` and the actual
-  velocity-integration physics are unaffected — `backend-sim` doesn't know
-  or care *why* a decelerating velocity was commanded, only whether it was.
-  20 unit tests total, including dedicated coverage of the enable/disable
-  sequence, the fault/reset path, and the stopping-flag override (dev-
-  dependency on `motion-core` lets some tests drive a real
-  `TrapezoidalProfile`'s sampled velocity through the sim rather than
-  hand-crafted sequences).
-- `app`: a continuously-running, multi-axis (`axis0`, `axis1`, `NUM_AXES`)
-  terminal app — `move <axisN|groupName> <target...> [vmax] [amax] [dmax]
-  [aborting|buffered]`, `stop <axisN|groupName> [decel]`, `enable
-  <axisN|groupName>`, `disable <axisN|groupName>`, `reset
-  <axisN|groupName>`, `status`, `help`, `quit`. Fixed 250 Hz control
-  loop on its own thread, decoupled from blocking stdin by a channel. Each
-  cycle samples the active trajectory (or holds at rest if idle) into an
-  `AxisSetpoint` per axis, calls `SimAxisGroup::exchange` once, and treats
-  the returned feedback as ground truth for position/velocity — a new
-  move's start is the axis's *actual* (backend) position, not the last
-  commanded one. Axes are fully independent — see Step 2, deferred. Axes
-  start disabled (DS402
-  `SwitchOnDisabled`, matching real drive power-up); `move` on a disabled
-  axis is rejected, not queued. Disabling a moving axis faults it (position
-  freezes where it was, `Command::Enable` refuses outright while faulted —
-  not just while `SwitchOnDisabled` — so a premature `enable` sent during
-  the fault window can't silently "stick" and auto-fire the instant a later
-  `reset` clears it); `reset` clears the fault but requires a fresh
-  `enable` afterward, same as the backend. DS402 transitions print to the
-  terminal as the backend confirms them, and `status` shows the current
-  `Ds402State`.
-  **`stop`** (added 2026-07-20, the first piece of interrupting a move in
-  progress rather than queuing behind it — a single-axis concern, distinct
-  from Step 2's multi-axis coordination; see the `plcopen-motion-goal`
-  memory's long-term abort/buffer/blend goal): builds a
-  `motion_core::StopRamp` from the axis's *actual*
-  position/velocity and replaces whatever's active (also clearing anything
-  queued). A local `Profile` enum (`Move(TrapezoidalProfile)` /
-  `Stop(StopRamp)`) is what lets the rest of the loop treat "whatever's
-  currently active" uniformly — completion/abort/fault messages still
-  differentiate ("stopped at" vs "reached", "stop faulted" vs "move
-  faulted") via `Profile::is_stop()`. Rejected on a disabled axis; a
-  short-circuit for an axis already at rest. `stop` deliberately does *not*
-  touch `Ds402State`/DS402 Quick Stop — see the `axis-backend` entry above.
-  **`BufferMode` (added 2026-07-21, see `plcopen-motion-goal` memory)**:
-  `Command::Move` takes an optional trailing `aborting`/`buffered` keyword
-  (default `Buffered`, so omitting it keeps prior behavior).
-  `AxisRuntime.pending` is a real `VecDeque<PendingMove>` FIFO now (was a
-  single replace-only slot) — a deliberate behavior change, every buffered
-  move queued eventually runs, in order, rather than only the most recent
-  being kept; queue promotion pops and tries moves one at a time (a
-  kinematically-invalid one is dropped and the next tried the same cycle,
-  rather than retried forever), and an axis that stops being enabled drops
-  its *entire* queue at once with one summary message.
-  `BufferMode::Aborting` bypasses the queue entirely — active or idle,
-  immediately — via a shared `abort_into` helper (clears `pending`, builds a
-  fresh profile from the axis's *actual* position/velocity, replaces
-  `ax.active`, reports build errors uniformly) also used by `stop`.
-  `Aborting` moves are built with
-  `motion_core::TrapezoidalProfile::new_with_start_velocity`, so an
-  in-flight move can be redirected to a new target — same-direction or
-  reversed — without waiting for it to reach rest first. Only
-  `Aborting`/`Buffered` so far; the four PLCopen blending variants are a
-  deferred, structurally different problem (see the memory).
-  **Axis groups** (added 2026-07-21): a hard-coded `AXIS_GROUPS` const table
-  (`axisGroup0` = `axis0`+`axis1`, a Cartesian pair) — not created/removed at
-  runtime, deliberately simpler than PLCopen's real axis-group model. Every
-  existing verb (`enable`/`disable`/`reset`/`stop`/`move`) accepts a group
-  name in place of an axis name (`Target` enum + `parse_target`, tried
-  before falling back to `parse_axis`); `enable`/`disable`/`reset`/`stop` on
-  a group just fan the identical per-axis logic (now extracted into
-  `handle_enable`/`handle_disable`/`handle_reset`/`handle_stop`, called once
-  per member) out to each member — no new semantics there. `move
-  <groupName> <coord>...` is the one new behavior: one scalar
-  `motion_core::LinearMove` (see the `motion-core` entry above) drives every
-  member from a single shared `Rc<SharedGroupMove>`, installed atomically —
-  a two-step gather-then-construct-then-install sequence (not the
-  single-axis `abort_into` helper, which models one *independent* fallible
-  per-axis build) means a rejected construction leaves no member
-  half-redirected. `BufferMode::Aborting` redirects a busy group immediately
-  (even mid-move, via `LinearMove::new_with_start_velocity`) and drops
-  anything the group had queued, same as a single-axis `aborting` move.
-  **`BufferMode::Buffered` queuing (added 2026-07-21)**: a busy group now
-  queues via its own `group_pending: Vec<VecDeque<PendingGroupMove>>` (one
-  FIFO per hard-coded group, declared in `run_control_loop` — deliberately
-  *not* part of `AxisRuntime`, since promoting a queued group move needs
-  every member simultaneously idle at once, which doesn't fit inside any
-  single axis's own state). A new "step 1b" mirrors the per-axis promotion
-  loop but atomically across the whole group via `install_group_move` (a
-  shared helper factored out of the immediate-move path, used by both);
-  a group whose members stop being enabled drops its whole queue at once,
-  same message style as the per-axis case. **Group
-  interruption is cascading**: stopping, disabling, or faulting *any one*
-  member of an active group move brings every other member to its own
-  independent `StopRamp` too (a group move missing a member no longer means
-  anything), *and* drops that group's own queued moves too (`cascade_group_
-  stop` clears `group_pending[group]` as part of the cascade, the same
-  "seizing/losing control clears anything queued" precedent `abort_into`
-  already established for single axes) — implemented as a collect-then-apply
-  two-pass structure (the borrow checker won't allow mutating a second `Vec`
-  element while holding `&mut` into the first from the same `iter_mut()`),
-  guarded by `Rc::ptr_eq` so a member that's already moved on to something
-  else isn't double-fired. This reuses `abort_into`/`StopRamp` unchanged for
-  every cascaded sibling — no new profile-building logic anywhere for that
-  path. Confirmed live: a 2-axis group move traces a straight line at the
-  commanded path speed (per-axis velocity ratios match the unit direction
-  vector exactly); 3 buffered group moves queued while busy ran in FIFO
-  order; `stop axisGroup0` and `disable axis0` mid-move each correctly
-  dropped the still-queued follow-up move (not just the active one); an
-  `aborting` redirect while a move was queued took over immediately *and*
-  dropped the queued move; a same-direction `aborting` redirect is
-  seamless, a redirect into a different direction shows the documented
-  velocity discontinuity with no NaN/crash. This is a **genuinely different
-  feature from Step 2** below (which is about auto-synchronizing two
-  *independently issued* single-axis moves) — a group move is one command
-  constructing one shared trajectory by construction, not two moves
-  retroactively time-scaled; picking this up isn't Step 2 sneaking in via a
-  side door.
-  **`help`/`status` cleanup (2026-07-21)**: `help` had grown into a long
-  wall of parenthetical usage notes across the `stop`/`BufferMode`/groups
-  additions — trimmed back to a terse, one-line-per-command list (target
-  syntax is just `<axisN|groupName>` now); detailed per-command help (e.g.
-  `help move`) is a natural future addition, not built. `status` now prints
-  a summary line per hard-coded group alongside its per-axis lines
-  (`idle at [...]` or the shared profile's phase/target while a group move
-  is active), reusing one representative member's `Profile::Group` state
-  rather than duplicating anything new in `AxisRuntime`.
-  **`verbose`** toggles the periodic per-cycle position/phase heartbeat
-  printed while an axis is moving (off by default — the viz window already
-  plots target-vs-actual continuously, so it's usually redundant on the
-  terminal). Discrete events (move started/finished/aborted, enable/
-  disable, faults, DS402 transitions) always print regardless; only the
-  repetitive heartbeat is gated.
-  **Layering rule (settled 2026-07-21, see `feedback_axis_state_layering`
-  memory)**: `app`'s business logic — move/stop rejection, queue
-  promotion, `enable`/`disable`/`reset` gating — checks `AxisState` only,
-  via a small `axis_operational()` helper, never `Ds402State` directly.
-  `AxisRuntime` carries both fields, but `ds402_state` is read *only* to
-  detect and print DS402 transitions for traceability; nothing branches on
-  it. Keeps `app` backend-agnostic the same way the trait seam itself is —
-  a `backend-ethercat` swap-in only has to report the same `AxisState`
-  values, not replicate `backend-sim`'s exact DS402 timing.
-- **Multi-waypoint path following** (added 2026-07-21, later the same day
-  as axis groups — picked up after the user declined a third axis/XYZ group
-  since `egui_plot` has no 3D support, not worth it just for a viz plot):
-  `motion_core::WaypointPath` (`motion-core/src/waypoint_path.rs`) is
-  geometry only — a smooth route through several N-dimensional waypoints via
-  **centripetal Catmull-Rom** (chosen for *local support*: each segment
-  depends only on its 4 nearest control points, so a per-segment
-  `SegmentKind::Line` override — force one leg straight, mirroring real
-  PLCopen/CNC path composition — doesn't perturb any other segment's
-  curvature), with **reflected phantom endpoints** (`P₋₁ = 2·P₀ − P₁`, not
-  duplication) for the first/last waypoint's missing neighbor — a
-  2-waypoint path degenerates to an exact straight line under this scheme
-  (verified to floating-point precision, and cross-checked against
-  `LinearMove` directly). Arc length has no closed form for a cubic, so each
-  segment gets its own lookup table (200 samples, built once at
-  construction) mapping arc-length to spline parameter; a query always
-  evaluates the *exact* curve at the LUT-refined parameter, never
-  interpolating stored LUT positions. `tangent_at_arc_length` uses a central
-  finite difference in the arc-length domain rather than an analytic
+Read the source for *what* exists. These are the decisions behind it.
+
+### `motion-core`
+
+- **`StopRamp` is a separate type, but `new_with_start_velocity` extends
+  `TrapezoidalProfile` in place.** These look inconsistent and aren't.
+  `StopRamp` (current-velocity-to-rest, one phase, no target position) is
+  genuinely simpler than a generalization would be. But when interrupting a
+  move with a *new target* came up, the user's explicit correction was to
+  extend `TrapezoidalProfile` itself rather than add a second type — that
+  correction overrides the `StopRamp` precedent. **When a new profile variant
+  comes up, ask; don't default to "add a separate type."**
+- **A zero-velocity `StopRamp` reports `Done` immediately**, unlike
+  `TrapezoidalProfile`'s zero-*distance* case, which reports `Pre` forever.
+  Deliberate — see `TrapezoidalProfile`'s doc comment for why the two cases
+  differ.
+- **`new_with_start_velocity` unifies three cases through one path**, not a
+  case-by-case dispatch: same-direction-with-room, start speed already above
+  the *new* move's max_speed (phase 1 decelerates into cruise), and
+  overshoot/reversal. Overshoot and reversal are the *same* code path,
+  distinguished only by which side of the target the deceleration lands on.
+  Unifying superficially-different cases has been the right default here.
+- **The new move's own limits govern the entire resulting profile**, including
+  any reversal preamble. No blending or carryover from the superseded move.
+- **Known, accepted limitation — perpendicular velocity is discarded.** When
+  redirecting a multi-axis move, `LinearMove`/`PathProfile`'s
+  `new_with_start_velocity` project the actual N-dimensional velocity onto the
+  new line/path tangent via a dot product. The perpendicular component is
+  dropped, not reconciled — a genuine *velocity* discontinuity (not just an
+  acceleration one) if the actual velocity wasn't already parallel. Only
+  reachable via `app`'s `aborting` group moves; the cascade path (siblings get
+  their own `StopRamp`) is fully vector-correct and unaffected.
+- **`LinearMove` is deliberately not a general spline.** A straight-line
+  N-axis move is one scalar `TrapezoidalProfile` over the Euclidean distance,
+  composed with a fixed unit-direction vector. This "reuse the existing scalar
+  profile over a scalar path coordinate" pattern is the recurring one —
+  `StopRamp`, `LinearMove`, and `PathProfile` all follow it.
+- **`WaypointPath` uses centripetal Catmull-Rom specifically for *local
+  support*** — each segment depends only on its 4 nearest control points, so a
+  per-segment `SegmentKind::Line` override doesn't perturb any other segment's
+  curvature. A natural cubic spline's *global* support would. Centripetal (not
+  uniform/chordal) parameterization avoids cusps on non-uniformly-spaced
+  waypoints (Yuksel et al. 2011).
+- **Endpoints use reflected phantoms (`P₋₁ = 2·P₀ − P₁`), not duplication** —
+  duplication zero-lengths the phantom segment and divides by zero in the
+  centripetal knot-spacing formula. A 2-waypoint path degenerates to an exact
+  straight line under this scheme (the natural sanity check, and it's tested).
+- **Arc length has no closed form for a cubic**, so each segment carries its
+  own arc-length↔parameter LUT. A query always evaluates the *exact* curve at
+  the LUT-refined parameter — never interpolates stored LUT positions.
+- **`tangent_at_arc_length` uses a central finite difference**, not an analytic
   Catmull-Rom derivative — arc-length parameterization already gives
-  `|dP/ds| ~= 1`, so this is accurate enough for the velocity feed-forward
-  it exists for. `motion_core::PathProfile` (`path_profile.rs`) composes
-  this with a `TrapezoidalProfile` over the path's total arc length —
-  "reuse the existing scalar profile," the same pattern `LinearMove`
-  established for the one-segment case, completely unchanged. 61
-  motion-core tests total (up from 43).
-  **`app`**: `movepath <groupName> <n> <coord>...(n waypoints) [vmax] [amax]
-  [dmax]` — group-only (an axis target is rejected; a single-axis "path" is
-  just `move ... buffered` chaining). Reuses the hard-coded `AXIS_GROUPS`
-  table rather than the original shelved design's free-form per-command
-  axis list — an explicit user call ("that's exactly why I stopped to
-  implement [axis groups] first"), since it costs nothing new to wire and
-  gains full reuse of the existing group machinery. Every segment defaults
-  to `SegmentKind::Spline` (the type supports `Line`, no CLI syntax for it
-  yet). **Deliberately idle-group-only, no queueing or `BufferMode`** — a
-  busy group's `movepath` is rejected outright, pointing at `stop`; this was
-  the original design's own scope call, re-confirmed rather than assumed
-  still right. `install_path_move` prepends the group's actual current
-  position as the path's own start waypoint (same "start is actual
-  feedback" rule every other move follows) and installs the fresh
-  `PathProfile` atomically across every member, mirroring
-  `install_group_move` exactly. A new `Profile::Path { shared:
-  Rc<SharedPathMove>, index }` variant sits alongside `Profile::Group`;
-  `SharedPathMove` mirrors `SharedGroupMove`'s shape exactly. The group
-  interruption cascade (`group_of`/`cascade_group_stop`) is **generalized,
-  not duplicated**, via a small `ActiveGroupMove` enum
-  (`Group(Rc<SharedGroupMove>) | Path(Rc<SharedPathMove>)`) with
-  `axes()`/`group()`/`max_deceleration()`/`still_drives()` accessors, since
-  `LinearMove` and `PathProfile` don't share a trait — the same cascade
-  function now handles both move kinds. `print_status`'s group-active
-  detection was generalized the same way. Live-verified against the built
-  binary: a 3-waypoint path traced correctly (including a genuine,
-  correct mid-path dip from spline curvature, not a bug); `movepath` on a
-  busy group was cleanly rejected without disturbing the in-flight move; a
-  plain single-axis `move` queued behind a busy group member and fired once
-  the group move finished; `stop axis0` mid-`movepath` correctly cascaded
-  `axis1` into its own `StopRamp`, confirming the cascade generalization
-  actually works for path moves, not just group moves.
-  **`movepath ... file <path>`** (added 2026-07-21, right after the above —
-  the user's call that the inline `<n> <coord>...` form "might be too
-  complex for an interactive mode app" past a handful of waypoints):
-  `parse_move_path` now dispatches on whether the first token after the
-  target is the literal `"file"` (`parse_move_path_file`) or a waypoint
-  count (`parse_move_path_inline`, the original form, unchanged) — both
-  converge on the identical `Command::MovePath`, so nothing downstream (the
-  control loop, `install_path_move`) needed to change at all. File format:
-  one waypoint per line, `coord_count` whitespace-separated numbers, blank
-  lines skipped, no comment syntax. Reading happens on the stdin-reading
-  thread inside `parse_command` (same place every other parse error is
-  already handled), not in the control loop. `read_waypoints_file` is a
-  thin `std::fs::read_to_string` wrapper around a separate, pure
-  `parse_waypoint_lines(contents, coord_count)` — split out specifically so
-  the line-parsing logic (blank-line skipping, per-line coordinate-count
-  and numeric validation, line-numbered error messages) stays unit-testable
-  without touching the filesystem; only two tests actually exercise real
-  files (a round-trip through a temp file, and a missing-file error).
-  Trailing `[vmax] [amax] [dmax]` parsing was extracted into a shared
-  `parse_kinematic_limits` helper used by both forms. Live-verified against
-  the built binary: a 4-waypoint file drove the group through to the exact
-  final waypoint, and a missing file produced a clean rejection message
-  without touching loop state.
-  **`movepath` queueing/aborting** (added 2026-07-21, right after — a
-  scaled-back version of a broader "transition mode" idea the user asked
-  about but hadn't finished specifying; agreed to land queueing/aborting
-  first and revisit the rest separately): `Command::MovePath` gained a
-  `buffer_mode: BufferMode` field and the control loop's dispatch now
-  mirrors `MoveGroup`'s exactly (busy + `Buffered` -> queue; busy +
-  `Aborting`, or idle -> install immediately). This needed
-  `motion_core::PathProfile::new_with_start_velocity` (mirrors
-  `LinearMove::new_with_start_velocity` exactly: the group's actual
-  velocity is projected onto the *path's own* initial tangent —
-  `WaypointPath::tangent_at_arc_length(0.0)`, no new geometry needed — then
-  handed to `TrapezoidalProfile::new_with_start_velocity` over arc length;
-  same documented "perpendicular component dropped" limitation).
-  `PathProfile::new()` became a thin wrapper the same way
-  `TrapezoidalProfile`/`LinearMove`'s did, verified bit-identical
-  (`WaypointPath`/`PathProfile` gained `PartialEq` for this). `app`'s
-  `install_path_move` now always uses the velocity-aware constructor —
-  same simplification `install_group_move` already had, since an idle
-  group's velocity is just 0 — so the old idle-group-only restriction is
-  gone entirely, not just widened. **Queueing needed
-  `PendingGroupMove` to become an enum** (`Move{..} | Path{..}`, was a
-  single struct) so one group's FIFO can interleave `move`s and
-  `movepath`s in issue order; the promotion loop matches on the variant and
-  calls `install_group_move`/`install_path_move` accordingly, unifying
-  their different error types via `.to_string()`. Trailing
-  `aborting`/`buffered` keyword parsing was extracted into a shared
-  `parse_buffer_mode_and_limits`, used by `move` and both `movepath` forms.
-  The existing `ActiveGroupMove`-generalized interruption cascade needed no
-  changes — it already covered `Profile::Path`. 4 new motion-core tests
-  (69 total) plus 2 new app parser tests. Live-verified: a queue mixing
-  `movepath`/`move`/`movepath` behind a busy group ran all three in FIFO
-  order, each reaching its correct target; an `aborting` `movepath` issued
-  mid-flight (heading one way) redirected immediately toward an opposite-
-  direction target, correctly showing a `decel` phase first (the group's
-  actual velocity reconciled against the new path, not just dropped).
-  **`BufferMode::Blend`** (added 2026-07-21, right after — the "transition
-  mode" idea above, clarified: smoothly transition the path's own
-  *geometry* onto a new one while it's actively running, not the four real
-  PLCopen blending variants). The insight that made this tractable: the
-  existing reflected phantom control point used for a path's first/last
-  waypoint is just an *assumption* ("the incoming approach was a straight
-  line toward the first real waypoint") — swap that assumption for the
-  truth when a real incoming velocity is known, and everything else
-  (Catmull-Rom evaluation, arc-length LUT, the scalar speed profile) is
-  unchanged. `WaypointPath::new_with_start_direction` (`waypoints`,
-  `segment_kinds`, was `new`'s whole signature) places the leading phantom
-  along a given direction at the same characteristic distance (`|P0-P1|`)
-  the reflection would have used, instead of reflecting; an all-zero
-  direction (including the one `new()` now passes as a thin wrapper) falls
-  back to the ordinary reflection exactly as before. **Explicitly not an
-  exact tangent match** — confirmed with the user rather than guessed: a
-  Catmull-Rom tangent at `P0` is a blend of the phantom *and* `P1`, so
-  matching the given direction closely (not exactly) is consistent with
-  "match the existing spline generation's own behavior," which is what was
-  actually asked for, not a mathematically exact fix like an explicit
-  Hermite tangent override would have been. `PathProfile::new_blended`
-  (mirrors `new_with_start_velocity`'s shape exactly) builds via this new
-  constructor instead of plain `new`, then projects the same actual
-  velocity onto the resulting (now much closer) tangent — same projection
-  math as `new_with_start_velocity`, just starting from a much better
-  tangent. Empirically the closeness depends on how well the new path's
-  *own* first-leg direction agrees with the given direction (tight when
-  they roughly agree — the realistic "continue roughly forward" case this
-  exists for — looser on a deliberately sharp mismatch, but still bounded
-  and sane, never worse than a plain redirect). `app`: `BufferMode` gained
-  a third variant, `Blend`, but it's `movepath`-only — `move`/`movegroup`
-  have no spline to lean a tangent into, so their own parser
-  (`parse_buffer_mode_and_limits`) still only recognizes
-  `aborting`/`buffered`; `movepath` uses a separate
-  `parse_movepath_buffer_mode_and_limits` that also recognizes `blend`.
-  `install_path_move`/`install_path_move_blended` are both thin callers of
-  a new shared `install_path_move_impl`, differing only in which
-  `PathProfile` constructor they pass — `Aborting` vs `Blend` is purely a
-  choice of geometry-building strategy, not a different installation
-  mechanism. 8 new motion-core tests (82 total) including the
-  discriminating one: sample an "old" path's actual velocity mid-flight,
-  blend a "new" path from that exact state, and check the composed
-  velocity vector at the transition instant is close in *both* direction
-  and magnitude — not just speed. Live-verified against the built binary:
-  redirecting from a curving path onto a new target with `blend` landed
-  already in the `cruise` phase (full speed, matching the incoming
-  velocity), while the identical redirect via `aborting` landed in `accel`
-  (well below cruise, having to build speed back up) — a clear, measurable
-  difference confirming the tangent-leaning actually works, not just
-  "doesn't crash."
-  **What's left**: per-segment `Line` override CLI syntax (from either
-  `movepath` form), file-format comments, and the four real PLCopen
-  blending variants (`BlendingLow`/`Previous`/`Next`/`High`) — still their
-  own deferred, structurally different problem, unaffected by any of this.
-- `app`'s viz window (`app/src/viz.rs` + `app/src/recording.rs`): an
-  eframe/egui_plot window baked into the `app` binary itself, not a separate
-  crate. Input stays entirely terminal-driven — viz has no controls, it only
-  plots. `RecordingAxisGroup` (`recording.rs`) wraps the real backend and
-  taps the `AxisGroup::exchange()` seam: it forwards every call unchanged and
-  copies each cycle's setpoint/feedback into a shared, bounded `History`
-  buffer. `run_control_loop` needed zero logic changes — only its backend
-  construction line changed to wrap `SimAxisGroup` in `RecordingAxisGroup`.
-  Shows target-vs-actual position/velocity per axis. The XY plot (2026-07-21:
-  generalized from one hardcoded axis0/axis1 "tool position" plot into one
-  per hard-coded axis group — see `app`'s axis-groups entry above) loops
-  over `AXIS_GROUPS`, so it scales as more groups are added instead of
-  staying pinned to whichever two axes happened to exist first; only groups
-  of exactly 2 axes get a plane plot (a 3+-axis group would need a
-  projection or a 3D view, not built). A status box per group sits
-  alongside the per-axis ones, but — since viz only taps the
-  `AxisGroup::exchange()` seam and has no visibility into `app`'s
-  higher-level `Profile::Group`/command bookkeeping — it can only show a
-  per-member position/velocity rollup from `History`, not whether a
-  synchronized group move is *currently* active (the terminal `status`
-  command can, since it reads `AxisRuntime` directly). The growing content
-  (an XY plot + status box per group, plus per-axis plot pairs) started
-  overflowing the window vertically once groups were added — fixed by
-  wrapping the `CentralPanel`'s content in `egui::ScrollArea::vertical()`
-  (so it's always reachable regardless of window size/axis count going
-  forward, not just today's fit) and giving the window a generous explicit
-  starting size (`ViewportBuilder::with_inner_size([1000.0, 900.0])` in
-  `main()` — eframe's unset default was too short) so nothing needs to
-  scroll for the common 2-axis/1-group case.
-- Not yet built: richer sim dynamics (Step 6), `backend-ethercat` (Step 7),
-  coordinated multi-axis moves (Step 2, deferred).
+  `|dP/ds| ≈ 1`, so this is accurate enough for the velocity feed-forward it
+  exists for. A deliberate v1 simplification.
+- **`BufferMode::Blend` is deliberately *not* an exact tangent match.** The
+  insight: the reflected phantom is just an *assumption* ("the incoming
+  approach was a straight line toward the first waypoint") — swap it for the
+  truth when a real incoming velocity is known, and everything downstream is
+  unchanged. `new_with_start_direction` places the leading phantom along the
+  given direction at the same characteristic distance `|P0-P1|`. A Catmull-Rom
+  tangent at `P0` blends the phantom *and* `P1`, so this matches the direction
+  closely but not exactly. That was the user's explicit call — *match the
+  existing spline generation's own behavior* — chosen over a mathematically
+  exact Hermite tangent override. **Precedent worth following: when the user
+  says "match existing behavior," that's a real technical preference for
+  reusing the established mechanism, not an invitation to substitute something
+  more rigorous.**
+- **Known, accepted limitation** at a `Line`↔`Spline` segment boundary: the
+  spline side's neighbour-derived tangent may not exactly match the line's
+  fixed direction — a small velocity-*direction* discontinuity (magnitude stays
+  continuous, from the shared scalar profile). Unbuilt fix: make the adjacent
+  spline tangent formula use the line's fixed direction.
+- **Path limits are a single scalar** max_speed/max_acceleration/
+  max_deceleration over arc length. Per-axis limits projected onto the local
+  path tangent is a deferred, harder follow-up.
+
+### `axis-backend`
+
+- **One combined `exchange()` call**, not separate write/read. Mirrors
+  EtherCAT's actual single synchronous transaction per cycle (EtherCRAB's
+  `tx_rx()`), so `backend-ethercat` won't need the trait reshaped later.
+- **Two state layers, deliberately.** `AxisState` (PLCopen
+  `MC_ReadStatus`-flavored) is the coarse view; `Ds402State` (the real CiA 402
+  power-state machine) is the detail beneath it, mirroring what PLCopen's own
+  `ST_AxisStatus` exists for. `Ds402State` lives at the *trait* level, not
+  inside `backend-sim`, because `backend-ethercat` will need the same shape.
+- **`enabled` and `fault_reset` are two distinct cyclic fields**, not one-off
+  commands — like real CiA 402 controlword bits (enable vs. the edge-triggered
+  Fault Reset bit).
+- **`AxisFeedback` carried `fault: Option<AxisFault>` from day one**, before
+  `backend-sim` could raise any, so `app`'s fault-handling path could be built
+  and exercised before real hardware exists.
+- **`MC_Stop` and DS402 Quick Stop are deliberately different things.** A
+  commanded stop flips only the coarser `AxisState` to `Stopping`;
+  `Ds402State` is untouched and stays `OperationEnabled`, because the drive
+  sees nothing but an ordinary decelerating velocity setpoint.
+  `Ds402State::QuickStopActive` stays reserved — that's a distinct,
+  typically emergency/safety-triggered mechanism, not implemented.
+
+### `backend-sim`
+
+- **Integrates velocity into position each cycle rather than passing through**
+  — genuinely stateful dt-stepping (see the dt seam above). This produces a
+  real (if tiny) target-vs-actual gap during accel/decel for viz to plot,
+  instead of two identical lines.
+- **Only integrates while `OperationEnabled`.** A disabled or faulted axis
+  ignores commanded velocity entirely, matching a real drive's power stage
+  being off.
+- **At most one DS402 transition per `exchange()` cycle, in either direction**
+  (enabling takes 3 cycles, ~12 ms at 250 Hz). Not a simplification for its own
+  sake — that's how a real master/drive negotiate it, one controlword write at
+  a time. See `step_ds402`'s doc comment.
+- **Disabling a *moving* axis faults it** — raises
+  `AxisFault::DisabledWhileMoving` and routes through `FaultReactionActive`
+  (held exactly one cycle) into latched `Fault`, rather than gracefully
+  stepping down. A real drive can't safely cut its power stage mid-motion the
+  way it can from rest. Disabling from `StandStill` stays graceful, no fault.
+  `Fault` clears only via `fault_reset` (DS402 transition 15, to
+  `SwitchOnDisabled`); resetting does not itself re-enable the axis.
+
+### `app`
+
+- **Feedback is ground truth.** Each cycle the loop treats the backend's
+  returned `AxisFeedback` — not the raw trajectory sample — as each axis's
+  actual position/velocity. A new move's `start` is that actual position, never
+  the last commanded one. Every move-building path follows this rule.
+- **Layering rule (settled 2026-07-21):** business logic — move/stop rejection,
+  queue promotion, `enable`/`disable`/`reset` gating — checks **`AxisState`
+  only**, via the `axis_operational()` helper. Never branch on `Ds402State`.
+  `AxisRuntime` carries `ds402_state` purely to detect and print transitions
+  for traceability. This keeps `app` backend-agnostic the same way the trait
+  seam is: a `backend-ethercat` swap-in only has to report the same
+  `AxisState` values, not replicate `backend-sim`'s exact DS402 timing.
+- **`Command::Enable` refuses while faulted**, not just while
+  `SwitchOnDisabled` — so a premature `enable` sent during the fault window
+  can't silently "stick" and auto-fire the instant a later `reset` clears it.
+- **Seizing or losing control clears anything queued.** Established by
+  `abort_into` for single axes and extended to groups by `cascade_group_stop`.
+  An axis that stops being enabled drops its *entire* queue at once, with one
+  summary message.
+- **Queue promotion drops a kinematically-invalid move and tries the next the
+  same cycle**, rather than retrying it forever.
+- **Group interruption cascades.** Stopping, disabling, or faulting *any one*
+  member of an active group or path move brings every other member to its own
+  independent `StopRamp` — a group move missing a member no longer means
+  anything. Implemented as collect-then-apply (the borrow checker won't allow
+  mutating a second `Vec` element while holding `&mut` into the first from the
+  same `iter_mut()`) and guarded by `Rc::ptr_eq` so a member that's already
+  moved on isn't double-fired. **Don't rebuild this pattern for a new move
+  kind — extend the `ActiveGroupMove` enum instead**, which is exactly how
+  path moves were folded in.
+- **Group moves install atomically** (gather-then-construct-then-install), not
+  via the single-axis `abort_into` helper — a group build is one fallible
+  construction across all members, not N independent ones, so a rejected
+  construction must leave no member half-redirected.
+- **`group_pending` lives in `run_control_loop`, not `AxisRuntime`** —
+  promoting a queued group move needs every member simultaneously idle, which
+  doesn't fit inside any single axis's own state.
+- **Axis groups are hard-coded** (`AXIS_GROUPS`), not created/removed at
+  runtime — deliberately simpler than PLCopen's real axis-group model. When a
+  new feature needs a multi-axis target, reuse this table rather than
+  reintroducing free-form per-command axis lists (the user's explicit call:
+  *"that's exactly why I stopped to implement them first"*).
+- **`movepath` is group-only.** A single-axis "path" is just `move ... buffered`
+  chaining.
+- **`BufferMode::Blend` is `movepath`-only** — `move` has no spline to lean a
+  tangent into, so it keeps its own two-keyword parser.
+- **`verbose` gates only the repetitive per-cycle heartbeat.** Discrete events
+  (move started/finished/aborted, enable/disable, faults, DS402 transitions)
+  always print. Off by default because the viz window already plots
+  target-vs-actual continuously.
+- **Viz taps the `AxisGroup::exchange()` seam, it does not touch the loop's
+  decision logic.** `RecordingAxisGroup` wraps whatever backend it's given and
+  forwards `exchange()` unchanged. The consequence to remember: viz has no
+  visibility into `app`'s higher-level `Profile`/command bookkeeping, so it can
+  only show a per-member rollup, never "is a synchronized group move active" —
+  the terminal `status` command can, since it reads `AxisRuntime` directly.
+- Viz plots a plane only for groups of **exactly 2 axes**; a 3+-axis group
+  would need a projection or a 3D view (`egui_plot` is strictly 2D — this is
+  why a third axis / XYZ group was declined).
 
 ## Roadmap
 
@@ -502,92 +245,41 @@ over-produce; confirm direction at natural decision points.
 2. **[deferred]** Two axes + coordination (finish-together time-scaling; the
    slower axis sets the move time, the faster axis is time-scaled to match).
    This is where `duration()` starts earning its keep. Explicitly on hold —
-   `app` currently drives axes independently (no coordination) and that's
-   staying true until this is revisited. Don't build toward coordinated
-   moves as a side effect of Step 3/4/5 work below. **Not the same thing**
-   as the hard-coded axis groups added 2026-07-21 (see the `app` entry
-   above): a group move is one command building one shared trajectory for a
-   *named, fixed* set of axes; this step is about auto-synchronizing the
-   durations of two *independently issued* single-axis moves — still
-   deferred, unrelated to groups existing now.
-3. **[done]** `AxisGroup` backend trait (`axis-backend` crate) + a simple
-   **sim backend** (`backend-sim` crate). Design settled 2026-07-20:
-   - `AxisGroup::exchange(&mut self, setpoints: &[AxisSetpoint]) ->
-     Result<&[AxisFeedback], AxisGroupError>` — one combined cyclic call, not
-     separate write/read. Mirrors EtherCAT's actual single synchronous
-     transaction per cycle (EtherCRAB's `tx_rx()`), so `backend-ethercat`
-     (Step 7) won't need the trait reshaped later.
-   - Trait stays in `f64` engineering units (mm, mm/s) — integer encoder-count
-     conversion is `backend-ethercat`'s private business (CLAUDE.md decision
-     #4), not the trait's.
-   - `AxisFeedback` carries `fault: Option<AxisFault>` from day one, even
-     though `backend-sim` won't raise any yet — lets `app`'s fault-handling
-     path get built/exercised before real hardware exists.
-   - `backend-sim`'s first plant model integrates the velocity setpoint into
-     its own position state each cycle (`position += velocity * dt`) rather
-     than a pure pass-through. Still trivial/lag-free, but genuinely stateful
-     dt-stepping (see the `NOTE (dt seam)` comment in `trajectory.rs`), and
-     gives a real (if tiny) target-vs-actual gap during accel/decel for
-     Step 5's viz to plot, instead of two identical lines until Step 6.
-4. **[done]** Fixed-timestep run loop: planner -> backend -> feedback. `app`'s
-   control loop now builds an `AxisSetpoint` per axis each cycle (sampling
-   the active trajectory, or holding at rest if idle), calls
-   `AxisGroup::exchange` once per tick against a `SimAxisGroup`, and treats
-   the returned `AxisFeedback` — not the raw trajectory sample — as each
-   axis's actual position/velocity. A new move's `start` is that actual
-   feedback position, not the last commanded one. Confirmed live: a 0->100mm
-   move now reports "reached 99.999 mm", the small Euler-integration
-   following error `backend-sim`'s design was meant to surface.
-5. **[done]** Simple **viz** (egui/eframe + egui_plot): target-vs-actual
-   position/velocity plots per axis, plus an XY tool-position plot. Viz is a
-   dev tool, runs on host, not deployed to Pi. Design settled 2026-07-20,
-   resolving the loop-sharing question in favor of the smallest option:
-   - **Baked into `app`, not a separate crate or shared "runtime" crate.**
-     `app` gained two modules (`recording.rs`, `viz.rs`); no new workspace
-     member. Terminal input is unchanged — viz is a passive, read-only
-     window, not a second frontend with its own input handling.
-   - **Data comes from tapping the `AxisGroup` seam, not from touching
-     `run_control_loop`'s decision logic.** `RecordingAxisGroup` wraps
-     whatever backend it's given, forwards `exchange()` unchanged, and
-     records setpoint/feedback into a shared `History`. The loop only
-     changed what it constructs the backend as.
-   - **Thread layout flipped.** eframe/winit require the GUI event loop on
-     the main thread, so `run_control_loop` moved onto its own spawned
-     thread (alongside the existing stdin-reader thread); `main()`'s thread
-     now runs `eframe::run_native`. The terminal `quit` command sets a
-     shared `AtomicBool` that viz polls each frame to close its own window.
-   - **Renderer: `glow` (OpenGL), not the default `wgpu`.** `wgpu` failed at
-     startup in this WSL setup (`WinitEventLoop(ExitFailure(1))`) — no
-     `/dev/dri` render node, no Vulkan ICD, only WSL's `/dev/dxg` GPU
-     passthrough. `glow` via Mesa's GL (through `/dev/dxg`) works. Also
-     dropped eframe's default `accesskit` feature (AT-SPI/D-Bus screen-reader
-     integration, unneeded for a dev plotting tool, and was itself hitting a
-     missing D-Bus session daemon during startup diagnosis).
-   - **Environment note for a fresh WSL setup**: running a GUI app needs
-     `libwayland-client0 libwayland-egl1 libwayland-cursor0 libxkbcommon0
-     libegl1 libgl1` installed (`apt-get install`) even with WSLg present —
-     WSLg provides the compositor, not the client-side libraries.
+   `app` drives axes independently (no coordination) and that stays true until
+   this is revisited. **Don't build toward coordinated moves as a side effect
+   of other work.** **Not the same thing** as the hard-coded axis groups: a
+   group move is one command building one shared trajectory for a *named,
+   fixed* set of axes; this step is about auto-synchronizing the durations of
+   two *independently issued* single-axis moves. Groups existing does not mean
+   this snuck in via a side door.
+3. [done] `AxisGroup` backend trait (`axis-backend`) + sim backend
+   (`backend-sim`).
+4. [done] Fixed-timestep run loop: planner → backend → feedback.
+5. [done] Simple viz (egui/eframe + egui_plot), baked into `app` as
+   `viz.rs` + `recording.rs` — not a separate crate, and not a second frontend
+   (input stays terminal-only; viz is passive and read-only). eframe/winit
+   require the GUI event loop on the main thread, which is why
+   `run_control_loop` lives on a spawned thread. Viz is a dev tool, host-only,
+   not deployed to the Pi. See `app/CLAUDE.md` for the WSL renderer gotcha.
 6. Richer sim: second-order lag, position/following-error limits, faults;
    S-curve (jerk-limited) profiles.
 7. (Hardware later) `backend-ethercat`: EtherCRAB + CiA 402 state machine +
    PDO mapping, behind the same `AxisGroup` trait.
 
-## Housekeeping notes
+## Known gaps / not built
 
-- [done] `app` binary crate exists (arrived early, ahead of Step 4/backend-sim —
-  see `app/src/main.rs`); `Cargo.lock` is committed, `.gitignore` no longer
-  excludes it.
-- Workspace layout target: motion-core / axis-backend / backend-sim /
-  backend-ethercat / app. (`viz` is not a separate crate — see Step 5: it's
-  baked into `app` as `app/src/viz.rs` + `app/src/recording.rs`.)
-- [done] Unit tests for `app`'s `parse_command`/`parse_axis` (added
-  2026-07-21, alongside axis groups since the move-parsing restructure
-  touched this code anyway): `app/src/main.rs`, `#[cfg(test)] mod tests`,
-  same pattern as `trajectory.rs`; 13 tests. (Full control-loop integration
-  testing — queuing, per-axis independence — remains a separate, harder
-  problem: real `sleep()`s and `println!`-format assertions make it
-  slow/brittle; revisit only if that becomes a recurring pain point, and
-  consider extracting the loop's decision logic to run on fake time first.)
+- Per-segment `SegmentKind::Line` override has no CLI syntax (the type
+  supports it; no command wires it).
+- `movepath` file format has no comment syntax.
+- The four real PLCopen blending variants (`BlendingLow`/`Previous`/`Next`/
+  `High`) — a structurally different problem: they need a profile aware of an
+  *adjacent* segment that never fully decelerates before handing off. Distinct
+  from `BufferMode::Blend`, which transitions path *geometry*. No plan yet;
+  confirm the shape with the user before building.
+- Full control-loop integration testing (queuing, per-axis independence) —
+  real `sleep()`s and `println!`-format assertions make it slow and brittle.
+  Revisit only if it becomes a recurring pain point, and consider extracting
+  the loop's decision logic to run on fake time first.
 
 ## How to work in this repo
 
@@ -596,6 +288,9 @@ implement, then verify with `cargo test`/`cargo run`. Flag design tradeoffs
 explicitly and let the user choose at decision points. Keep `motion-core`
 pure. Preserve the architectural decisions above unless we explicitly revisit
 one.
+
+**Verify interactive changes against the built binary** (`./target/debug/app`),
+not `cargo run` — there's a known piped-stdin timing gotcha.
 
 NEVER use sed, awk, or cat to read or edit files. Always use the built-in
 Read, Edit, and Write tools.
