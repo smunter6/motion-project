@@ -16,8 +16,7 @@
 //! Axes are independent: `move axis0 100` and `move axis1 50` run
 //! concurrently on their own clocks, with no relationship between their
 //! durations. Driving several axes to arrive together (finish-together
-//! time-scaling) is a distinct, harder feature — deliberately deferred; see
-//! the roadmap's Step 2.
+//! time-scaling) is a distinct, harder feature — deliberately deferred.
 //!
 //! Run from the workspace root with:
 //!
@@ -48,17 +47,16 @@
 //!
 //! `stop` interrupts whatever an axis is doing (active or queued) with a
 //! controlled deceleration to rest, built from the axis's *actual* current
-//! velocity (see `motion_core::StopRamp`). This is PLCopen `MC_Stop`, not
-//! DS402's Quick Stop (a distinct, typically emergency/safety-triggered
-//! mechanism) — the backend's `Ds402State` is unaffected; only the coarser
-//! `AxisState` (via `AxisSetpoint::stopping`) reports `Stopping` instead of
-//! `DiscreteMotion`.
+//! velocity (see `motion_core::StopRamp`). This is not DS402's Quick Stop
+//! (a distinct, typically emergency/safety-triggered mechanism) — the
+//! backend's `Ds402State` is unaffected; only the coarser `AxisState` (via
+//! `AxisSetpoint::stopping`) reports `Stopping` instead of `DiscreteMotion`.
 //!
-//! A `move`'s trailing `aborting`/`buffered` keyword picks its PLCopen
-//! `BufferMode`: `buffered` (the default) queues behind a busy axis, FIFO,
-//! and runs once earlier moves finish, same as always; `aborting` takes
-//! over immediately — active or queued — building the new move from the
-//! axis's actual position/velocity via
+//! A `move`'s trailing `aborting`/`buffered` keyword picks its buffer mode:
+//! `buffered` (the default) queues behind a busy axis, FIFO, and runs once
+//! earlier moves finish, same as always; `aborting` takes over immediately
+//! — active or queued — building the new move from the axis's actual
+//! position/velocity via
 //! `motion_core::TrapezoidalProfile::new_with_start_velocity` rather than
 //! waiting for it to come to rest first.
 //!
@@ -84,20 +82,101 @@ use std::time::{Duration, Instant};
 use axis_backend::{AxisGroup, AxisSetpoint, AxisState, Ds402State};
 use backend_sim::SimAxisGroup;
 use motion_core::{
-    LinearMove, LinearMoveError, MotionPhase, PathProfile, PathProfileError, SegmentKind,
+    LinearMove, LinearMoveError, MotionPhase, PathProfile, PathProfileError,
     StopRamp, TrajectoryError, TrapezoidalProfile,
 };
 use recording::{History, RecordingAxisGroup};
 use viz::VizApp;
 
 const CONTROL_RATE_HZ: f64 = 250.0;
-const DEFAULT_MAX_SPEED: f64 = 50.0; // mm/s
-const DEFAULT_MAX_ACCELERATION: f64 = 200.0; // mm/s^2
+/// Defaults for *Cartesian* (group / path) moves, which are TCP-space
+/// quantities regardless of what kind of axes carry them out. Single-axis
+/// commands don't use these — they use the axis's own `AxisConfig`, whose
+/// units may not be mm at all. See `AXIS_CONFIGS`.
+const DEFAULT_CARTESIAN_MAX_SPEED: f64 = 50.0; // mm/s
+const DEFAULT_CARTESIAN_MAX_ACCELERATION: f64 = 200.0; // mm/s^2
 const STATUS_PRINT_PERIOD: Duration = Duration::from_millis(250);
 
 /// Below this speed, an axis counts as already at rest for `stop`'s
 /// "nothing to do" short-circuit.
 const AT_REST_EPS: f64 = 1e-6;
+
+/// One axis's own dynamic capability and travel, in **that axis's own
+/// units** — mm for a linear axis, degrees for a rotary joint. Every
+/// single-axis operation reads these: a raw `move axisN`/`stop axisN`'s
+/// default limits, and — the one that isn't user-visible — the per-joint
+/// `StopRamp` that `cascade_group_stop` builds for each member of an
+/// interrupted group.
+///
+/// That cascade case is why this exists rather than two global constants.
+/// A group move's limits are *Cartesian* (mm/s² of TCP), but the cascade
+/// applies a deceleration in **joint** space. While every axis is linear
+/// and every group is Cartesian those are numerically the same thing, so
+/// the confusion is invisible; the moment a group has non-identity
+/// kinematics, feeding a mm/s² number to a rotary joint's ramp is a silent
+/// unit error on the exact path that runs when something has already gone
+/// wrong.
+///
+/// Deliberately one flat struct, not an enum over axis kinds. What varies
+/// between a linear axis and a rotary joint is the *numbers*, a display
+/// *label*, and whether travel is bounded — not the operations performed on
+/// them, and `motion-core` is unit-agnostic `f64` throughout. An
+/// `AxisKind` enum earns its place when some axis type needs different
+/// *math* (a continuous rotary axis wanting shortest-path wraparound inside
+/// `TrapezoidalProfile`, say), not merely different values.
+///
+/// Compile-time like `AXIS_GROUPS`, for the same reason: this is machine
+/// configuration, and there's no runtime-config infrastructure to hang it
+/// on yet. The shape deserializes unchanged if that ever arrives.
+struct AxisConfig {
+    max_speed: f64,
+    max_acceleration: f64,
+    max_deceleration: f64,
+    /// Display only — `motion-core` never sees units. Used by `status` and
+    /// the heartbeat so a rotary joint doesn't print "mm".
+    units: &'static str,
+    /// Soft travel limits, as `(min, max)` inclusive. `None` means
+    /// unbounded — a continuous rotary axis, or an axis whose limits simply
+    /// aren't modelled yet. Checked when a move target is commanded; see
+    /// `check_target_in_limits`.
+    position_limits: Option<(f64, f64)>,
+}
+
+/// Per-axis configuration, indexed by axis number — `main()` asserts the
+/// length matches `NUM_AXES`.
+const AXIS_CONFIGS: &[AxisConfig] = &[
+    AxisConfig {
+        max_speed: 50.0,
+        max_acceleration: 200.0,
+        max_deceleration: 200.0,
+        units: "mm",
+        position_limits: Some((-500.0, 500.0)),
+    },
+    AxisConfig {
+        max_speed: 50.0,
+        max_acceleration: 200.0,
+        max_deceleration: 200.0,
+        units: "mm",
+        position_limits: Some((-500.0, 500.0)),
+    },
+];
+
+/// Rejects a single-axis move target outside the axis's soft travel limits.
+///
+/// Deliberately narrow: this checks a *commanded endpoint* only. It says
+/// nothing about the interior of a path, nor about where a group move's
+/// Cartesian target lands once mapped through kinematics into joint space —
+/// both of which need the whole-path plausibility checking that is still
+/// deferred. An unlimited axis (`position_limits: None`) always passes.
+fn check_target_in_limits(axis: usize, target: f64) -> Result<(), String> {
+    match AXIS_CONFIGS[axis].position_limits {
+        Some((min, max)) if target < min || target > max => Err(format!(
+            "target {target:.3} {units} is outside travel limits [{min:.3}, {max:.3}] {units}",
+            units = AXIS_CONFIGS[axis].units
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// How much target-vs-actual history the viz window keeps per axis, in
 /// seconds. Older samples are dropped as new ones arrive.
@@ -111,9 +190,8 @@ const NUM_AXES: usize = 2;
 /// A hard-coded axis group: a named Cartesian pair/triple/etc. that can be
 /// driven by the same `enable`/`disable`/`reset`/`stop`/`move` commands as a
 /// single axis, just fanned out to (or coordinated across) its members.
-/// Groups are **not** created or removed at runtime — this is deliberately
-/// simpler than PLCopen's real axis-group model, per the project's own
-/// choice to keep this a fixed, known-at-compile-time table.
+/// Groups are **not** created or removed at runtime — a fixed,
+/// known-at-compile-time table by design.
 struct AxisGroupDef {
     name: &'static str,
     axes: &'static [usize],
@@ -127,15 +205,11 @@ const AXIS_GROUPS: &[AxisGroupDef] = &[AxisGroupDef {
     axes: &[0, 1],
 }];
 
-/// PLCopen `BufferMode`-style dispatch policy for a move. `Aborting`/
+/// Dispatch policy for a move when the target is already busy. `Aborting`/
 /// `Buffered` apply to every move target (`move`/`movegroup`/`movepath`);
-/// `Blend` is `movepath`-only (see `Command::MovePath`'s docs) — the four
-/// real PLCopen blending variants (`BlendingLow`/`Previous`/`Next`/`High`)
-/// are still their own, structurally different deferred problem (a profile
-/// aware of an *adjacent* segment that never fully decelerates before
-/// handing off — see the `plcopen-motion-goal` memory); `Blend` here is a
-/// narrower, `movepath`-specific thing: smoothly transitioning the path's
-/// own *geometry* onto a new one, not blending across two independent move
+/// `Blend` is `movepath`-only (see `Command::MovePath`'s docs) — a narrower,
+/// `movepath`-specific thing: smoothly transitioning the path's own
+/// *geometry* onto a new one, not blending across two independent move
 /// segments in general.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferMode {
@@ -206,21 +280,18 @@ enum Command {
     /// A multi-waypoint move for a group, smoothly blended through every
     /// waypoint via `motion_core::PathProfile` (centripetal Catmull-Rom).
     /// `waypoints` are the points *after* the group's current position —
-    /// the actual current position (and actual velocity, via whichever of
+    /// the actual current position (and velocity, via whichever of
     /// `PathProfile::new_with_start_velocity`/`new_blended` `buffer_mode`
     /// picks) is always prepended as the path's own start (see
     /// `install_path_move_impl`), the same "start is the axes' actual
-    /// state, not a commanded one" rule every other move here follows.
-    /// `buffer_mode`: `Buffered` queues FIFO behind a busy group, same as
-    /// `MoveGroup`; `Aborting` and `Blend` both redirect immediately
-    /// (mid-flight, from wherever the group actually is) and only differ
-    /// in *how* the new path's geometry is built — `Aborting` via
+    /// state" rule every other move here follows. `buffer_mode`:
+    /// `Buffered` queues FIFO behind a busy group, same as `MoveGroup`;
+    /// `Aborting` and `Blend` both redirect immediately and only differ in
+    /// *how* the new path's geometry is built — `Aborting` via
     /// `install_path_move` (assumes a straight approach to the new path's
-    /// first waypoint, same as a redirected `move`), `Blend` via
-    /// `install_path_move_blended` (leans the new path's own start tangent
-    /// toward the actual incoming velocity direction instead, for a
-    /// visibly smoother transition — see `PathProfile::new_blended`'s
-    /// docs for why it's a close match, not an exact one).
+    /// first waypoint), `Blend` via `install_path_move_blended` (leans the
+    /// new path's own start tangent toward the actual incoming velocity
+    /// direction instead, for a visibly smoother transition).
     MovePath {
         group: usize,
         waypoints: Vec<Vec<f64>>,
@@ -236,6 +307,12 @@ enum Command {
 }
 
 fn main() {
+    debug_assert_eq!(
+        AXIS_CONFIGS.len(),
+        NUM_AXES,
+        "AXIS_CONFIGS has {} entries but NUM_AXES is {NUM_AXES}",
+        AXIS_CONFIGS.len()
+    );
     for group in AXIS_GROUPS {
         for &axis in group.axes {
             debug_assert!(
@@ -386,8 +463,21 @@ fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>
         .map(|c| parse_f64(c))
         .collect::<Result<_, _>>()?;
 
+    // A single-axis move defaults to that axis's own limits (which may be
+    // deg/s, not mm/s); a group move is Cartesian and defaults to the
+    // TCP-space constants. See `AxisConfig`.
+    let defaults = match target {
+        Target::Axis(a) => (
+            AXIS_CONFIGS[a].max_speed,
+            AXIS_CONFIGS[a].max_acceleration,
+        ),
+        Target::Group(_) => (
+            DEFAULT_CARTESIAN_MAX_SPEED,
+            DEFAULT_CARTESIAN_MAX_ACCELERATION,
+        ),
+    };
     let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
-        parse_buffer_mode_and_limits(rest, line)?;
+        parse_buffer_mode_and_limits(rest, line, defaults)?;
 
     match target {
         Target::Axis(axis) => Ok(Some(Command::Move {
@@ -556,6 +646,7 @@ fn parse_waypoint_lines(contents: &str, coord_count: usize) -> Result<Vec<Vec<f6
 fn parse_buffer_mode_and_limits(
     rest: &[&str],
     line: &str,
+    defaults: (f64, f64),
 ) -> Result<(BufferMode, f64, f64, f64), String> {
     let (buffer_mode, numeric_rest) = match rest.last() {
         Some(&"aborting") => (BufferMode::Aborting, &rest[..rest.len() - 1]),
@@ -563,7 +654,7 @@ fn parse_buffer_mode_and_limits(
         _ => (BufferMode::Buffered, rest),
     };
     let (max_speed, max_acceleration, max_deceleration) =
-        parse_kinematic_limits(numeric_rest, line)?;
+        parse_kinematic_limits(numeric_rest, line, defaults)?;
     Ok((buffer_mode, max_speed, max_acceleration, max_deceleration))
 }
 
@@ -580,8 +671,14 @@ fn parse_movepath_buffer_mode_and_limits(
         Some(&"blend") => (BufferMode::Blend, &rest[..rest.len() - 1]),
         _ => (BufferMode::Buffered, rest),
     };
-    let (max_speed, max_acceleration, max_deceleration) =
-        parse_kinematic_limits(numeric_rest, line)?;
+    let (max_speed, max_acceleration, max_deceleration) = parse_kinematic_limits(
+        numeric_rest,
+        line,
+        (
+            DEFAULT_CARTESIAN_MAX_SPEED,
+            DEFAULT_CARTESIAN_MAX_ACCELERATION,
+        ),
+    )?;
     Ok((buffer_mode, max_speed, max_acceleration, max_deceleration))
 }
 
@@ -589,18 +686,22 @@ fn parse_movepath_buffer_mode_and_limits(
 /// `movepath` forms (`[vmax] [amax] [dmax]`, each defaulting the same way
 /// `move`'s do: `vmax`/`amax` fall back to the global defaults, `dmax`
 /// falls back to whatever `amax` resolved to).
-fn parse_kinematic_limits(rest: &[&str], line: &str) -> Result<(f64, f64, f64), String> {
+fn parse_kinematic_limits(
+    rest: &[&str],
+    line: &str,
+    defaults: (f64, f64),
+) -> Result<(f64, f64, f64), String> {
     if rest.len() > 3 {
         return Err(format!("too many arguments: {line:?}"));
     }
     let mut numeric_rest = rest.iter();
     let max_speed = match numeric_rest.next() {
         Some(v) => parse_f64(v)?,
-        None => DEFAULT_MAX_SPEED,
+        None => defaults.0,
     };
     let max_acceleration = match numeric_rest.next() {
         Some(a) => parse_f64(a)?,
-        None => DEFAULT_MAX_ACCELERATION,
+        None => defaults.1,
     };
     let max_deceleration = match numeric_rest.next() {
         Some(d) => parse_f64(d)?,
@@ -658,15 +759,13 @@ fn group_label(group: usize) -> &'static str {
     AXIS_GROUPS[group].name
 }
 
-/// Whether an axis is enabled and fault-free — the PLCopen-level gate every
-/// business-logic decision in this loop checks (`move`/`stop` rejection,
-/// queue promotion, `enable`'s "already enabled"), instead of comparing
-/// `Ds402State` directly (see `AxisRuntime::ds402_state`'s docs for why).
-/// `AxisState::Disabled` covers every DS402 substate short of fully
-/// `OperationEnabled` (`SwitchOnDisabled`/`ReadyToSwitchOn`/`SwitchedOn` all
-/// collapse to it), so this is exactly equivalent to comparing
-/// `Ds402State::OperationEnabled` directly would have been — just expressed
-/// at the layer `app` is supposed to reason in.
+/// Whether an axis is enabled and fault-free — the gate every business-logic
+/// decision in this loop checks (`move`/`stop` rejection, queue promotion,
+/// `enable`'s "already enabled"), instead of comparing `Ds402State` directly
+/// (see `AxisRuntime::ds402_state`'s docs for why). `AxisState::Disabled`
+/// covers every DS402 substate short of fully `OperationEnabled`, so this is
+/// exactly equivalent to comparing `Ds402State::OperationEnabled` directly
+/// — just expressed at the layer `app` is supposed to reason in.
 fn axis_operational(state: AxisState) -> bool {
     !matches!(state, AxisState::Disabled | AxisState::ErrorStop)
 }
@@ -720,19 +819,21 @@ fn print_help() {
 /// straight-line profile (see `motion_core::LinearMove`), which axes
 /// participate (in the same order the profile's per-axis samples come out
 /// in — always `AXIS_GROUPS[group].axes`, so this is a zero-alloc pointer,
-/// not a clone), and the group's own `max_deceleration`, reused if the
-/// group needs to be cascaded into a stop (see the control loop's cascade
-/// logic).
+/// not a clone).
+///
+/// Deliberately does *not* carry the group move's `max_deceleration`: it
+/// used to, for `cascade_group_stop` to reuse, but that value is Cartesian
+/// and the cascade's ramps are built in joint space, so each sibling now
+/// decelerates at its own `AxisConfig::max_deceleration` instead.
 struct SharedGroupMove {
     profile: LinearMove,
     axes: &'static [usize],
     group: usize,
-    max_deceleration: f64,
 }
 
 /// The path-move analog of `SharedGroupMove` — same shape (a shared
-/// profile, participating axes, group index, deceleration for cascading
-/// into a stop), just wrapping `motion_core::PathProfile` instead of
+/// profile, participating axes, group index), just wrapping
+/// `motion_core::PathProfile` instead of
 /// `LinearMove`. Kept as a distinct type (not a generalized
 /// `SharedGroupMove<P>`) since the two profile types don't share a common
 /// trait and nothing outside `Profile`'s own match arms needs to treat them
@@ -741,7 +842,6 @@ struct SharedPathMove {
     profile: PathProfile,
     axes: &'static [usize],
     group: usize,
-    max_deceleration: f64,
 }
 
 /// Whichever motion profile is currently driving an axis: a commanded
@@ -827,13 +927,18 @@ impl Profile {
 }
 
 /// Clears any queued moves and replaces whatever's active on `ax` with a
-/// fresh profile built from its *actual* current position/velocity —
+/// fresh profile built from its current *commanded* position/velocity —
 /// shared by `stop` (builds a `StopRamp`) and an `aborting` move (builds a
 /// `TrapezoidalProfile` via `new_with_start_velocity`). `build` receives
 /// (position, velocity), does its own success printing (it alone knows the
 /// right message and has the built profile's `duration()` to hand), and
 /// returns the `Profile` to install or a `TrajectoryError` to report the
 /// same way regardless of which case triggered it.
+///
+/// Commanded, not actual: the replacement profile has to pick up the
+/// commanded stream exactly where the superseded one left it, or the
+/// redirect itself becomes a step input. See
+/// `AxisRuntime::commanded_position`.
 fn abort_into(
     ax: &mut AxisRuntime,
     axis: usize,
@@ -841,7 +946,7 @@ fn abort_into(
     build: impl FnOnce(f64, f64) -> Result<Profile, TrajectoryError>,
 ) {
     ax.pending.clear();
-    match build(ax.position, ax.velocity) {
+    match build(ax.commanded_position, ax.commanded_velocity) {
         Ok(profile) => {
             ax.active = Some(ActiveMove {
                 profile,
@@ -878,12 +983,6 @@ impl ActiveGroupMove {
         }
     }
 
-    fn max_deceleration(&self) -> f64 {
-        match self {
-            ActiveGroupMove::Group(s) => s.max_deceleration,
-            ActiveGroupMove::Path(s) => s.max_deceleration,
-        }
-    }
 
     /// Whether `profile` is still actively driven by *this specific* shared
     /// move instance (identity, via `Rc::ptr_eq` within the matching
@@ -917,7 +1016,7 @@ fn group_of(profile: &Profile) -> Option<ActiveGroupMove> {
 }
 
 /// Cascades a group (or path) interruption: every member of `shared` other
-/// than `except` gets its own `StopRamp` from its own actual
+/// than `except` gets its own `StopRamp` from its own commanded
 /// position/velocity, via the same `abort_into` mechanism a direct
 /// single-axis `stop` uses — no new profile-building logic, just invoked
 /// once per sibling. Guarded by `ActiveGroupMove::still_drives` (identity,
@@ -938,8 +1037,12 @@ fn cascade_group_stop(
     // same "seizing/losing control clears anything queued" precedent as
     // `abort_into`.
     group_pending[shared.group()].clear();
-    let decel = shared.max_deceleration();
     for &other in shared.axes() {
+        // Each sibling decelerates at *its own* limit, not the group move's.
+        // The group's `max_deceleration` is a Cartesian TCP quantity, and
+        // this ramp is built in joint space — see `AxisConfig`.
+        let decel = AXIS_CONFIGS[other].max_deceleration;
+        let units = AXIS_CONFIGS[other].units;
         if other == except {
             continue;
         }
@@ -957,7 +1060,7 @@ fn cascade_group_stop(
             move |position, velocity| {
                 let ramp = StopRamp::new(position, velocity, decel)?;
                 println!(
-                    "  -> {}: stopping (group interrupted): {:.3} mm/s -> 0 (decel {decel:.3} mm/s^2, {:.3}s)",
+                    "  -> {}: stopping (group interrupted): {:.3} {units}/s -> 0 (decel {decel:.3} {units}/s^2, {:.3}s)",
                     axis_label(other),
                     velocity,
                     ramp.duration()
@@ -969,7 +1072,8 @@ fn cascade_group_stop(
 }
 
 /// Attempts to build a `LinearMove` for `group`'s `members` from their
-/// current actual position/velocity, and — only on success — installs it
+/// current *commanded* position/velocity (see
+/// `AxisRuntime::commanded_position`), and — only on success — installs it
 /// atomically as `Profile::Group` on every member (also clearing each
 /// member's own individual pending queue, same as `abort_into`). On
 /// failure nothing is touched, so a rejected group move never leaves one
@@ -989,8 +1093,11 @@ fn install_group_move(
     max_acceleration: f64,
     max_deceleration: f64,
 ) -> Result<f64, LinearMoveError> {
-    let starts: Vec<f64> = members.iter().map(|&a| axes[a].position).collect();
-    let velocities: Vec<f64> = members.iter().map(|&a| axes[a].velocity).collect();
+    let starts: Vec<f64> = members.iter().map(|&a| axes[a].commanded_position).collect();
+    let velocities: Vec<f64> = members
+        .iter()
+        .map(|&a| axes[a].commanded_velocity)
+        .collect();
     let profile = LinearMove::new_with_start_velocity(
         starts,
         velocities,
@@ -1004,7 +1111,6 @@ fn install_group_move(
         profile,
         axes: members,
         group,
-        max_deceleration,
     });
     for (index, &axis) in members.iter().enumerate() {
         let ax = &mut axes[axis];
@@ -1022,18 +1128,17 @@ fn install_group_move(
 }
 
 /// The path-move analog of `install_group_move`: attempts to build a
-/// `PathProfile` for `group`'s `members`, prepending their current *actual*
-/// position as the path's own start waypoint (`waypoints` is everything
+/// `PathProfile` for `group`'s `members`, prepending their current
+/// *commanded* position as the path's own start waypoint (`waypoints` is everything
 /// *after* that — see `Command::MovePath`'s docs), and — only on success —
 /// installs it atomically as `Profile::Path` on every member. On failure
 /// nothing is touched, same "never half-redirect a member" guarantee
-/// `install_group_move` gives. Every segment defaults to
-/// `SegmentKind::Spline` (smooth blending through every waypoint) — this
-/// first pass doesn't expose a per-segment `Line` override from the command
-/// line, though `motion_core::WaypointPath` itself supports one.
+/// `install_group_move` gives. Every segment is a smooth spline blending
+/// through every waypoint — `motion_core::WaypointPath` no longer offers a
+/// per-segment straight-line override (see its module docs).
 ///
 /// `build` is which `PathProfile` constructor to use — always given each
-/// member's current *actual* velocity, exactly like `install_group_move`
+/// member's current *commanded* velocity, exactly like `install_group_move`
 /// always uses `LinearMove::new_with_start_velocity` (an idle group's
 /// velocity is simply 0, which reduces to ordinary rest-to-rest behavior,
 /// so there's no separate idle-only code path). `install_path_move` and
@@ -1052,23 +1157,23 @@ fn install_path_move_impl(
     build: impl FnOnce(
         Vec<Vec<f64>>,
         Vec<f64>,
-        Vec<SegmentKind>,
         f64,
         f64,
         f64,
     ) -> Result<PathProfile, PathProfileError>,
 ) -> Result<f64, PathProfileError> {
-    let start: Vec<f64> = members.iter().map(|&a| axes[a].position).collect();
-    let velocities: Vec<f64> = members.iter().map(|&a| axes[a].velocity).collect();
+    let start: Vec<f64> = members.iter().map(|&a| axes[a].commanded_position).collect();
+    let velocities: Vec<f64> = members
+        .iter()
+        .map(|&a| axes[a].commanded_velocity)
+        .collect();
     let mut all_waypoints = Vec::with_capacity(waypoints.len() + 1);
     all_waypoints.push(start);
     all_waypoints.extend(waypoints);
-    let segment_kinds = vec![SegmentKind::Spline; all_waypoints.len() - 1];
 
     let profile = build(
         all_waypoints,
         velocities,
-        segment_kinds,
         max_speed,
         max_acceleration,
         max_deceleration,
@@ -1078,7 +1183,6 @@ fn install_path_move_impl(
         profile,
         axes: members,
         group,
-        max_deceleration,
     });
     for (index, &axis) in members.iter().enumerate() {
         let ax = &mut axes[axis];
@@ -1185,18 +1289,19 @@ fn handle_reset(ax: &mut AxisRuntime, axis: usize) {
 fn handle_stop(ax: &mut AxisRuntime, axis: usize, max_deceleration: Option<f64>) {
     if !axis_operational(ax.axis_state) {
         println!("  ! {}: stop rejected: axis is disabled", axis_label(axis));
-    } else if ax.active.is_none() && ax.velocity.abs() < AT_REST_EPS {
+    } else if ax.active.is_none() && ax.commanded_velocity.abs() < AT_REST_EPS {
         // Nothing queued survives this either way (see abort_into), but
         // there's genuinely nothing to decelerate — short-circuit before
         // building a zero-duration StopRamp just to say so.
         ax.pending.clear();
         println!("  -> {}: already at rest", axis_label(axis));
     } else {
-        let decel = max_deceleration.unwrap_or(DEFAULT_MAX_ACCELERATION);
+        let decel = max_deceleration.unwrap_or(AXIS_CONFIGS[axis].max_deceleration);
+        let units = AXIS_CONFIGS[axis].units;
         abort_into(ax, axis, "stop", move |position, velocity| {
             let ramp = StopRamp::new(position, velocity, decel)?;
             println!(
-                "  -> {}: stopping: {:.3} mm/s -> 0 (decel {decel:.3} mm/s^2, {:.3}s)",
+                "  -> {}: stopping: {:.3} {units}/s -> 0 (decel {decel:.3} {units}/s^2, {:.3}s)",
                 axis_label(axis),
                 velocity,
                 ramp.duration()
@@ -1251,11 +1356,41 @@ enum PendingGroupMove {
 struct AxisRuntime {
     // Last-known *actual* position/velocity, from backend feedback — not
     // the raw trajectory sample. Updated once per control cycle after the
-    // backend exchange; `status` reads these directly rather than
-    // resampling, so it reports the same "actual" value the heartbeat
-    // print does.
+    // backend exchange. Used for *reporting only* (`status`, the heartbeat
+    // print, move-completion messages) and for the enable-time resync
+    // below — never to seed a profile. See `commanded_position`.
     position: f64,
     velocity: f64,
+    // The *commanded* (model) position/velocity: exactly what was sent as
+    // this axis's `AxisSetpoint` last cycle. This — not feedback — is what
+    // every profile is seeded from: a new move, an aborting redirect, a
+    // `StopRamp`, a queue promotion, a group/path move's start state.
+    //
+    // Why the model and not feedback: seeding from actual injects a step
+    // into the commanded stream. If the previous move ended commanding
+    // 100.000 while the axis actually sits at 99.980 (following error), a
+    // new move seeded from 99.980 steps the commanded position backward
+    // 0.020 mm in one cycle — a step input to the drive. It also destroys
+    // repeatability (the same command sequence produces a different
+    // trajectory depending on measured error) and quietly launders
+    // following error into the plan instead of leaving it visible to the
+    // drive's own following-error detection, which is the mechanism
+    // designed to catch it.
+    //
+    // Accepted consequence: if an axis physically can't keep up (jam,
+    // overload), the model runs away from reality and following error
+    // grows until the drive faults. That's correct — that fault is the
+    // designed detector.
+    //
+    // Resynced from feedback at exactly one place: the transition from
+    // non-operational to operational (see the feedback fold in the control
+    // loop). Every path that stops accepting moves — disable, fault —
+    // leaves the axis `Disabled`/`ErrorStop`, and `axis_operational` gates
+    // every move/stop/promotion, so nothing can be commanded again without
+    // crossing that transition first. Homing, when it exists, will be the
+    // second resync point.
+    commanded_position: f64,
+    commanded_velocity: f64,
     active: Option<ActiveMove>,
     // FIFO queue of buffered moves waiting for the current one (and each
     // other) to finish, in order. An `aborting` move bypasses this
@@ -1267,7 +1402,7 @@ struct AxisRuntime {
     // backend every cycle as `AxisSetpoint::enabled` (see axis-backend's
     // docs on why that's a cyclic field, not a one-off command).
     want_enabled: bool,
-    // This axis's coarser, PLCopen-flavored state, updated from feedback
+    // This axis's coarser status, updated from feedback
     // every cycle. Every business-logic gate in this loop
     // (`move`/`stop`/queue-promotion rejection, `enable`/`disable`'s
     // "already ..." checks, fault recovery) checks *this*, not
@@ -1293,6 +1428,8 @@ impl AxisRuntime {
         Self {
             position: 0.0,
             velocity: 0.0,
+            commanded_position: 0.0,
+            commanded_velocity: 0.0,
             active: None,
             pending: VecDeque::new(),
             last_status_print: Instant::now(),
@@ -1349,7 +1486,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             }
             while let Some(p) = ax.pending.pop_front() {
                 match TrapezoidalProfile::new(
-                    ax.position,
+                    ax.commanded_position,
                     p.target,
                     p.max_speed,
                     p.max_acceleration,
@@ -1359,7 +1496,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         println!(
                             "  -> {}: starting queued move: {:.3} -> {:.3} mm ({:.3}s)",
                             axis_label(i),
-                            ax.position,
+                            ax.commanded_position,
                             p.target,
                             profile.duration()
                         );
@@ -1453,14 +1590,22 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
 
         // 2. Build this cycle's commanded setpoint for every axis: sample
         //    the active trajectory if there is one, otherwise hold at the
-        //    axis's last known actual position with zero velocity.
+        //    axis's last *commanded* position with zero velocity.
+        //
+        //    Holding at commanded rather than actual is what keeps the
+        //    commanded stream continuous across the gap between moves — an
+        //    idle axis must keep asking for the same place it last asked
+        //    for, not drift onto wherever the servo settled. Each setpoint
+        //    is written back to `commanded_position`/`commanded_velocity`
+        //    here, which is the single point where the model chain
+        //    advances; see `AxisRuntime::commanded_position`.
         let setpoints: Vec<AxisSetpoint> = axes
             .iter_mut()
             .map(|ax| {
                 // Consume the one-shot reset pulse right here — it's sent
                 // in this cycle's setpoint and must not repeat next cycle.
                 let fault_reset = std::mem::take(&mut ax.pending_fault_reset);
-                match &ax.active {
+                let setpoint = match &ax.active {
                     Some(mv) => {
                         let elapsed = mv.started_at.elapsed().as_secs_f64();
                         let sample = mv.profile.sample(elapsed);
@@ -1473,13 +1618,16 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         }
                     }
                     None => AxisSetpoint {
-                        position: ax.position,
+                        position: ax.commanded_position,
                         velocity: 0.0,
                         enabled: ax.want_enabled,
                         fault_reset,
                         stopping: false,
                     },
-                }
+                };
+                ax.commanded_position = setpoint.position;
+                ax.commanded_velocity = setpoint.velocity;
+                setpoint
             })
             .collect();
 
@@ -1504,9 +1652,23 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
         let mut group_cascades: Vec<(ActiveGroupMove, usize)> = Vec::new();
 
         for (i, ax) in axes.iter_mut().enumerate() {
+            let was_operational = axis_operational(ax.axis_state);
             ax.position = feedback[i].position;
             ax.velocity = feedback[i].velocity;
             ax.axis_state = feedback[i].state;
+
+            // The one resync point: coming back from non-operational
+            // (`Disabled`/`ErrorStop`) to operational. While the power
+            // stage was off the axis could have moved for reasons the
+            // model knows nothing about — coasting, gravity, a fault
+            // reaction, or a hand — so the commanded chain is stale and
+            // the only truth available is where the axis actually is.
+            // Everywhere else the model leads and feedback is reporting
+            // only; see `AxisRuntime::commanded_position`.
+            if !was_operational && axis_operational(ax.axis_state) {
+                ax.commanded_position = ax.position;
+                ax.commanded_velocity = ax.velocity;
+            }
 
             // A fault means the last enable request is void — recovery is
             // an explicit reset, then a fresh enable, not an automatic
@@ -1631,6 +1793,12 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             "  ! {}: move rejected: axis is disabled (enable it first)",
                             axis_label(axis)
                         );
+                    } else if let Err(e) = check_target_in_limits(axis, target) {
+                        // Checked when the command is accepted, so a
+                        // `buffered` move is rejected at the point the user
+                        // typed it rather than silently sitting in the queue
+                        // until promotion.
+                        println!("  ! {}: move rejected: {e}", axis_label(axis));
                     } else {
                         match buffer_mode {
                             // Blend is movepath-only and never actually
@@ -1675,7 +1843,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             }
                             BufferMode::Buffered if ax.active.is_none() => {
                                 match TrapezoidalProfile::new(
-                                    ax.position,
+                                    ax.commanded_position,
                                     target,
                                     max_speed,
                                     max_acceleration,
@@ -1685,7 +1853,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                         println!(
                                             "  -> {}: move: {:.3} -> {target:.3} mm ({:.3}s)",
                                             axis_label(axis),
-                                            ax.position,
+                                            ax.commanded_position,
                                             profile.duration()
                                         );
                                         ax.active = Some(ActiveMove {
@@ -2097,12 +2265,33 @@ mod tests {
             Ok(Some(Command::Move {
                 axis: 0,
                 target: 100.0,
-                max_speed: DEFAULT_MAX_SPEED,
-                max_acceleration: DEFAULT_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_MAX_ACCELERATION,
+                max_speed: AXIS_CONFIGS[0].max_speed,
+                max_acceleration: AXIS_CONFIGS[0].max_acceleration,
+                max_deceleration: AXIS_CONFIGS[0].max_acceleration,
                 buffer_mode: BufferMode::Buffered,
             }))
         );
+    }
+
+    #[test]
+    fn target_within_travel_limits_is_accepted() {
+        let (min, max) = AXIS_CONFIGS[0].position_limits.unwrap();
+        assert!(check_target_in_limits(0, 0.0).is_ok());
+        assert!(check_target_in_limits(0, max).is_ok(), "max is inclusive");
+        assert!(check_target_in_limits(0, min).is_ok(), "min is inclusive");
+    }
+
+    #[test]
+    fn target_outside_travel_limits_is_rejected() {
+        let (min, max) = AXIS_CONFIGS[0].position_limits.unwrap();
+        let over = check_target_in_limits(0, max + 1.0);
+        assert!(over.is_err());
+        // The message must name the axis's own units, not a hardcoded "mm".
+        assert!(
+            over.unwrap_err().contains(AXIS_CONFIGS[0].units),
+            "rejection should report the axis's units"
+        );
+        assert!(check_target_in_limits(0, min - 1.0).is_err());
     }
 
     #[test]
@@ -2139,9 +2328,9 @@ mod tests {
             Ok(Some(Command::Move {
                 axis: 0,
                 target: 100.0,
-                max_speed: DEFAULT_MAX_SPEED,
-                max_acceleration: DEFAULT_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_MAX_ACCELERATION,
+                max_speed: AXIS_CONFIGS[0].max_speed,
+                max_acceleration: AXIS_CONFIGS[0].max_acceleration,
+                max_deceleration: AXIS_CONFIGS[0].max_acceleration,
                 buffer_mode: BufferMode::Aborting,
             }))
         );
@@ -2170,9 +2359,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![10.0, 0.0], vec![10.0, 10.0]],
-                max_speed: DEFAULT_MAX_SPEED,
-                max_acceleration: DEFAULT_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_MAX_ACCELERATION,
+                max_speed: DEFAULT_CARTESIAN_MAX_SPEED,
+                max_acceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
+                max_deceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
                 buffer_mode: BufferMode::Buffered,
             }))
         );
@@ -2212,9 +2401,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![5.0, 5.0]],
-                max_speed: DEFAULT_MAX_SPEED,
-                max_acceleration: DEFAULT_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_MAX_ACCELERATION,
+                max_speed: DEFAULT_CARTESIAN_MAX_SPEED,
+                max_acceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
+                max_deceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
                 buffer_mode: BufferMode::Aborting,
             }))
         );
@@ -2317,8 +2506,8 @@ mod tests {
                 group: 0,
                 waypoints: vec![vec![10.0, 0.0], vec![10.0, 10.0]],
                 max_speed: 30.0,
-                max_acceleration: DEFAULT_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_MAX_ACCELERATION,
+                max_acceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
+                max_deceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
                 buffer_mode: BufferMode::Buffered,
             }))
         );

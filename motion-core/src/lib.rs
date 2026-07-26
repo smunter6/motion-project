@@ -16,13 +16,12 @@
 //! Anything that touches the outside world (a NIC, a servo drive, a window)
 //! lives in a *different* crate, on the far side of a trait seam.
 //!
-//! ## Contents so far
+//! ## Contents
 //!
-//! - [`trajectory`] — the trapezoidal velocity profile for one axis.
-//!
-//! Coming in later steps: an `AxisGroup` trait (the command/feedback seam), a
-//! software sim backend, simple visualization, and eventually an EtherCRAB +
-//! CiA 402 backend for real drives.
+//! - [`trajectory`] — trapezoidal velocity profile and stop ramp for one axis.
+//! - [`linear_move`] — straight-line moves across several axes.
+//! - [`waypoint_path`] — multi-waypoint spline paths.
+//! - [`path_profile`] — speed profile over a [`waypoint_path::WaypointPath`].
 
 pub mod linear_move;
 pub mod path_profile;
@@ -32,4 +31,4 @@ pub mod waypoint_path;
 pub use linear_move::{LinearMove, LinearMoveError, LinearMoveSample, MAX_GROUP_AXES};
 pub use path_profile::{PathProfile, PathProfileError, PathSample};
 pub use trajectory::{MotionPhase, StopRamp, TrajectoryError, TrajectorySample, TrapezoidalProfile};
-pub use waypoint_path::{SegmentKind, WaypointPath, WaypointPathError};
+pub use waypoint_path::{WaypointPath, WaypointPathError};

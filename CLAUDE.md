@@ -96,11 +96,11 @@ Read the source for *what* exists. These are the decisions behind it.
   profile over a scalar path coordinate" pattern is the recurring one —
   `StopRamp`, `LinearMove`, and `PathProfile` all follow it.
 - **`WaypointPath` uses centripetal Catmull-Rom specifically for *local
-  support*** — each segment depends only on its 4 nearest control points, so a
-  per-segment `SegmentKind::Line` override doesn't perturb any other segment's
-  curvature. A natural cubic spline's *global* support would. Centripetal (not
-  uniform/chordal) parameterization avoids cusps on non-uniformly-spaced
-  waypoints (Yuksel et al. 2011).
+  support*** — each segment depends only on its 4 nearest control points, so
+  editing one waypoint can't ripple through the whole route. A natural cubic
+  spline's *global* support would. Centripetal (not uniform/chordal)
+  parameterization avoids cusps on non-uniformly-spaced waypoints (Yuksel et
+  al. 2011).
 - **Endpoints use reflected phantoms (`P₋₁ = 2·P₀ − P₁`), not duplication** —
   duplication zero-lengths the phantom segment and divides by zero in the
   centripetal knot-spacing formula. A 2-waypoint path degenerates to an exact
@@ -125,11 +125,34 @@ Read the source for *what* exists. These are the decisions behind it.
   says "match existing behavior," that's a real technical preference for
   reusing the established mechanism, not an invitation to substitute something
   more rigorous.**
-- **Known, accepted limitation** at a `Line`↔`Spline` segment boundary: the
-  spline side's neighbour-derived tangent may not exactly match the line's
-  fixed direction — a small velocity-*direction* discontinuity (magnitude stays
-  continuous, from the shared scalar profile). Unbuilt fix: make the adjacent
-  spline tangent formula use the line's fixed direction.
+- **The path is G1, never G2 — and the straight-segment override was deleted
+  rather than fixed** (2026-07-26). Catmull-Rom is a **C1** construction:
+  adjacent segments agree on the tangent at a shared waypoint but not on the
+  second derivative, so *curvature steps at every waypoint* (measured: ±30–50%
+  on a 4-waypoint path). That's inherent to the family, not a bug.
+
+  `SegmentKind::Line` made it much worse — a measured **22.5°** velocity
+  *direction* discontinuity where a forced-line segment met a spline one. The
+  previously-recorded "unbuilt fix" (feed the line's direction into the
+  adjacent spline's tangent formula) **cannot work**: with centripetal knots
+  the junction tangent is proportional to `L·d + v`, so moving the phantom
+  along `d` rescales it without ever rotating it. That same algebra is why
+  `BufferMode::Blend` is inexact — one root cause, two symptoms.
+
+  The real fix is a different curve family — **Yuksel's C2 interpolating
+  splines**, roadmap item 8, which get C2 from the formulation rather than
+  from a tuned second-derivative rule, and carry exact straight segments and
+  circular arcs as first-class members. Sequenced *after* jerk-limited
+  profiles and curvature-limited feedrate, both worth more first. Until then
+  `WaypointPath` does exactly one thing — smooth splines through every
+  waypoint — and `SegmentKind` no longer exists.
+- **Nothing bounds centripetal acceleration.** `PathProfile` applies one
+  scalar `max_speed` over arc length; lateral acceleration is `v²κ` and is
+  unchecked. Measured κ ≈ 0.23 at 50 mm/s gives ≈ 567 mm/s² against a
+  `max_acceleration` of 200 — nearly 3× over, today. Curvature-limited
+  feedrate is the standard fix and is the next path-quality item worth
+  building. Note G2 would make that quantity *continuous*, not *bounded* —
+  these are separate problems.
 - **Path limits are a single scalar** max_speed/max_acceleration/
   max_deceleration over arc length. Per-axis limits projected onto the local
   path tangent is a deferred, harder follow-up.
@@ -180,10 +203,36 @@ Read the source for *what* exists. These are the decisions behind it.
 
 ### `app`
 
-- **Feedback is ground truth.** Each cycle the loop treats the backend's
-  returned `AxisFeedback` — not the raw trajectory sample — as each axis's
-  actual position/velocity. A new move's `start` is that actual position, never
-  the last commanded one. Every move-building path follows this rule.
+- **The model is ground truth for planning; feedback is for reporting**
+  (settled 2026-07-26, *reversing* an earlier "feedback is ground truth"
+  rule). `AxisRuntime` carries both: `position`/`velocity` from
+  `AxisFeedback`, and `commanded_position`/`commanded_velocity` — exactly
+  what was sent as last cycle's `AxisSetpoint`. **Every** profile is seeded
+  from commanded: a new move, an aborting redirect, a `StopRamp`, a queue
+  promotion, a group or path move's start state. An idle axis holds at its
+  commanded position, not wherever the servo settled, which is what keeps
+  the commanded stream continuous across the gap between moves.
+
+  Seeding from feedback injects a *step* into the commanded stream — end a
+  move commanding 100.000 with the axis actually at 99.980, seed the next
+  move from 99.980, and the commanded position jumps backward 0.020 mm in
+  one cycle. It also destroys repeatability (identical command sequences
+  produce different trajectories depending on measured error) and launders
+  following error into the plan instead of leaving it visible to the drive's
+  own following-error detection. Note `backend-sim` **hides** this class of
+  bug: it integrates commanded velocity and never chases commanded position,
+  so a position step shows up only as a target-vs-actual gap in viz.
+
+  Accepted consequence: if an axis physically can't keep up, the model runs
+  away from reality until the drive faults on following error. That fault is
+  the designed detector; masking it was the old rule's real cost.
+- **One resync point: non-operational → operational.** Coming back from
+  `Disabled`/`ErrorStop`, commanded is set from feedback, because while the
+  power stage was off the axis could have moved for reasons the model knows
+  nothing about. That single hook suffices because `axis_operational()`
+  gates every move/stop/promotion and both disable and fault land in one of
+  those two states — nothing can be commanded again without crossing it.
+  Homing will be the second such point when it exists.
 - **Layering rule (settled 2026-07-21):** business logic — move/stop rejection,
   queue promotion, `enable`/`disable`/`reset` gating — checks **`AxisState`
   only**, via the `axis_operational()` helper. Never branch on `Ds402State`.
@@ -216,6 +265,33 @@ Read the source for *what* exists. These are the decisions behind it.
 - **`group_pending` lives in `run_control_loop`, not `AxisRuntime`** —
   promoting a queued group move needs every member simultaneously idle, which
   doesn't fit inside any single axis's own state.
+- **Per-axis capability lives in `AXIS_CONFIGS`, not global constants**
+  (added 2026-07-26). Each axis carries its own max speed/accel/decel *in its
+  own units*, a display-only `units` label, and optional soft travel limits.
+  Single-axis `move`/`stop` defaults come from here; Cartesian group/path
+  moves keep the `DEFAULT_CARTESIAN_*` constants, since a TCP-space limit is
+  mm/s whatever kind of axes carry it out.
+
+  The motivating case wasn't the defaults, it was `cascade_group_stop`: it
+  used to reuse the group move's `max_deceleration`, which is *Cartesian*,
+  to build per-member `StopRamp`s in *joint* space. Identical while every
+  axis is linear; a silent unit error the moment a group has non-identity
+  kinematics — on the path that runs when something has already gone wrong.
+  `SharedGroupMove`/`SharedPathMove` no longer carry `max_deceleration` at
+  all.
+
+  One flat struct, deliberately not an enum over axis kinds: what differs
+  between a linear axis and a rotary joint is the numbers, a label, and
+  whether travel is bounded — not the operations, and `motion-core` is
+  unit-agnostic `f64` throughout. Add an `AxisKind` enum when some axis type
+  needs different *math* (continuous-rotation shortest-path wraparound, say),
+  not merely different values.
+- **`position_limits` is checked at the commanded endpoint only.** A
+  single-axis move target outside the range is rejected when the command is
+  accepted (so a `buffered` move fails where the user typed it, not later at
+  promotion). It says nothing about a path's interior, or about where a
+  group's Cartesian target lands in joint space — both need whole-path
+  plausibility checking, still unbuilt.
 - **Axis groups are hard-coded** (`AXIS_GROUPS`), not created/removed at
   runtime — deliberately simpler than PLCopen's real axis-group model. When a
   new feature needs a multi-axis target, reuse this table rather than
@@ -263,13 +339,56 @@ Read the source for *what* exists. These are the decisions behind it.
    not deployed to the Pi. See `app/CLAUDE.md` for the WSL renderer gotcha.
 6. Richer sim: second-order lag, position/following-error limits, faults;
    S-curve (jerk-limited) profiles.
-7. (Hardware later) `backend-ethercat`: EtherCRAB + CiA 402 state machine +
+7. **Curvature-limited feedrate.** Bound `v²κ` along a path instead of
+   applying one scalar `max_speed` regardless of how tight the curve is. Works
+   with the geometry we already have; the highest-value path-quality item.
+8. **C2 interpolating splines (Yuksel's class), replacing Catmull-Rom.**
+   Cem Yuksel, "A Class of C2 Interpolating Splines", *ACM TOG* 39(5) art. 160,
+   July 2020 — same author as the centripetal parameterization work this
+   module already rests on. Non-polynomial splines built by *trigonometric
+   blending* of an interpolation function through three consecutive control
+   points. Use the **circular** variant.
+
+   Why this and not quintic Hermite (the earlier plan, superseded 2026-07-26):
+   both give C2, interpolating, local support (4 points/segment), no global
+   solve. But quintic Hermite needs an *invented local rule for second
+   derivatives* at each waypoint, and this codebase already carries two
+   documented defects that trace to exactly that kind of heuristic (see the
+   `motion-core` continuity note). Yuksel's C2 falls out of the formulation
+   with nothing to tune. It also adds guarantees we cannot otherwise get:
+   **self-intersection-free segments** regardless of control point placement
+   (the paper notes centripetal Catmull-Rom — what we run today — is still
+   prone to these), plus **exact circular arcs and exact straight segments**
+   as first-class members of the same family, which is how `SegmentKind`
+   properly returns.
+
+   Sequenced after 6 and 7 deliberately: geometric C2 buys little while the
+   scalar profile is trapezoidal (acceleration already steps in time), and
+   continuity is not boundedness. It composes with 7 — constant-curvature
+   circular arcs make a curvature-limited feedrate trivial to compute.
+
+   Cost: non-polynomial, so transcendental evaluation per sample. Irrelevant
+   at 250 Hz; mildly relevant to the RP2350 aspiration, though not a new
+   problem in kind — `motion-core` already calls `f64::sqrt`, which equally
+   needs `libm` under `no_std`. Arc length still has no closed form, so the
+   per-segment LUT machinery is unaffected.
+
+   Separately, for *later*: Cai, Yang & You, "A Catmull-Rom Spline Based
+   Analytical C3 Continuous Tool Path Smoothing Method for Robotic Machining",
+   *Acta Mechanica et Automatica* 2025, DOI 10.2478/ama-2025-0088. Not an
+   alternative to the above — a different layer. Yuksel replaces the *curve
+   family* while keeping waypoints exactly interpolated; Cai replaces the
+   *waypoint semantics* (corner smoothing within a deviation tolerance, path
+   no longer passes through corners) to reach C3 jerk continuity. Revisit only
+   if jerk-continuous geometry becomes the binding constraint.
+9. (Hardware later) `backend-ethercat`: EtherCRAB + CiA 402 state machine +
    PDO mapping, behind the same `AxisGroup` trait.
 
 ## Known gaps / not built
 
-- Per-segment `SegmentKind::Line` override has no CLI syntax (the type
-  supports it; no command wires it).
+- No straight-segment override within a path. `SegmentKind` was removed
+  (2026-07-26) rather than left broken — see the `motion-core` section. It
+  returns with roadmap item 8.
 - `movepath` file format has no comment syntax.
 - The four real PLCopen blending variants (`BlendingLow`/`Previous`/`Next`/
   `High`) — a structurally different problem: they need a profile aware of an
