@@ -22,13 +22,21 @@
 //! - [`linear_move`] — straight-line moves across several axes.
 //! - [`waypoint_path`] — multi-waypoint spline paths.
 //! - [`path_profile`] — speed profile over a [`waypoint_path::WaypointPath`].
+//! - [`kinematics`] — the joint-space ↔ task-space seam.
 
+pub mod kinematics;
 pub mod linear_move;
 pub mod path_profile;
 pub mod trajectory;
 pub mod waypoint_path;
 
+pub use kinematics::{
+    IdentityKinematics, KinematicBranch, KinematicModel, KinematicVector, KinematicsError,
+    ScaraKinematics,
+};
 pub use linear_move::{LinearMove, LinearMoveError, LinearMoveSample, MAX_GROUP_AXES};
 pub use path_profile::{PathProfile, PathProfileError, PathSample};
-pub use trajectory::{MotionPhase, StopRamp, TrajectoryError, TrajectorySample, TrapezoidalProfile};
+pub use trajectory::{
+    MotionPhase, StopRamp, TrajectoryError, TrajectorySample, TrapezoidalProfile,
+};
 pub use waypoint_path::{WaypointPath, WaypointPathError};

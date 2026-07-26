@@ -42,8 +42,10 @@ over-produce; confirm direction at natural decision points.
    `NOTE (dt seam)` comment in `motion-core/src/trajectory.rs::sample`.
 4. **f64 in the core.** Real drives use integer encoder counts; that conversion
    is the backend's job at the hardware seam, not the planner's.
-5. **Kinematics is pluggable.** Start Cartesian (trivial), but keep the seam so
-   other kinematic models (e.g., 2-link arm) can drop in later.
+5. **Kinematics is pluggable** — and as of 2026-07-26 the seam is real, not
+   just anticipated: `motion_core::KinematicModel`, with `IdentityKinematics`
+   for Cartesian groups and `ScaraKinematics` for the 2-link arm on
+   `axisGroup1`.
 6. **Control rate: 250 Hz** (4 ms cycle) to start.
 
 ## Deployment context
@@ -156,6 +158,34 @@ Read the source for *what* exists. These are the decisions behind it.
 - **Path limits are a single scalar** max_speed/max_acceleration/
   max_deceleration over arc length. Per-axis limits projected onto the local
   path tangent is a deferred, harder follow-up.
+- **`kinematics` maps joint space ↔ task space, and forward is infallible
+  while inverse is not.** Every joint pose puts the tool somewhere; not
+  every task point is reachable, and the mapping can be locally degenerate.
+  `KinematicVector` is one type for all four roles (joint/task ×
+  position/velocity) because it is the same N-real-valued shape either way,
+  fixed-size and `Copy` for the same no-allocator reason as
+  `LinearMoveSample`.
+- **The IK solution branch is an opaque `KinematicBranch(u8)` token, not an
+  `Elbow` enum.** "Elbow up/down" is a SCARA concept, but the value is
+  stored and forwarded by model-agnostic `app` code, and an associated type
+  would break `dyn` object safety. `app` obtains one from `resolve_branch`
+  and hands it back to `inverse_position`, never interpreting it.
+- **`ScaraKinematics` bakes in a `q2_eff = q2 + π/2` home offset**, so raw
+  `(0, 0)` — where every axis starts — is "elbow bent 90°", not the fully
+  extended, singular textbook pose. **Raw `q2 = 0` does not mean "straight
+  arm."** The offset exists only inside FK/IK/Jacobian; everything outside
+  sees raw `q2`.
+- **The singularity predicate is `|sin(q2_eff)| < 0.05` (≈2.9° from straight
+  or fully folded), not `|det| < ε`.** `det = l1·l2·sin(q2_eff)` carries
+  units of length², so an absolute epsilon on it silently rescales with the
+  link lengths and has no natural value. Dividing `l1·l2` out leaves a
+  dimensionless test with a readable geometric meaning, at the same cost.
+  Understand its limit: it tests the **pose alone**. A near-singular
+  Jacobian loses rank in *one* direction, so this rejects some commands that
+  were realizable and — worse — accepts commands whose joint rates are
+  already unrealizable short of the threshold. Bounding the joint rate
+  itself needs per-axis limits, which `motion-core` must not know; that
+  check belongs in `app` (roadmap T3).
 
 ### `axis-backend`
 
@@ -292,6 +322,58 @@ Read the source for *what* exists. These are the decisions behind it.
   promotion). It says nothing about a path's interior, or about where a
   group's Cartesian target lands in joint space — both need whole-path
   plausibility checking, still unbuilt.
+- **Every group carries a `KinematicModel`, including Cartesian ones**
+  (added 2026-07-26). `axisGroup0`'s pair of linear stages uses
+  `IdentityKinematics`, so there is exactly **one** code path through the
+  move builders, the control loop and status/viz — never an
+  `if group.is_an_arm { … }` fork — and a Cartesian group is provably
+  unaffected (identity composed with identity is a no-op; verified
+  value-for-value against the pre-change binary). `IdentityKinematics`
+  carries its own `dof` rather than being a dof-agnostic unit struct, so
+  `main()`'s arity assertion means something for the one model where it
+  would be easiest to get wrong.
+- **A group move's profile is Cartesian end to end.** Kinematics converts
+  *into* it once at install (FK on the commanded joint state) and *out of
+  it* once per group per cycle (IK to joint setpoints). `LinearMove` and
+  `PathProfile` never learn that kinematics exists.
+- **The IK branch is resolved once per move, from commanded joints, and
+  held.** Stored on `SharedGroupMove`/`SharedPathMove`. Not per-*instance*:
+  a raw single-axis jog can put the arm on the other branch, and a
+  fixed-branch model would jump back to its own on the next move's first
+  cycle. Not per-*cycle*: "nearest solution to last cycle" makes IK's output
+  depend on its own previous output, breaking decision #3 (a sample at
+  `t = 0.348` would depend on the history that got there). Held per move, IK
+  stays a pure function of Cartesian position, and the branch persists
+  across moves *for free* — commanded joints came out of IK on that branch,
+  so re-resolving from them returns it again, until the enable-transition
+  resync, which is exactly when it should change.
+
+  **`backend-sim` cannot show you a branch bug**: it integrates commanded
+  velocity and never chases position, so an off-branch jump appears only as
+  a growing target-vs-actual gap. A real drive in CSP mode would fault on
+  following error immediately — severity is inverted between sim and
+  hardware.
+- **A runtime IK failure cascades into per-joint `StopRamp`s, and the
+  cascade must run *before* the setpoint pass, not after.** Holding position
+  next to a singularity is exactly what doesn't recover — zero velocity
+  there stays there — so every member ramps down independently in joint
+  space, which is singularity-free by construction. The ordering is not
+  cosmetic: each ramp starts from `commanded_velocity`, and the setpoint
+  pass is what overwrites it. Cascading afterwards builds every ramp from
+  the zero velocity that pass just wrote, i.e. an *instantaneous* stop —
+  the exact step discontinuity the model-chain rule exists to prevent,
+  delivered at the worst possible moment. Found by reading the printed ramp
+  durations (`0.000s`), not by a test.
+- **`cascade_group_stop` takes `except: Option<usize>` and a `reason`.**
+  `None` because an IK failure has no blaming axis — every member stops.
+- **`Profile::target()` is joint space for group members too** — the stored
+  IK of the Cartesian target, not the matching component of it. Those
+  coincide only under identity kinematics.
+- **SCARA joint values are radians**, not degrees (a deliberate deviation
+  from the plan, which said `units: "deg"`). `ScaraKinematics` does
+  trigonometry on these values directly and `motion-core` holds no unit
+  conversions, so degrees would mean a unit convention leaking into pure
+  math. `AXIS_CONFIGS` says `"rad"` and `move axis3 0.5` means 0.5 rad.
 - **Axis groups are hard-coded** (`AXIS_GROUPS`), not created/removed at
   runtime — deliberately simpler than PLCopen's real axis-group model. When a
   new feature needs a multi-axis target, reuse this table rather than
@@ -337,6 +419,14 @@ Read the source for *what* exists. These are the decisions behind it.
    require the GUI event loop on the main thread, which is why
    `run_control_loop` lives on a spawned thread. Viz is a dev tool, host-only,
    not deployed to the Pi. See `app/CLAUDE.md` for the WSL renderer gotcha.
+5b. [done] **Kinematics seam + SCARA** (tiers T0–T2 of the kinematics plan):
+   `KinematicModel`/`IdentityKinematics`/`ScaraKinematics`, install-time
+   FK/IK in the move builders, per-cycle IK in the control loop, and
+   `axisGroup1` = a 2-link arm on `axis2`/`axis3`. **T3 (a motion
+   plausibility planner: whole-path reachability/singularity checking and
+   joint-rate limiting, converting T2's reactive stops into up-front
+   rejections) and T4 (joint position limits, further models) are not
+   built** — see Known gaps.
 6. Richer sim: second-order lag, position/following-error limits, faults;
    S-curve (jerk-limited) profiles.
 7. **Curvature-limited feedrate.** Bound `v²κ` along a path instead of
@@ -386,6 +476,30 @@ Read the source for *what* exists. These are the decisions behind it.
 
 ## Known gaps / not built
 
+- **No preemptive mid-path reachability/singularity guarding** (kinematics
+  T3). Validation is install-time only — a group move's endpoint, and
+  *every* explicitly-given `movepath` waypoint — plus the reactive
+  cascade-stop above. Nothing checks the *interior* of a segment.
+- **No joint-rate limiting** (kinematics T3). `max_speed`/`max_acceleration`
+  bound Cartesian TCP motion; joint rate is `J⁻¹·ẋ`, so a perfectly legal
+  Cartesian command can demand an arbitrarily large joint rate well before
+  the pose-only `NearSingular` predicate trips. When it lands it goes in
+  `app`, not `motion-core` (it compares against `AXIS_CONFIGS[axis]
+  .max_speed`): the joint velocity vector is already in hand in the control
+  loop's per-group pass, so it's one comparison per axis per cycle routed
+  into the existing `cascade_group_stop`.
+- **The SCARA's equal links put a *reachable* singularity at the origin**
+  (kinematics T3). Equal links collapse the inner unreachable hole to a
+  point, so `r = 0` is reachable and a straight move from `(x, y)` to
+  `(−x, −y)` crosses it with both endpoints validating cleanly. The
+  user's explicit call, made with this understood: handle it reactively
+  rather than contorting the geometry (unequal links, or an artificial
+  `r_min` keep-out). Until T3, **"don't cross the origin" is a convention
+  enforced by test and demo target choice, not by the code.**
+- No joint *position* limits (kinematics T4) — `AXIS_CONFIGS` for the SCARA
+  joints has `position_limits: None`.
+- No redundant/reduced-DOF kinematic models; the design assumes
+  `dof() == axes.len()`.
 - No straight-segment override within a path. `SegmentKind` was removed
   (2026-07-26) rather than left broken — see the `motion-core` section. It
   returns with roadmap item 8.
@@ -410,6 +524,18 @@ one.
 
 **Verify interactive changes against the built binary** (`./target/debug/app`),
 not `cargo run` — there's a known piped-stdin timing gotcha.
+
+**Scripted/automated sessions run `--headless`** (no viz window) — that is the
+default for anything driven by a script rather than a person, and the only
+exception is a change that is specifically *about* the visualization. It isn't
+just tidier: the window needs a display server, dominates startup, and keeps
+the process alive after the control loop ends. Headless runs the identical
+control loop (recording included — the tap is at the `AxisGroup` seam and
+doesn't care whether anything draws it) on the main thread, so it verifies the
+same behavior. It also needs **no startup sleep**: the loop is running before
+the first piped command is drained, unlike the windowed path which wants ~2 s
+first. Per-command settling sleeps are still needed — `enable` takes 3 control
+cycles before a `move` will be accepted. See `scripts/demo_session.sh`.
 
 NEVER use sed, awk, or cat to read or edit files. Always use the built-in
 Read, Edit, and Write tools.

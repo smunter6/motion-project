@@ -20,7 +20,16 @@
 //!
 //! Run from the workspace root with:
 //!
-//!     cargo run -p app
+//!     cargo run -p app                 # terminal + viz window
+//!     cargo run -p app -- --headless   # terminal only, no window
+//!
+//! `--headless` skips the viz window entirely and runs the control loop on
+//! the main thread. It exists for scripted, non-interactive sessions —
+//! piping commands into stdin and reading the printed output back — where a
+//! GUI window is pure overhead and a liability: it needs a display server,
+//! it's the slowest part of startup, and it keeps the process alive after
+//! the control loop has ended. Everything except the plots behaves
+//! identically; see `scripts/demo_session.sh`.
 //!
 //! Commands (one per line on stdin):
 //!     move <axisN> <target_mm> [max_speed] [max_acceleration] [max_deceleration] [aborting|buffered]
@@ -82,8 +91,8 @@ use std::time::{Duration, Instant};
 use axis_backend::{AxisGroup, AxisSetpoint, AxisState, Ds402State};
 use backend_sim::SimAxisGroup;
 use motion_core::{
-    LinearMove, LinearMoveError, MotionPhase, PathProfile, PathProfileError,
-    StopRamp, TrajectoryError, TrapezoidalProfile,
+    LinearMove, LinearMoveError, MotionPhase, PathProfile, PathProfileError, StopRamp,
+    TrajectoryError, TrapezoidalProfile,
 };
 use recording::{History, RecordingAxisGroup};
 use viz::VizApp;
@@ -159,6 +168,29 @@ const AXIS_CONFIGS: &[AxisConfig] = &[
         units: "mm",
         position_limits: Some((-500.0, 500.0)),
     },
+    // axis2/axis3: the SCARA arm's shoulder and elbow (see
+    // `SCARA_KINEMATICS`). Rotary, and in **radians** — `ScaraKinematics`
+    // does trigonometry on these values directly, and `motion-core` has no
+    // unit conversions in it. So `move axis3 0.5` means 0.5 rad ≈ 28.6°.
+    //
+    // `position_limits: None` — joint travel limits are deferred (T4); the
+    // arm's real constraint today is workspace reachability, which the
+    // group move's install-time IK check covers, and which says nothing
+    // about a raw single-axis jog anyway.
+    AxisConfig {
+        max_speed: 2.0,
+        max_acceleration: 8.0,
+        max_deceleration: 8.0,
+        units: "rad",
+        position_limits: None,
+    },
+    AxisConfig {
+        max_speed: 2.0,
+        max_acceleration: 8.0,
+        max_deceleration: 8.0,
+        units: "rad",
+        position_limits: None,
+    },
 ];
 
 /// Rejects a single-axis move target outside the axis's soft travel limits.
@@ -185,7 +217,7 @@ const HISTORY_SECONDS: f64 = 60.0;
 /// Number of independent axes the app manages, named `axis0`..`axis{N-1}`
 /// on the command line. Bumping this is the only change needed to add more
 /// axes — everything else is `Vec`-driven.
-const NUM_AXES: usize = 2;
+const NUM_AXES: usize = 4;
 
 /// A hard-coded axis group: a named Cartesian pair/triple/etc. that can be
 /// driven by the same `enable`/`disable`/`reset`/`stop`/`move` commands as a
@@ -195,15 +227,56 @@ const NUM_AXES: usize = 2;
 struct AxisGroupDef {
     name: &'static str,
     axes: &'static [usize],
+    /// How this group's *task-space* (Cartesian) coordinates map to its
+    /// members' joint positions. Every group has one, including groups of
+    /// plain linear stages whose axes already are Cartesian coordinates —
+    /// those use `IdentityKinematics`, so there is exactly one code path
+    /// through the move builders, the control loop and status/viz rather
+    /// than a kinematic/non-kinematic fork.
+    ///
+    /// `&'static dyn` rather than a generic parameter: the table is
+    /// heterogeneous (different models per group) and the dispatch happens
+    /// once per group per cycle, which is nothing next to the trig it
+    /// guards.
+    kinematics: &'static dyn motion_core::KinematicModel,
 }
 
-/// `axisGroup0` = `axis0` (X) + `axis1` (Y), a Cartesian pair. Add more
+/// The pass-through model for 2-axis Cartesian groups. Carries its own DOF
+/// so `main()`'s arity assertion means something for identity groups too.
+static IDENTITY_KINEMATICS_2: motion_core::IdentityKinematics =
+    motion_core::IdentityKinematics::new(2);
+
+/// The 2-link planar arm driven by `axisGroup1`. Equal links, deliberately:
+/// unequal links would put the fold-back singularity on the boundary of an
+/// unreachable inner hole, where install-time rejection catches it for free,
+/// but equal links collapse that hole to a single point **at the origin** —
+/// so the singularity is reachable, and a straight move from `(x, y)` to
+/// `(-x, -y)` crosses it with both endpoints validating cleanly. That is
+/// handled reactively (the per-cycle `NearSingular` → cascade stop), not
+/// prevented; until whole-path plausibility checking exists, "don't cross
+/// the origin" is a convention that tests and demo targets observe, not a
+/// property of the geometry.
+static SCARA_KINEMATICS: motion_core::ScaraKinematics =
+    motion_core::ScaraKinematics::new(100.0, 100.0);
+
+/// `axisGroup0` = `axis0` (X) + `axis1` (Y), a Cartesian pair.
+/// `axisGroup1` = `axis2` (shoulder) + `axis3` (elbow), a SCARA arm — same
+/// commands, same Cartesian move semantics, different model. Add more
 /// entries here to define more groups; `main()` asserts every referenced
-/// axis index is `< NUM_AXES`.
-const AXIS_GROUPS: &[AxisGroupDef] = &[AxisGroupDef {
-    name: "axisGroup0",
-    axes: &[0, 1],
-}];
+/// axis index is `< NUM_AXES` and that each group's arity matches its
+/// kinematic model's DOF.
+const AXIS_GROUPS: &[AxisGroupDef] = &[
+    AxisGroupDef {
+        name: "axisGroup0",
+        axes: &[0, 1],
+        kinematics: &IDENTITY_KINEMATICS_2,
+    },
+    AxisGroupDef {
+        name: "axisGroup1",
+        axes: &[2, 3],
+        kinematics: &SCARA_KINEMATICS,
+    },
+];
 
 /// Dispatch policy for a move when the target is already busy. `Aborting`/
 /// `Buffered` apply to every move target (`move`/`movegroup`/`movepath`);
@@ -321,7 +394,24 @@ fn main() {
                 group.name
             );
         }
+        debug_assert_eq!(
+            group.kinematics.dof(),
+            group.axes.len(),
+            "AXIS_GROUPS[{}] has {} axes but its kinematic model has {} DOF",
+            group.name,
+            group.axes.len(),
+            group.kinematics.dof()
+        );
     }
+
+    let headless = match parse_args() {
+        Ok(headless) => headless,
+        Err(message) => {
+            eprintln!("{message}");
+            eprintln!("usage: app [--headless]");
+            std::process::exit(2);
+        }
+    };
 
     print_help();
 
@@ -330,6 +420,18 @@ fn main() {
 
     let capacity = (CONTROL_RATE_HZ * HISTORY_SECONDS) as usize;
     let history = Arc::new(Mutex::new(History::new(NUM_AXES, capacity)));
+
+    // Headless: no window, so the control loop runs right here on the main
+    // thread and the process ends when it does. `RecordingAxisGroup` still
+    // wraps the backend and still records — the recording tap is at the
+    // `AxisGroup` seam and has nothing to do with whether anything is
+    // drawing it, and keeping it means headless and windowed runs execute
+    // the identical loop, which is the point of the mode.
+    if headless {
+        run_control_loop(rx, history);
+        return;
+    }
+
     // Set once the control loop exits (via `quit` or stdin EOF) — the viz
     // window has no controls of its own, so this is its cue to close too.
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -363,6 +465,28 @@ fn main() {
         Box::new(move |_cc| Ok(Box::new(VizApp::new(history, shutdown, NUM_AXES)))),
     )
     .expect("failed to run viz window");
+}
+
+/// Reads the one command-line flag this app has: `--headless`. Returns
+/// whether it was given, or an error message for anything else.
+///
+/// Hand-rolled rather than pulling in a CLI crate: it's one boolean, and
+/// `app` is the only crate here with dependencies at all — adding an
+/// argument parser for this would be the most-dependencies-per-feature
+/// change in the workspace. Revisit if a third flag ever shows up.
+///
+/// Unknown arguments are an error, not ignored: a scripted session that
+/// typos `--headles` should fail loudly rather than silently opening a
+/// window nobody is watching and then hanging.
+fn parse_args() -> Result<bool, String> {
+    let mut headless = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--headless" => headless = true,
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(headless)
 }
 
 /// Blocks on stdin, parsing one command per line and forwarding it to the
@@ -467,10 +591,7 @@ fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>
     // deg/s, not mm/s); a group move is Cartesian and defaults to the
     // TCP-space constants. See `AxisConfig`.
     let defaults = match target {
-        Target::Axis(a) => (
-            AXIS_CONFIGS[a].max_speed,
-            AXIS_CONFIGS[a].max_acceleration,
-        ),
+        Target::Axis(a) => (AXIS_CONFIGS[a].max_speed, AXIS_CONFIGS[a].max_acceleration),
         Target::Group(_) => (
             DEFAULT_CARTESIAN_MAX_SPEED,
             DEFAULT_CARTESIAN_MAX_ACCELERATION,
@@ -513,7 +634,7 @@ fn parse_move_path(target: &str, rest: &[&str], line: &str) -> Result<Option<Com
         Target::Axis(_) => {
             return Err(format!(
                 "movepath requires a group target, not a single axis: {line:?}"
-            ))
+            ));
         }
         Target::Group(g) => g,
     };
@@ -553,7 +674,10 @@ fn parse_move_path_inline(
         ));
     }
     let (coords, rest) = rest.split_at(coord_total);
-    let flat: Vec<f64> = coords.iter().map(|c| parse_f64(c)).collect::<Result<_, _>>()?;
+    let flat: Vec<f64> = coords
+        .iter()
+        .map(|c| parse_f64(c))
+        .collect::<Result<_, _>>()?;
     let waypoints: Vec<Vec<f64>> = flat.chunks(coord_count).map(|c| c.to_vec()).collect();
 
     let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
@@ -813,6 +937,15 @@ fn print_help() {
     cmd_line("help", "show this message");
     cmd_line("quit", "exit");
     println!();
+    // Worth saying explicitly now that a group's coordinates and its
+    // members' units genuinely differ, rather than coinciding as they do
+    // for a Cartesian group.
+    println!("  a group move's coordinates are Cartesian (mm); a single-axis");
+    println!("  move is raw joint space in that axis's own units:");
+    for (axis, config) in AXIS_CONFIGS.iter().enumerate() {
+        println!("    {}: {}", axis_label(axis), config.units);
+    }
+    println!();
 }
 
 /// State shared by every member of an active group move: the underlying
@@ -825,10 +958,33 @@ fn print_help() {
 /// used to, for `cascade_group_stop` to reuse, but that value is Cartesian
 /// and the cascade's ramps are built in joint space, so each sibling now
 /// decelerates at its own `AxisConfig::max_deceleration` instead.
+///
+/// The profile itself is entirely **Cartesian** — kinematics converts into
+/// it once at install (start state) and out of it once per cycle (setpoints).
 struct SharedGroupMove {
     profile: LinearMove,
     axes: &'static [usize],
     group: usize,
+    /// Which IK solution branch this move runs on, resolved once from the
+    /// group's *commanded* joint pose at install and then held for the
+    /// move's whole duration.
+    ///
+    /// Per-move, not per-instance and not per-cycle. Per-instance would
+    /// fight raw single-axis jogging: jog a joint into the other branch and
+    /// a fixed-branch model jumps back to its own on the next move's first
+    /// cycle. Per-*cycle* reselection ("nearest solution to last cycle")
+    /// would make IK's output depend on its own previous output, breaking
+    /// the "trajectory is a pure function of elapsed time" rule. Held here,
+    /// IK stays a pure function of Cartesian position for the whole move,
+    /// and the branch persists across moves for free: commanded joints came
+    /// out of IK on this branch, so resolving from them next time returns
+    /// it again.
+    branch: motion_core::KinematicBranch,
+    /// The move's endpoint in **joint** space — IK of the Cartesian target
+    /// on `branch`, computed at install as the reachability check. Kept so
+    /// `status` can report each member's own target instead of a Cartesian
+    /// coordinate that means nothing for a rotary joint.
+    joint_target: motion_core::KinematicVector,
 }
 
 /// The path-move analog of `SharedGroupMove` — same shape (a shared
@@ -842,6 +998,12 @@ struct SharedPathMove {
     profile: PathProfile,
     axes: &'static [usize],
     group: usize,
+    /// Same role as `SharedGroupMove::branch` — see there.
+    branch: motion_core::KinematicBranch,
+    /// Same role as `SharedGroupMove::joint_target` — IK of the *final*
+    /// waypoint. The intermediate waypoints are IK'd at install too, as a
+    /// reachability check, but only the endpoint is worth keeping.
+    joint_target: motion_core::KinematicVector,
 }
 
 /// Whichever motion profile is currently driving an axis: a commanded
@@ -900,12 +1062,29 @@ impl Profile {
         }
     }
 
+    /// This axis's own endpoint, always in **joint** space — which for a
+    /// group/path member means the stored IK of the Cartesian target, not
+    /// the Cartesian target's matching component. Those coincide only under
+    /// identity kinematics; on an arm the Cartesian target is millimetres
+    /// and this axis is a rotary joint.
     fn target(&self) -> f64 {
         match self {
             Profile::Move(p) => p.target(),
             Profile::Stop(p) => p.target(),
-            Profile::Group { shared, index } => shared.profile.target()[*index],
-            Profile::Path { shared, index } => shared.profile.target()[*index],
+            Profile::Group { shared, index } => shared.joint_target.as_slice()[*index],
+            Profile::Path { shared, index } => shared.joint_target.as_slice()[*index],
+        }
+    }
+
+    /// `(group index, this axis's position within the group)` for a group or
+    /// path move — the control loop's key into its per-group cache of
+    /// IK-converted joint setpoints. `None` for a single-axis profile, which
+    /// is already joint-space and needs no conversion.
+    fn group_and_index(&self) -> Option<(usize, usize)> {
+        match self {
+            Profile::Group { shared, index } => Some((shared.group, *index)),
+            Profile::Path { shared, index } => Some((shared.group, *index)),
+            _ => None,
         }
     }
 
@@ -983,6 +1162,46 @@ impl ActiveGroupMove {
         }
     }
 
+    /// This move's Cartesian `(position, velocity)` at `t`, plus the IK
+    /// branch it was installed on — everything the control loop needs to
+    /// convert one shared task-space sample into joint setpoints, from
+    /// either profile type.
+    ///
+    /// Infallible in the vector construction: both profiles sample within
+    /// `MAX_GROUP_AXES` and produce finite values from finite inputs, which
+    /// the install-time construction already guaranteed.
+    fn sample(
+        &self,
+        t: f64,
+    ) -> (
+        motion_core::KinematicVector,
+        motion_core::KinematicVector,
+        motion_core::KinematicBranch,
+    ) {
+        let (position, velocity, branch) = match self {
+            ActiveGroupMove::Group(s) => {
+                let sample = s.profile.sample(t);
+                (
+                    motion_core::KinematicVector::from_slice(sample.position()),
+                    motion_core::KinematicVector::from_slice(sample.velocity()),
+                    s.branch,
+                )
+            }
+            ActiveGroupMove::Path(s) => {
+                let sample = s.profile.sample(t);
+                (
+                    motion_core::KinematicVector::from_slice(sample.position()),
+                    motion_core::KinematicVector::from_slice(sample.velocity()),
+                    s.branch,
+                )
+            }
+        };
+        (
+            position.expect("profile sample is always a valid kinematic vector"),
+            velocity.expect("profile sample is always a valid kinematic vector"),
+            branch,
+        )
+    }
 
     /// Whether `profile` is still actively driven by *this specific* shared
     /// move instance (identity, via `Rc::ptr_eq` within the matching
@@ -1026,11 +1245,18 @@ fn group_of(profile: &Profile) -> Option<ActiveGroupMove> {
 /// double-interruption-in-the-same-cycle and asymmetric disable/fault
 /// timing between members both come out correct rather than double-firing
 /// or clobbering unrelated state.
+/// `except` is the axis that caused the interruption and has already been
+/// given its own new profile — `None` when nothing is to blame in
+/// particular and *every* member should be stopped, which is what a runtime
+/// IK failure does. `reason` is the parenthetical in each member's stop
+/// message, so a kinematic failure doesn't report itself as an ordinary
+/// group interruption.
 fn cascade_group_stop(
     axes: &mut [AxisRuntime],
     group_pending: &mut [VecDeque<PendingGroupMove>],
     shared: &ActiveGroupMove,
-    except: usize,
+    except: Option<usize>,
+    reason: &str,
 ) {
     // A group/path move missing one of its members no longer means
     // anything, so neither do any of *its own* queued follow-up moves —
@@ -1043,7 +1269,7 @@ fn cascade_group_stop(
         // this ramp is built in joint space — see `AxisConfig`.
         let decel = AXIS_CONFIGS[other].max_deceleration;
         let units = AXIS_CONFIGS[other].units;
-        if other == except {
+        if Some(other) == except {
             continue;
         }
         let still_in_this_move = match &axes[other].active {
@@ -1060,7 +1286,7 @@ fn cascade_group_stop(
             move |position, velocity| {
                 let ramp = StopRamp::new(position, velocity, decel)?;
                 println!(
-                    "  -> {}: stopping (group interrupted): {:.3} {units}/s -> 0 (decel {decel:.3} {units}/s^2, {:.3}s)",
+                    "  -> {}: stopping ({reason}): {:.3} {units}/s -> 0 (decel {decel:.3} {units}/s^2, {:.3}s)",
                     axis_label(other),
                     velocity,
                     ramp.duration()
@@ -1071,9 +1297,69 @@ fn cascade_group_stop(
     }
 }
 
+/// Gathers one value per group member into a `KinematicVector` — the
+/// commanded joint position or velocity, ready to hand to the group's
+/// kinematic model. Fails only on a non-finite value or an over-long group,
+/// both of which `KinematicVector::from_slice` checks.
+fn commanded_vector(
+    axes: &[AxisRuntime],
+    members: &[usize],
+    field: impl Fn(&AxisRuntime) -> f64,
+) -> Result<motion_core::KinematicVector, motion_core::KinematicsError> {
+    let values: Vec<f64> = members.iter().map(|&a| field(&axes[a])).collect();
+    motion_core::KinematicVector::from_slice(&values)
+}
+
+/// Why a group or path move couldn't be installed: either the profile
+/// construction rejected the geometry/limits, or the kinematic model
+/// rejected the target (unreachable, or a dimension mismatch that means the
+/// group and its model disagree on arity).
+///
+/// One enum over all three because the call sites only ever print whichever
+/// they got — they already funnelled `LinearMoveError` and
+/// `PathProfileError` through `.to_string()` for exactly that reason.
+#[derive(Debug)]
+enum GroupMoveError {
+    LinearMove(LinearMoveError),
+    Path(PathProfileError),
+    Kinematics(motion_core::KinematicsError),
+}
+
+impl std::fmt::Display for GroupMoveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GroupMoveError::LinearMove(e) => write!(f, "{e}"),
+            GroupMoveError::Path(e) => write!(f, "{e}"),
+            GroupMoveError::Kinematics(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<LinearMoveError> for GroupMoveError {
+    fn from(e: LinearMoveError) -> Self {
+        GroupMoveError::LinearMove(e)
+    }
+}
+
+impl From<PathProfileError> for GroupMoveError {
+    fn from(e: PathProfileError) -> Self {
+        GroupMoveError::Path(e)
+    }
+}
+
+impl From<motion_core::KinematicsError> for GroupMoveError {
+    fn from(e: motion_core::KinematicsError) -> Self {
+        GroupMoveError::Kinematics(e)
+    }
+}
+
 /// Attempts to build a `LinearMove` for `group`'s `members` from their
 /// current *commanded* position/velocity (see
-/// `AxisRuntime::commanded_position`), and — only on success — installs it
+/// `AxisRuntime::commanded_position`), mapped through the group's kinematic
+/// model into Cartesian task space — the profile it builds is Cartesian
+/// throughout, and the per-cycle inverse conversion back to joint setpoints
+/// happens in the control loop. Only on success — including the target's
+/// reachability, checked by a dry-run `inverse_position` — installs it
 /// atomically as `Profile::Group` on every member (also clearing each
 /// member's own individual pending queue, same as `abort_into`). On
 /// failure nothing is touched, so a rejected group move never leaves one
@@ -1092,15 +1378,26 @@ fn install_group_move(
     max_speed: f64,
     max_acceleration: f64,
     max_deceleration: f64,
-) -> Result<f64, LinearMoveError> {
-    let starts: Vec<f64> = members.iter().map(|&a| axes[a].commanded_position).collect();
-    let velocities: Vec<f64> = members
-        .iter()
-        .map(|&a| axes[a].commanded_velocity)
-        .collect();
+) -> Result<f64, GroupMoveError> {
+    let model = AXIS_GROUPS[group].kinematics;
+    let joint_start = commanded_vector(axes, members, |ax| ax.commanded_position)?;
+    let joint_velocity = commanded_vector(axes, members, |ax| ax.commanded_velocity)?;
+
+    // Branch first, from the commanded joint pose — everything below is
+    // built on it, including the target's reachability check.
+    let branch = model.resolve_branch(joint_start);
+    let start = model.forward_position(joint_start);
+    let start_velocity = model.forward_velocity(joint_start, joint_velocity);
+
+    // Dry-run IK on the target before building anything: an unreachable or
+    // singular endpoint is rejected here, where the user typed it, rather
+    // than surfacing mid-move as a cascade stop.
+    let joint_target =
+        model.inverse_position(motion_core::KinematicVector::from_slice(&targets)?, branch)?;
+
     let profile = LinearMove::new_with_start_velocity(
-        starts,
-        velocities,
+        start.as_slice().to_vec(),
+        start_velocity.as_slice().to_vec(),
         targets,
         max_speed,
         max_acceleration,
@@ -1111,6 +1408,8 @@ fn install_group_move(
         profile,
         axes: members,
         group,
+        branch,
+        joint_target,
     });
     for (index, &axis) in members.iter().enumerate() {
         let ax = &mut axes[axis];
@@ -1154,26 +1453,36 @@ fn install_path_move_impl(
     max_speed: f64,
     max_acceleration: f64,
     max_deceleration: f64,
-    build: impl FnOnce(
-        Vec<Vec<f64>>,
-        Vec<f64>,
-        f64,
-        f64,
-        f64,
-    ) -> Result<PathProfile, PathProfileError>,
-) -> Result<f64, PathProfileError> {
-    let start: Vec<f64> = members.iter().map(|&a| axes[a].commanded_position).collect();
-    let velocities: Vec<f64> = members
-        .iter()
-        .map(|&a| axes[a].commanded_velocity)
-        .collect();
+    build: impl FnOnce(Vec<Vec<f64>>, Vec<f64>, f64, f64, f64) -> Result<PathProfile, PathProfileError>,
+) -> Result<f64, GroupMoveError> {
+    let model = AXIS_GROUPS[group].kinematics;
+    let joint_start = commanded_vector(axes, members, |ax| ax.commanded_position)?;
+    let joint_velocity = commanded_vector(axes, members, |ax| ax.commanded_velocity)?;
+
+    let branch = model.resolve_branch(joint_start);
+    let start = model.forward_position(joint_start);
+    let start_velocity = model.forward_velocity(joint_start, joint_velocity);
+
+    // Every explicitly-given waypoint is IK'd up front, not just the final
+    // target: a few extra calls, once, at install time, and an obviously
+    // unreachable path is rejected before it starts rather than cascading
+    // to a stop somewhere in the middle of it. All on the one resolved
+    // branch — a path that would need the elbow to flip partway isn't a
+    // path this can run. Says nothing about the *interior* of a segment;
+    // that needs whole-path plausibility checking, still unbuilt.
+    let mut joint_target = joint_start;
+    for waypoint in &waypoints {
+        joint_target =
+            model.inverse_position(motion_core::KinematicVector::from_slice(waypoint)?, branch)?;
+    }
+
     let mut all_waypoints = Vec::with_capacity(waypoints.len() + 1);
-    all_waypoints.push(start);
+    all_waypoints.push(start.as_slice().to_vec());
     all_waypoints.extend(waypoints);
 
     let profile = build(
         all_waypoints,
-        velocities,
+        start_velocity.as_slice().to_vec(),
         max_speed,
         max_acceleration,
         max_deceleration,
@@ -1183,6 +1492,8 @@ fn install_path_move_impl(
         profile,
         axes: members,
         group,
+        branch,
+        joint_target,
     });
     for (index, &axis) in members.iter().enumerate() {
         let ax = &mut axes[axis];
@@ -1209,7 +1520,7 @@ fn install_path_move(
     max_speed: f64,
     max_acceleration: f64,
     max_deceleration: f64,
-) -> Result<f64, PathProfileError> {
+) -> Result<f64, GroupMoveError> {
     install_path_move_impl(
         axes,
         group,
@@ -1232,7 +1543,7 @@ fn install_path_move_blended(
     max_speed: f64,
     max_acceleration: f64,
     max_deceleration: f64,
-) -> Result<f64, PathProfileError> {
+) -> Result<f64, GroupMoveError> {
     install_path_move_impl(
         axes,
         group,
@@ -1494,11 +1805,12 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                 ) {
                     Ok(profile) => {
                         println!(
-                            "  -> {}: starting queued move: {:.3} -> {:.3} mm ({:.3}s)",
+                            "  -> {}: starting queued move: {:.3} -> {:.3} {units} ({:.3}s)",
                             axis_label(i),
                             ax.commanded_position,
                             p.target,
-                            profile.duration()
+                            profile.duration(),
+                            units = AXIS_CONFIGS[i].units
                         );
                         ax.active = Some(ActiveMove {
                             profile: Profile::Move(profile),
@@ -1588,6 +1900,96 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             }
         }
 
+        // 1c. Kinematics, once per active group: sample the group's shared
+        //     *Cartesian* profile and convert it into joint position and
+        //     velocity for its members. Done here, ahead of the per-axis
+        //     setpoint pass, for two reasons — the conversion is per group,
+        //     not per axis (an arm's joint 1 setpoint depends on the whole
+        //     Cartesian point, not on one coordinate of it), and every
+        //     member is then sampled at exactly the same instant rather than
+        //     each at its own `elapsed()`.
+        //
+        //     Under `IdentityKinematics` this is a pass-through, so a
+        //     Cartesian group's setpoints are unchanged.
+        //
+        //     The branch comes from the move — resolved once at install,
+        //     never re-resolved here. See `SharedGroupMove::branch`.
+        let mut group_joint: Vec<
+            Option<(motion_core::KinematicVector, motion_core::KinematicVector)>,
+        > = vec![None; AXIS_GROUPS.len()];
+        // A failed conversion can't cascade from inside this pass (that
+        // needs `&mut` across the whole slice), so failures are collected
+        // and applied after the setpoint map — the same collect-then-apply
+        // shape the feedback fold below already uses.
+        let mut ik_failures: Vec<(ActiveGroupMove, String)> = Vec::new();
+        for (g, group) in AXIS_GROUPS.iter().enumerate() {
+            // Any member driving this group's move is a valid
+            // representative — they share one profile and one start
+            // instant, and only one shared move per group can be live at a
+            // time (installing a new one replaces every member; a cascade
+            // clears every member that's left).
+            let Some(shared) = group
+                .axes
+                .iter()
+                .find_map(|&axis| match &axes[axis].active {
+                    Some(mv) => match group_of(&mv.profile) {
+                        Some(shared) if shared.group() == g => Some((shared, mv.started_at)),
+                        _ => None,
+                    },
+                    None => None,
+                })
+            else {
+                continue;
+            };
+            let (shared, started_at) = shared;
+            let elapsed = started_at.elapsed().as_secs_f64();
+            let (cartesian_position, cartesian_velocity, branch) = shared.sample(elapsed);
+
+            let model = group.kinematics;
+            let converted =
+                model
+                    .inverse_position(cartesian_position, branch)
+                    .and_then(|joint_position| {
+                        let joint_velocity =
+                            model.inverse_velocity(joint_position, cartesian_velocity)?;
+                        Ok((joint_position, joint_velocity))
+                    });
+            match converted {
+                Ok(pair) => group_joint[g] = Some(pair),
+                // Holding position next to a singularity is exactly what
+                // doesn't recover — zero velocity there stays there. Every
+                // member ramps down independently in joint space instead,
+                // which is singularity-free by construction.
+                Err(e) => ik_failures.push((shared, format!("kinematics failed: {e}"))),
+            }
+        }
+
+        // 1d. Apply any kinematic failure from 1c, *before* this cycle's
+        //     setpoints are built. Ordering matters and is not arbitrary:
+        //     each member's `StopRamp` starts from its `commanded_velocity`,
+        //     and the setpoint pass below is what overwrites that. Cascade
+        //     after it and every ramp starts from the zero velocity the
+        //     failing cycle just wrote — an instantaneous stop, which is the
+        //     step discontinuity the whole model-chain rule exists to
+        //     prevent, delivered at the worst possible moment. Cascading
+        //     first, the ramps are installed with `started_at` = now, and
+        //     the setpoint pass samples them at t ~= 0, which is exactly the
+        //     velocity the group was already commanding.
+        //
+        //     `except: None` — nothing is to blame in particular, so every
+        //     member ramps down. Double-firing is already guarded by
+        //     `still_drives`.
+        for (shared, reason) in ik_failures {
+            println!("  ! {}: {reason}", group_label(shared.group()));
+            cascade_group_stop(
+                &mut axes,
+                &mut group_pending,
+                &shared,
+                None,
+                "kinematics failed",
+            );
+        }
+
         // 2. Build this cycle's commanded setpoint for every axis: sample
         //    the active trajectory if there is one, otherwise hold at the
         //    axis's last *commanded* position with zero velocity.
@@ -1606,17 +2008,49 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                 // in this cycle's setpoint and must not repeat next cycle.
                 let fault_reset = std::mem::take(&mut ax.pending_fault_reset);
                 let setpoint = match &ax.active {
-                    Some(mv) => {
-                        let elapsed = mv.started_at.elapsed().as_secs_f64();
-                        let sample = mv.profile.sample(elapsed);
-                        AxisSetpoint {
-                            position: sample.position,
-                            velocity: sample.velocity,
-                            enabled: ax.want_enabled,
-                            fault_reset,
-                            stopping: mv.profile.is_stop(),
+                    // A group/path member takes its component from the
+                    // joint vector computed once for the whole group in
+                    // step 1c, rather than sampling the shared Cartesian
+                    // profile itself — that sample is task-space, and only
+                    // under identity kinematics is component `index` of it
+                    // also this axis's setpoint.
+                    Some(mv) => match mv.profile.group_and_index() {
+                        Some((g, index)) => match &group_joint[g] {
+                            Some((position, velocity)) => AxisSetpoint {
+                                position: position.as_slice()[index],
+                                velocity: velocity.as_slice()[index],
+                                enabled: ax.want_enabled,
+                                fault_reset,
+                                stopping: mv.profile.is_stop(),
+                            },
+                            // Kinematics failed for this group and the
+                            // cascade in 1d couldn't even build this axis a
+                            // stop ramp (so it's still pointed at the dead
+                            // group move). Command what an idle axis
+                            // commands: hold at commanded
+                            // position, zero velocity. (Holding at
+                            // *feedback* would inject a step discontinuity
+                            // at the worst possible moment.)
+                            None => AxisSetpoint {
+                                position: ax.commanded_position,
+                                velocity: 0.0,
+                                enabled: ax.want_enabled,
+                                fault_reset,
+                                stopping: false,
+                            },
+                        },
+                        None => {
+                            let elapsed = mv.started_at.elapsed().as_secs_f64();
+                            let sample = mv.profile.sample(elapsed);
+                            AxisSetpoint {
+                                position: sample.position,
+                                velocity: sample.velocity,
+                                enabled: ax.want_enabled,
+                                fault_reset,
+                                stopping: mv.profile.is_stop(),
+                            }
                         }
-                    }
+                    },
                     None => AxisSetpoint {
                         position: ax.commanded_position,
                         velocity: 0.0,
@@ -1743,9 +2177,19 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
 
                 if phase == MotionPhase::Done {
                     if mv.profile.is_stop() {
-                        println!("  -> {}: stopped at {:.3} mm", axis_label(i), ax.position);
+                        println!(
+                            "  -> {}: stopped at {:.3} {}",
+                            axis_label(i),
+                            ax.position,
+                            AXIS_CONFIGS[i].units
+                        );
                     } else {
-                        println!("  -> {}: reached {:.3} mm", axis_label(i), ax.position);
+                        println!(
+                            "  -> {}: reached {:.3} {}",
+                            axis_label(i),
+                            ax.position,
+                            AXIS_CONFIGS[i].units
+                        );
                     }
                     ax.active = None;
                     ax.last_phase = None;
@@ -1757,11 +2201,12 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             || now.duration_since(ax.last_status_print) >= STATUS_PRINT_PERIOD)
                     {
                         println!(
-                            "     {}  t={elapsed:>6.3}s  pos={:>9.3} mm  vel={:>8.3} mm/s  {}",
+                            "     {}  t={elapsed:>6.3}s  pos={:>9.3} {units}  vel={:>8.3} {units}/s  {}",
                             axis_label(i),
                             ax.position,
                             ax.velocity,
-                            phase_label(phase)
+                            phase_label(phase),
+                            units = AXIS_CONFIGS[i].units
                         );
                         ax.last_status_print = now;
                     }
@@ -1773,7 +2218,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
         // Apply any group cascades collected above, now that the borrow
         // from `axes.iter_mut()` has ended.
         for (shared, faulted_axis) in group_cascades {
-            cascade_group_stop(&mut axes, &mut group_pending, &shared, faulted_axis);
+            cascade_group_stop(
+                &mut axes,
+                &mut group_pending,
+                &shared,
+                Some(faulted_axis),
+                "group interrupted",
+            );
         }
 
         // 5. Drain any commands that arrived since the last tick.
@@ -1825,10 +2276,11 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                         max_deceleration,
                                     )?;
                                     println!(
-                                        "  -> {}: move (aborting): {:.3} -> {target:.3} mm ({:.3}s)",
+                                        "  -> {}: move (aborting): {:.3} -> {target:.3} {units} ({:.3}s)",
                                         axis_label(axis),
                                         position,
-                                        profile.duration()
+                                        profile.duration(),
+                                        units = AXIS_CONFIGS[axis].units
                                     );
                                     Ok(Profile::Move(profile))
                                 });
@@ -1837,7 +2289,8 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                         &mut axes,
                                         &mut group_pending,
                                         &shared,
-                                        axis,
+                                        Some(axis),
+                                        "group interrupted",
                                     );
                                 }
                             }
@@ -1851,10 +2304,11 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                 ) {
                                     Ok(profile) => {
                                         println!(
-                                            "  -> {}: move: {:.3} -> {target:.3} mm ({:.3}s)",
+                                            "  -> {}: move: {:.3} -> {target:.3} {units} ({:.3}s)",
                                             axis_label(axis),
                                             ax.commanded_position,
-                                            profile.duration()
+                                            profile.duration(),
+                                            units = AXIS_CONFIGS[axis].units
                                         );
                                         ax.active = Some(ActiveMove {
                                             profile: Profile::Move(profile),
@@ -1868,9 +2322,10 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             }
                             BufferMode::Buffered => {
                                 println!(
-                                    "  -> {}: busy: queuing move to {target:.3} mm ({} already queued)",
+                                    "  -> {}: busy: queuing move to {target:.3} {units} ({} already queued)",
                                     axis_label(axis),
-                                    ax.pending.len()
+                                    ax.pending.len(),
+                                    units = AXIS_CONFIGS[axis].units
                                 );
                                 ax.pending.push_back(PendingMove {
                                     target,
@@ -1895,7 +2350,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         .and_then(|mv| group_of(&mv.profile));
                     handle_stop(&mut axes[axis], axis, max_deceleration);
                     if let Some(shared) = previous_group {
-                        cascade_group_stop(&mut axes, &mut group_pending, &shared, axis);
+                        cascade_group_stop(
+                            &mut axes,
+                            &mut group_pending,
+                            &shared,
+                            Some(axis),
+                            "group interrupted",
+                        );
                     }
                 }
                 Command::Enable { axis } => {
@@ -2110,20 +2571,25 @@ fn print_status(axes: &[AxisRuntime]) {
                     Some(name) => format!("  (group {name})"),
                     None => String::new(),
                 };
+                // `target()` is this axis's own joint-space endpoint — for
+                // a group member that's the stored IK of the Cartesian
+                // target, not one coordinate of it (see `Profile::target`).
                 println!(
-                    "  status: {}: pos={:.3} mm  vel={:.3} mm/s  {}  (target {:.3} mm)  [{:?}]{group_note}",
+                    "  status: {}: pos={:.3} {units}  vel={:.3} {units}/s  {}  (target {:.3} {units})  [{:?}]{group_note}",
                     axis_label(i),
                     ax.position,
                     ax.velocity,
                     phase_label(mv.profile.phase_at(elapsed)),
                     mv.profile.target(),
-                    ax.ds402_state
+                    ax.ds402_state,
+                    units = AXIS_CONFIGS[i].units
                 );
             }
             None => println!(
-                "  status: {}: idle at {:.3} mm  [{:?}]",
+                "  status: {}: idle at {:.3} {}  [{:?}]",
                 axis_label(i),
                 ax.position,
+                AXIS_CONFIGS[i].units,
                 ax.ds402_state
             ),
         }
@@ -2136,21 +2602,24 @@ fn print_status(axes: &[AxisRuntime]) {
         // same profile/timing) — both `LinearMove` and `PathProfile` expose
         // the same `phase_at`/`target` shape, so this extracts a common
         // (phase, target) pair regardless of which one is actually active.
-        let active = group.axes.iter().find_map(|&axis| match &axes[axis].active {
-            Some(mv) => {
-                let elapsed = mv.started_at.elapsed().as_secs_f64();
-                match &mv.profile {
-                    Profile::Group { shared, .. } if shared.group == g => {
-                        Some((shared.profile.phase_at(elapsed), shared.profile.target()))
+        let active = group
+            .axes
+            .iter()
+            .find_map(|&axis| match &axes[axis].active {
+                Some(mv) => {
+                    let elapsed = mv.started_at.elapsed().as_secs_f64();
+                    match &mv.profile {
+                        Profile::Group { shared, .. } if shared.group == g => {
+                            Some((shared.profile.phase_at(elapsed), shared.profile.target()))
+                        }
+                        Profile::Path { shared, .. } if shared.group == g => {
+                            Some((shared.profile.phase_at(elapsed), shared.profile.target()))
+                        }
+                        _ => None,
                     }
-                    Profile::Path { shared, .. } if shared.group == g => {
-                        Some((shared.profile.phase_at(elapsed), shared.profile.target()))
-                    }
-                    _ => None,
                 }
-            }
-            None => None,
-        });
+                None => None,
+            });
         match active {
             Some((phase, target)) => {
                 let target: Vec<String> = target.iter().map(|v| format!("{v:.3}")).collect();
@@ -2162,16 +2631,29 @@ fn print_status(axes: &[AxisRuntime]) {
                 );
             }
             None => {
-                let positions: Vec<String> = group
-                    .axes
-                    .iter()
-                    .map(|&axis| format!("{:.3}", axes[axis].position))
-                    .collect();
-                println!(
-                    "  status: {}: idle at [{}] mm",
-                    group.name,
-                    positions.join(", ")
-                );
+                // A group's position is its *TCP* position, so this is the
+                // members' measured joint positions run through forward
+                // kinematics — not the raw joint values, which are what the
+                // per-axis lines above already report. Identical for a
+                // Cartesian group; the whole point for an arm.
+                let joints: Vec<f64> = group.axes.iter().map(|&axis| axes[axis].position).collect();
+                let cartesian = motion_core::KinematicVector::from_slice(&joints)
+                    .map(|j| group.kinematics.forward_position(j));
+                match cartesian {
+                    Ok(p) => {
+                        let coords: Vec<String> =
+                            p.as_slice().iter().map(|v| format!("{v:.3}")).collect();
+                        println!(
+                            "  status: {}: idle at [{}] mm",
+                            group.name,
+                            coords.join(", ")
+                        );
+                    }
+                    // Only reachable if feedback itself went non-finite,
+                    // which would be a backend bug — report it rather than
+                    // printing a plausible-looking wrong number.
+                    Err(e) => println!("  status: {}: position unavailable: {e}", group.name),
+                }
             }
         }
     }
@@ -2197,9 +2679,12 @@ mod tests {
         assert_eq!(parse_axis("axis1"), Ok(1));
     }
 
+    // Phrased against NUM_AXES rather than a literal, so adding axes
+    // doesn't turn this into a false failure the way it just did.
     #[test]
     fn parse_axis_rejects_out_of_range() {
-        assert!(parse_axis("axis2").is_err());
+        assert!(parse_axis(&format!("axis{NUM_AXES}")).is_err());
+        assert!(parse_axis(&format!("axis{}", NUM_AXES + 7)).is_err());
     }
 
     #[test]

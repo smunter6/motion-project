@@ -3,6 +3,14 @@
 Loaded only when working under `app/`. Design rationale for the control loop,
 profiles, and group cascade lives in the root `CLAUDE.md`.
 
+## `--headless` sidesteps every gotcha below
+
+Everything on this page is about getting a GUI window to open under WSL. A
+scripted session doesn't need one: `./target/debug/app --headless` skips viz
+and runs the control loop on the main thread. Use it by default for anything
+automated; the notes below matter only when the change is about the
+visualization itself, or when a human wants to watch the plots.
+
 ## Viz renderer: use `glow`, not the default `wgpu`
 
 eframe's default `wgpu` renderer **fails at startup in this WSL setup**

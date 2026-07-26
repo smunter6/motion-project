@@ -37,6 +37,20 @@ fn state_label(state: AxisState, motion: MotionFlags) -> &'static str {
     }
 }
 
+/// A group's task-space (TCP) point from its members' joint values, via the
+/// group's own kinematic model — a pass-through for a Cartesian group, real
+/// forward kinematics for an arm. `None` if the values are rejected
+/// (non-finite feedback), in which case the sample is simply dropped from
+/// the plot rather than drawn somewhere wrong.
+///
+/// Two dimensions because only 2-axis groups get a plane plot (`egui_plot`
+/// is strictly 2D).
+fn tcp_xy(group: &crate::AxisGroupDef, joints: [f64; 2]) -> Option<[f64; 2]> {
+    let joints = motion_core::KinematicVector::from_slice(&joints).ok()?;
+    let point = group.kinematics.forward_position(joints);
+    Some([point.as_slice()[0], point.as_slice()[1]])
+}
+
 pub struct VizApp {
     history: Arc<Mutex<History>>,
     shutdown: Arc<AtomicBool>,
@@ -88,9 +102,17 @@ impl eframe::App for VizApp {
                         let (x_axis, y_axis) = (group.axes[0], group.axes[1]);
                         ui.vertical(|ui| {
                             ui.heading(format!(
-                                "{} (axis{x_axis} = X, axis{y_axis} = Y)",
+                                "{} — TCP X/Y (axis{x_axis}, axis{y_axis})",
                                 group.name
                             ));
+                            // Both streams are joint values in the History
+                            // buffer (that's what crosses the AxisGroup
+                            // seam), so each sample goes through forward
+                            // kinematics to become a point in the plane.
+                            // Identity for a Cartesian group — the axes
+                            // *are* X and Y — and the whole point for an
+                            // arm, whose joint angles plotted raw would
+                            // trace nothing meaningful.
                             Plot::new(format!("xy_plot_{}", group.name))
                                 .view_aspect(1.5)
                                 .height(220.0)
@@ -99,13 +121,23 @@ impl eframe::App for VizApp {
                                         .axis(x_axis)
                                         .iter()
                                         .zip(history.axis(y_axis).iter())
-                                        .map(|(a, b)| [a.setpoint.position, b.setpoint.position])
+                                        .filter_map(|(a, b)| {
+                                            tcp_xy(
+                                                group,
+                                                [a.setpoint.position, b.setpoint.position],
+                                            )
+                                        })
                                         .collect();
                                     let actual: PlotPoints = history
                                         .axis(x_axis)
                                         .iter()
                                         .zip(history.axis(y_axis).iter())
-                                        .map(|(a, b)| [a.feedback.position, b.feedback.position])
+                                        .filter_map(|(a, b)| {
+                                            tcp_xy(
+                                                group,
+                                                [a.feedback.position, b.feedback.position],
+                                            )
+                                        })
                                         .collect();
                                     plot_ui.line(Line::new("target", target));
                                     plot_ui.line(Line::new("actual", actual));
@@ -120,14 +152,17 @@ impl eframe::App for VizApp {
                             ui.group(|ui| {
                                 ui.set_min_width(160.0);
                                 ui.strong(format!("axis{axis}"));
+                                // Each axis labels itself in its own units —
+                                // a rotary joint must not print "mm".
+                                let units = crate::AXIS_CONFIGS[axis].units;
                                 match last {
                                     Some(s) => {
                                         ui.label(format!(
-                                            "position: {:8.3} mm",
+                                            "position: {:8.3} {units}",
                                             s.feedback.position
                                         ));
                                         ui.label(format!(
-                                            "velocity: {:8.3} mm/s",
+                                            "velocity: {:8.3} {units}/s",
                                             s.feedback.velocity
                                         ));
                                         ui.label(format!(
@@ -147,8 +182,8 @@ impl eframe::App for VizApp {
                                         }
                                     }
                                     None => {
-                                        ui.label("position:    0.000 mm");
-                                        ui.label("velocity:    0.000 mm/s");
+                                        ui.label(format!("position:    0.000 {units}"));
+                                        ui.label(format!("velocity:    0.000 {units}/s"));
                                         ui.label("status:   disabled");
                                     }
                                 }
@@ -172,9 +207,26 @@ impl eframe::App for VizApp {
                                         Some(s) => (s.feedback.position, s.feedback.velocity),
                                         None => (0.0, 0.0),
                                     };
+                                    let units = crate::AXIS_CONFIGS[axis].units;
                                     ui.label(format!(
-                                        "axis{axis}: {position:8.3} mm  {velocity:8.3} mm/s"
+                                        "axis{axis}: {position:8.3} {units}  {velocity:8.3} {units}/s"
                                     ));
+                                }
+                                // ...and the same members as one TCP point,
+                                // which is the only line here that means
+                                // the same thing across every kind of group.
+                                if group.axes.len() == 2 {
+                                    let joints = [
+                                        history.axis(group.axes[0]).back().map_or(0.0, |s| {
+                                            s.feedback.position
+                                        }),
+                                        history.axis(group.axes[1]).back().map_or(0.0, |s| {
+                                            s.feedback.position
+                                        }),
+                                    ];
+                                    if let Some([x, y]) = tcp_xy(group, joints) {
+                                        ui.weak(format!("TCP:   {x:8.3}, {y:8.3} mm"));
+                                    }
                                 }
                             });
                         }
@@ -187,8 +239,9 @@ impl eframe::App for VizApp {
                     for axis in 0..self.num_axes {
                         ui.vertical(|ui| {
                             ui.heading(format!("axis{axis}"));
+                            let units = crate::AXIS_CONFIGS[axis].units;
 
-                            ui.label("position (mm)");
+                            ui.label(format!("position ({units})"));
                             Plot::new(format!("pos_plot_{axis}"))
                                 .width(col_width)
                                 .height(160.0)
@@ -207,7 +260,7 @@ impl eframe::App for VizApp {
                                     plot_ui.line(Line::new("actual", actual));
                                 });
 
-                            ui.label("velocity (mm/s)");
+                            ui.label(format!("velocity ({units}/s)"));
                             Plot::new(format!("vel_plot_{axis}"))
                                 .width(col_width)
                                 .height(160.0)
