@@ -26,6 +26,12 @@ const VIZ_REFRESH_PERIOD: std::time::Duration = std::time::Duration::from_millis
 
 /// The drawn mechanism: warm and opaque, so it reads as a physical object
 /// on top of the two thin trace lines rather than as a third trace.
+/// Height of each per-axis time-series plot. Three of them per axis now
+/// (position, velocity, acceleration), so this is smaller than when there
+/// were two — the row still has to fit beside its neighbours without the
+/// column becoming a scroll of its own.
+const PLOT_HEIGHT: f32 = 140.0;
+
 const ARM_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 145, 45);
 const JOINT_COLOR: egui::Color32 = egui::Color32::from_rgb(250, 250, 250);
 
@@ -96,6 +102,31 @@ fn in_plot_order(points: impl Iterator<Item = [f64; 2]>) -> PlotPoints<'static> 
     let mut points: Vec<[f64; 2]> = points.collect();
     points.reverse();
     PlotPoints::from(points)
+}
+
+/// One time-series plot with a target and an actual trace — the shape every
+/// per-axis plot has.
+///
+/// `allow_scroll(false)` on all of them: scroll-to-pan fights the page's own
+/// scroll area, so a wheel gesture aimed at reaching the plots below would
+/// instead drag whichever plot the pointer happened to be over. Drag-to-pan
+/// and box-zoom still work.
+fn time_series_plot(
+    ui: &mut egui::Ui,
+    id: String,
+    width: f32,
+    height: f32,
+    target: PlotPoints<'static>,
+    actual: PlotPoints<'static>,
+) {
+    Plot::new(id)
+        .width(width)
+        .height(height)
+        .allow_scroll(false)
+        .show(ui, |plot_ui| {
+            plot_ui.line(Line::new("target", target));
+            plot_ui.line(Line::new("actual", actual));
+        });
 }
 
 /// The most recent *measured* joint values for a 2-axis group, or `None`
@@ -195,7 +226,10 @@ impl eframe::App for VizApp {
                             // trace nothing meaningful.
                             let plot = Plot::new(format!("xy_plot_{}", group.name))
                                 .view_aspect(1.5)
-                                .height(220.0);
+                                .height(220.0)
+                                // Same reason as the time-series plots —
+                                // see `time_series_plot`.
+                                .allow_scroll(false);
                             // A drawn mechanism needs equal scaling on both
                             // axes or its links change length as the plot
                             // rescales — a rigid arm that visibly stretches
@@ -259,8 +293,13 @@ impl eframe::App for VizApp {
                         });
                     }
 
+                    // Two columns, axes and groups, rather than one tall
+                    // stack of both: they answer different questions (what
+                    // each physical axis is doing vs. where each group's
+                    // TCP is), and stacked they made the row taller than
+                    // the plots beside them for no reason.
                     ui.vertical(|ui| {
-                        ui.heading("status");
+                        ui.heading("axes");
                         for axis in 0..self.num_axes {
                             let last = history.axis(axis).back();
                             ui.group(|ui| {
@@ -303,14 +342,18 @@ impl eframe::App for VizApp {
                                 }
                             });
                         }
-                        // One box per hard-coded axis group, built purely from
-                        // the same per-axis History feedback the boxes above
-                        // use — viz only taps the AxisGroup::exchange() seam, it
-                        // has no visibility into app's higher-level Profile::
-                        // Group/command bookkeeping, so this can't show whether
-                        // a synchronized group move is *currently* active the
-                        // way the terminal `status` command can; it's a
-                        // per-member position/velocity rollup instead.
+                    });
+
+                    // One box per hard-coded axis group, built purely from
+                    // the same per-axis History feedback the boxes beside
+                    // it use — viz only taps the AxisGroup::exchange() seam,
+                    // it has no visibility into app's higher-level Profile::
+                    // Group/command bookkeeping, so this can't show whether
+                    // a synchronized group move is *currently* active the
+                    // way the terminal `status` command can; it's a
+                    // per-member position/velocity rollup instead.
+                    ui.vertical(|ui| {
+                        ui.heading("groups");
                         for group in crate::AXIS_GROUPS {
                             ui.group(|ui| {
                                 ui.set_min_width(160.0);
@@ -355,56 +398,56 @@ impl eframe::App for VizApp {
                             ui.heading(format!("axis{axis}"));
                             let units = crate::AXIS_CONFIGS[axis].units;
                             let stride = plot_stride(history.axis(axis).len());
+                            // Newest-first, decimated: what every trace in
+                            // this column is built from.
+                            let series = |pick: fn(&crate::recording::Sample) -> f64| {
+                                history
+                                    .axis(axis)
+                                    .iter()
+                                    .rev()
+                                    .step_by(stride)
+                                    .map(move |s| [s.t, pick(s)])
+                            };
 
                             ui.label(format!("position ({units})"));
-                            Plot::new(format!("pos_plot_{axis}"))
-                                .width(col_width)
-                                .height(160.0)
-                                .show(ui, |plot_ui| {
-                                    let target = in_plot_order(
-                                        history
-                                            .axis(axis)
-                                            .iter()
-                                            .rev()
-                                            .step_by(stride)
-                                            .map(|s| [s.t, s.setpoint.position]),
-                                    );
-                                    let actual = in_plot_order(
-                                        history
-                                            .axis(axis)
-                                            .iter()
-                                            .rev()
-                                            .step_by(stride)
-                                            .map(|s| [s.t, s.feedback.position]),
-                                    );
-                                    plot_ui.line(Line::new("target", target));
-                                    plot_ui.line(Line::new("actual", actual));
-                                });
+                            time_series_plot(
+                                ui,
+                                format!("pos_plot_{axis}"),
+                                col_width,
+                                PLOT_HEIGHT,
+                                in_plot_order(series(|s| s.setpoint.position)),
+                                in_plot_order(series(|s| s.feedback.position)),
+                            );
 
                             ui.label(format!("velocity ({units}/s)"));
-                            Plot::new(format!("vel_plot_{axis}"))
-                                .width(col_width)
-                                .height(160.0)
-                                .show(ui, |plot_ui| {
-                                    let target = in_plot_order(
-                                        history
-                                            .axis(axis)
-                                            .iter()
-                                            .rev()
-                                            .step_by(stride)
-                                            .map(|s| [s.t, s.setpoint.velocity]),
-                                    );
-                                    let actual = in_plot_order(
-                                        history
-                                            .axis(axis)
-                                            .iter()
-                                            .rev()
-                                            .step_by(stride)
-                                            .map(|s| [s.t, s.feedback.velocity]),
-                                    );
-                                    plot_ui.line(Line::new("target", target));
-                                    plot_ui.line(Line::new("actual", actual));
-                                });
+                            time_series_plot(
+                                ui,
+                                format!("vel_plot_{axis}"),
+                                col_width,
+                                PLOT_HEIGHT,
+                                in_plot_order(series(|s| s.setpoint.velocity)),
+                                in_plot_order(series(|s| s.feedback.velocity)),
+                            );
+
+                            // Both traces come straight off the seam, same
+                            // as position and velocity — the target one is
+                            // the planner's exact closed-form acceleration,
+                            // not a difference of plotted samples. This is
+                            // the plot that makes jerk limiting visible at
+                            // all: unfiltered, the target steps square
+                            // between 0 and +/-a_max; filtered, it ramps.
+                            //
+                            // The *actual* trace is a plant estimate and
+                            // will look coarser — see `AxisFeedback`.
+                            ui.label(format!("acceleration ({units}/s²)"));
+                            time_series_plot(
+                                ui,
+                                format!("acc_plot_{axis}"),
+                                col_width,
+                                PLOT_HEIGHT,
+                                in_plot_order(series(|s| s.setpoint.acceleration)),
+                                in_plot_order(series(|s| s.feedback.acceleration)),
+                            );
                         });
                         ui.separator();
                     }

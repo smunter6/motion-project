@@ -15,14 +15,19 @@
 //!
 //! # Why these types don't reuse `motion_core::TrajectorySample`
 //!
-//! [`AxisSetpoint`] looks identical to `TrajectorySample` today (same two
-//! `f64` fields), but they belong to different layers: `TrajectorySample`
-//! is the planner's pure-math output, `AxisSetpoint` is what crosses the
-//! hardware seam. Keeping them distinct means a future planner-side change
-//! (say, an acceleration feed-forward field) or a future backend-side need
-//! (say, a torque limit per cycle) doesn't ripple across the seam just
-//! because one crate depended on the other's type. `axis-backend`
-//! deliberately does not depend on `motion-core`.
+//! [`AxisSetpoint`] carries much the same numbers as `TrajectorySample`,
+//! but they belong to different layers: `TrajectorySample` is the planner's
+//! pure-math output, `AxisSetpoint` is what crosses the hardware seam.
+//! Keeping them distinct means a planner-side change or a future
+//! backend-side need (say, a torque limit per cycle) doesn't ripple across
+//! the seam just because one crate depended on the other's type.
+//! `axis-backend` deliberately does not depend on `motion-core`.
+//!
+//! The acceleration field is a good example of the split earning its keep:
+//! it was added to *both* types for the same reason (drives consume it as a
+//! feed-forward), but they don't mean quite the same thing on each side —
+//! the planner's is exact and the plant's is an estimate. See
+//! [`AxisFeedback::acceleration`].
 
 use std::fmt;
 
@@ -36,6 +41,18 @@ use std::fmt;
 pub struct AxisSetpoint {
     pub position: f64,
     pub velocity: f64,
+    /// Commanded acceleration — the second feed-forward term.
+    ///
+    /// Carried across the seam rather than derived by whoever wants it,
+    /// because real drives *consume* it: in CSP/CSV modes it becomes a
+    /// torque offset (torque being what accelerates the load), and the
+    /// planner is the only layer that knows it exactly. Differencing the
+    /// velocity stream downstream would give a delayed, noisier estimate of
+    /// something already known in closed form.
+    ///
+    /// A backend that has nowhere to put it may ignore it — same as any
+    /// drive that doesn't map the corresponding object.
+    pub acceleration: f64,
     /// Requested power-stage state: `true` to (request to) enable, `false`
     /// to (request to) disable. Sequencing the real multi-step DS402
     /// transitions to get there is each backend's own business. Sent every
@@ -68,6 +85,19 @@ pub struct AxisSetpoint {
 pub struct AxisFeedback {
     pub position: f64,
     pub velocity: f64,
+    /// Measured acceleration.
+    ///
+    /// **Asymmetric with [`AxisSetpoint::acceleration`], deliberately.**
+    /// The commanded value is exact — the planner computes it in closed
+    /// form. This one is a *plant* quantity, and most real drives have no
+    /// acceleration object to report, so `backend-ethercat` will likely
+    /// have to derive it from successive velocities and will inherit that
+    /// estimate's lag and noise. `backend-sim` can report it honestly
+    /// because it knows the velocity change it just applied.
+    ///
+    /// Don't read it as ground truth the way position and velocity are
+    /// read; it is for display and diagnostics.
+    pub acceleration: f64,
     /// A fault this axis is reporting, if any. Mirrors
     /// [`ds402_state`](Self::ds402_state) being [`Ds402State::FaultReactionActive`]
     /// or [`Ds402State::Fault`] — `None` the rest of the time.
@@ -264,6 +294,7 @@ mod tests {
                     AxisFeedback {
                         position: 0.0,
                         velocity: 0.0,
+                        acceleration: 0.0,
                         fault: None,
                         state: AxisState::StandStill,
                         motion: MotionFlags::default(),
@@ -305,6 +336,7 @@ mod tests {
             AxisSetpoint {
                 position: 10.0,
                 velocity: 1.0,
+                acceleration: 0.0,
                 enabled: true,
                 fault_reset: false,
                 stopping: false,
@@ -312,6 +344,7 @@ mod tests {
             AxisSetpoint {
                 position: 20.0,
                 velocity: 2.0,
+                acceleration: 0.0,
                 enabled: true,
                 fault_reset: false,
                 stopping: false,

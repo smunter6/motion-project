@@ -158,6 +158,43 @@ Read the source for *what* exists. These are the decisions behind it.
 - **Path limits are a single scalar** max_speed/max_acceleration/
   max_deceleration over arc length. Per-axis limits projected onto the local
   path tangent is a deferred, harder follow-up.
+- **Jerk limiting is done by *filtering* a trapezoid, not by deriving a
+  seven-segment S-curve** (`jerk_filter.rs`, 2026-07-28). Convolving a
+  trapezoidal velocity profile with a rectangular window of length
+  `T = max(accel, decel) / max_jerk` gives piecewise-quadratic velocity,
+  continuous acceleration, and piecewise-constant jerk. The seven-segment
+  derivation is a case analysis that multiplies out once the move can start
+  at a non-zero velocity — which every redirect here does — while filtering
+  reuses `TrapezoidalProfile` whole and adds no branches. Same "reuse the
+  existing scalar profile" pattern as `StopRamp`/`LinearMove`/`PathProfile`.
+
+  **A trapezoid is the `max_jerk → ∞` case**, not a parallel construction:
+  the window shrinks to nothing and a zero-width box filter is the identity.
+  `max_jerk: None` is that limit and is asserted *bit-identical* to the
+  unfiltered profile, so it delegates rather than approximating.
+
+  Costs, both accepted: the profile is not time-optimal (it runs exactly `T`
+  longer — measured, every move's duration grew by exactly the window), and
+  jerk is set indirectly by the window rather than commanded.
+- **Filtering needs `TrapezoidalProfile::position_integral`.** Filtered
+  *velocity* is only a difference of positions, `(p(t) − p(t−T))/T`, but
+  filtered *position* is the mean position over the window, which needs an
+  analytic antiderivative. It is piecewise over exactly the phases `sample`
+  uses, so the two cannot disagree about where a phase ends, and it is
+  tested against numerical integration rather than against itself.
+- **A non-zero start velocity needs a `v₀·T/2` correction, or the move
+  misses.** For the filtered profile to *begin* at `v₀`, the underlying
+  profile is extended backwards before `t = 0` as a straight line at that
+  velocity. That extension contributes area: the filtered move overshoots by
+  exactly `v₀·T/2`, independent of shape. So the inner profile is built to a
+  target short by that amount, and the same constant offsets the start back
+  into place. **This vanishes from rest**, so every rest-to-rest test passes
+  while a redirect silently overshoots — the reason it's called out here.
+- **The jerk bound is exact only when a cruise phase outlasts the window.**
+  On a short move one window straddles both the accel and decel steps and
+  jerk reaches `(accel + decel)/T`, up to 2× the limit. Sizing the window
+  for that case would double it on *every* move to bound one where the axis
+  barely moves. Deliberate, and pinned by a test so it can't drift further.
 - **`kinematics` maps joint space ↔ task space, and forward is infallible
   while inverse is not.** Every joint pose puts the tool somewhere; not
   every task point is reachable, and the mapping can be locally degenerate.
@@ -185,7 +222,28 @@ Read the source for *what* exists. These are the decisions behind it.
   were realizable and — worse — accepts commands whose joint rates are
   already unrealizable short of the threshold. Bounding the joint rate
   itself needs per-axis limits, which `motion-core` must not know; that
-  check belongs in `app` (roadmap T3).
+  check belongs in `app` (roadmap 7).
+
+- **Acceleration is computed in closed form and carried across the seam,
+  never differenced** (2026-07-28). Every profile knows its own
+  acceleration analytically — piecewise constant for a trapezoid, piecewise
+  linear once jerk-limited — so `TrajectorySample`, `LinearMoveSample` and
+  `PathSample` all report it. Differencing downstream would give a delayed,
+  noisier estimate of something already known exactly.
+- **A path sample's acceleration has a centripetal term, not just a
+  tangential one.** `a = a_t·T̂ + v²·dT̂/ds`. Omitting the second term would
+  be worse than useless as a feed-forward: on a tight curve at speed it is
+  usually the *larger* of the two, and it exists even at constant speed.
+  `dT̂/ds` is a central difference on the tangent (which is itself a central
+  difference — see `CURVATURE_STEP`). This is also the quantity roadmap 7
+  needs to bound.
+- **`inverse_acceleration` needs the `J̇·q̇` term and so cannot be composed
+  from `inverse_velocity`.** `q̈ = J⁻¹(ẍ − J̇q̇)`. A rotating linkage
+  accelerates its own tool even at constant joint rates. Measured on the
+  SCARA at moderate rates, dropping the term changes the answer by ~0.7 and
+  ~1.7 rad/s² against joint accelerations of the same order — leading-order,
+  not a correction. Tested two ways: a finite-difference round trip through
+  forward kinematics, and an explicit check that the term moves the answer.
 
 ### `axis-backend`
 
@@ -197,6 +255,15 @@ Read the source for *what* exists. These are the decisions behind it.
   power-state machine) is the detail beneath it, mirroring what PLCopen's own
   `ST_AxisStatus` exists for. `Ds402State` lives at the *trait* level, not
   inside `backend-sim`, because `backend-ethercat` will need the same shape.
+- **`acceleration` crosses the seam in both directions, but means different
+  things** (2026-07-28). Commanded: exact, from the planner, and consumed by
+  real drives as a torque offset in CSP/CSV — which is why it belongs on the
+  seam rather than being re-derived by whoever wants it. Measured: a *plant*
+  quantity, and most drives have no acceleration object at all, so
+  `backend-ethercat` will likely difference successive velocities and
+  inherit that estimate's lag. `backend-sim` reports it honestly from the
+  velocity change it applied. **Don't read the feedback one as ground truth**
+  the way position and velocity are read.
 - **`enabled` and `fault_reset` are two distinct cyclic fields**, not one-off
   commands — like real CiA 402 controlword bits (enable vs. the edge-triggered
   Fault Reset bit).
@@ -295,6 +362,69 @@ Read the source for *what* exists. These are the decisions behind it.
 - **`group_pending` lives in `run_control_loop`, not `AxisRuntime`** —
   promoting a queued group move needs every member simultaneously idle, which
   doesn't fit inside any single axis's own state.
+- **`MotionLimits` is one shape used by both config tables** (2026-07-28):
+  `AxisConfig.limits` (joint space, per axis) and `AxisGroupDef.limits` (task
+  space, per group). Same four numbers either way, so one struct stops them
+  drifting apart. Which applies is a **units** question, not a preference: a
+  single-axis `move axis3` is joint-space and takes the axis's limits; a
+  group move is TCP-space and takes the group's, even though rotary joints
+  carry it out.
+
+  Group limits are now **per group** rather than one set of global
+  `DEFAULT_CARTESIAN_*` constants — an arm's TCP capability isn't a gantry's,
+  even in the same mm/s. `DEFAULT_CARTESIAN_LIMITS` remains as the shared
+  starting point each group's entry copies.
+- **`max_jerk` comes from config only, never from a move's command line.**
+  Every other limit can be overridden per move (`[vmax] [amax] [dmax]`);
+  jerk cannot. It's a property of what the machine can stand, not a per-move
+  choice the way a feedrate is. `setlimits` changes it; a `move` never does.
+- **Limits are resolved in the control loop, not in the parser** (added
+  2026-07-28 with `setlimits`). A `Command` carries `Option<f64>` per limit
+  — *what the user typed* — and `RuntimeLimits::resolve` fills the gaps from
+  the loop's live table at handling time.
+
+  This split is what makes runtime limits work at all. The parser runs on
+  the stdin thread and can't see loop state, so resolving there would pin
+  every command to the compile-time values and a `setlimits` would silently
+  do nothing for bare moves. Resolving at handling time also means a
+  `setlimits` affects the very next command rather than racing it.
+
+  `RuntimeLimits` seeds from `AXIS_CONFIGS`/`AXIS_GROUPS` and is the only
+  mutable copy; the `const` tables stay the startup values. **This is a
+  deliberate softening of the "config is compile-time" decision** below —
+  the tables are still the source of truth at startup, and there's still no
+  persistence, so a `setlimits` lasts until exit.
+- **A queued move stores its limits when accepted, not when promoted.**
+  `PendingMove`/`PendingGroupMove` carry a resolved `MotionLimits`, so a
+  later `setlimits` can't retroactively rewrite a move already sitting in a
+  queue. Same "fail/decide where the user typed it" principle as
+  `check_target_in_limits`.
+- **`dmax` now falls back to the configured deceleration, not to `amax`**
+  (changed 2026-07-28). The old rule pre-dated per-axis config and meant a
+  configured `max_deceleration` was *silently ignored by every move* — only
+  `stop` and the group cascade ever used it. Invisible until `setlimits` let
+  someone set a deceleration and watch it not apply. The two now agree.
+- **`setlimits` updates are partial and *named*, not positional** —
+  `setlimits axis0 accel 100 jerk 500`, with `setlimits axis0` reporting and
+  changing nothing. A comma form (`setlimits axis0 ,,100,500`) was the
+  alternative and was rejected: miscounting a comma puts the wrong *valid*
+  number into the wrong limit, silently, on a parameter governing machine
+  motion. Names are also order-independent, readable back in a log, and
+  survive a new limit being added — phase 2's lateral-acceleration bound
+  would otherwise be a new column everyone must count past.
+
+  Each limit takes two spellings, `speed`/`accel`/`decel`/`jerk` and
+  `vmax`/`amax`/`dmax`/`jmax`, because both vocabularies already exist in
+  the app (`move`'s positional args use the second in `help`).
+
+  `LimitsUpdate::max_jerk` is `Option<Option<f64>>` and **both levels
+  matter**: the outer `None` is "not named, leave it", the inner is "named
+  as `none`, i.e. no jerk limit". Collapsing them would make "don't touch
+  jerk" and "remove the jerk limit" the same command. Pinned by a test.
+
+  A report always prints all four limits, not just the changed ones — after
+  a partial update the useful question is what the machine will now do, not
+  which words were typed.
 - **Per-axis capability lives in `AXIS_CONFIGS`, not global constants**
   (added 2026-07-26). Each axis carries its own max speed/accel/decel *in its
   own units*, a display-only `units` label, and optional soft travel limits.
@@ -422,16 +552,36 @@ Read the source for *what* exists. These are the decisions behind it.
 5b. [done] **Kinematics seam + SCARA** (tiers T0–T2 of the kinematics plan):
    `KinematicModel`/`IdentityKinematics`/`ScaraKinematics`, install-time
    FK/IK in the move builders, per-cycle IK in the control loop, and
-   `axisGroup1` = a 2-link arm on `axis2`/`axis3`. **T3 (a motion
-   plausibility planner: whole-path reachability/singularity checking and
-   joint-rate limiting, converting T2's reactive stops into up-front
-   rejections) and T4 (joint position limits, further models) are not
-   built** — see Known gaps.
-6. Richer sim: second-order lag, position/following-error limits, faults;
-   S-curve (jerk-limited) profiles.
-7. **Curvature-limited feedrate.** Bound `v²κ` along a path instead of
-   applying one scalar `max_speed` regardless of how tight the curve is. Works
-   with the geometry we already have; the highest-value path-quality item.
+   `axisGroup1` = a 2-link arm on `axis2`/`axis3`. **T3 (whole-path
+   reachability/singularity checking and joint-rate limiting) is not built
+   — it is now folded into item 7 below. T4 (joint position limits, further
+   models) is not built either** — see Known gaps.
+6. **[partly done]** S-curve (jerk-limited) profiles — **done** 2026-07-28
+   via `jerk_filter.rs`, wired through every move kind. Still to do: richer
+   sim (second-order lag, position/following-error limits, faults).
+
+   Worth knowing the two halves are coupled: **`backend-sim` integrates
+   commanded velocity and models no mechanics, so jerk limiting is very
+   nearly invisible in viz.** What it improves — excitation, following error
+   during accel transients — isn't modelled, so the sim half is what makes
+   the profile half observable rather than an act of faith.
+7. **Unified limit scheduling** — the next phase, scoped 2026-07-27.
+   Curvature-limited feedrate (bound `v²κ` instead of applying one scalar
+   `max_speed` however tight the curve), joint-rate limiting, and whole-path
+   reachability/singularity checking are **one problem**: a derived quantity
+   evaluated along the path, bounded by a limit, with feedrate `v(s)` the only
+   free variable. So they share one speed-vs-arc-length envelope and one scan,
+   rather than three of each. Converts today's reactive cascade-stops into
+   up-front feedrate reduction or rejection, and subsumes what the kinematics
+   plan called T3.
+
+   **The ordering cost this used to carry is gone.** The worry was that
+   item 6's jerk limiting would force the envelope's forward/backward
+   acceleration passes to be rebuilt. Jerk limiting landed *first*
+   (2026-07-28), so those passes get built once, already knowing that
+   braking distance depends on entry acceleration and not just velocity.
+   Detailed design, and four open questions, are in the plan file (see
+   `MEMORY.md`) — not duplicated here, since nothing is built yet.
 8. **C2 interpolating splines (Yuksel's class), replacing Catmull-Rom.**
    Cem Yuksel, "A Class of C2 Interpolating Splines", *ACM TOG* 39(5) art. 160,
    July 2020 — same author as the centripetal parameterization work this
@@ -476,28 +626,31 @@ Read the source for *what* exists. These are the decisions behind it.
 
 ## Known gaps / not built
 
-- **No preemptive mid-path reachability/singularity guarding** (kinematics
-  T3). Validation is install-time only — a group move's endpoint, and
-  *every* explicitly-given `movepath` waypoint — plus the reactive
-  cascade-stop above. Nothing checks the *interior* of a segment.
-- **No joint-rate limiting** (kinematics T3). `max_speed`/`max_acceleration`
+- **No preemptive mid-path reachability/singularity guarding** (roadmap 7).
+  Validation is install-time only — a group move's endpoint, and *every*
+  explicitly-given `movepath` waypoint — plus the reactive cascade-stop
+  above. Nothing checks the *interior* of a segment.
+- **No joint-rate limiting** (roadmap 7). `max_speed`/`max_acceleration`
   bound Cartesian TCP motion; joint rate is `J⁻¹·ẋ`, so a perfectly legal
   Cartesian command can demand an arbitrarily large joint rate well before
-  the pose-only `NearSingular` predicate trips. When it lands it goes in
-  `app`, not `motion-core` (it compares against `AXIS_CONFIGS[axis]
-  .max_speed`): the joint velocity vector is already in hand in the control
-  loop's per-group pass, so it's one comparison per axis per cycle routed
-  into the existing `cascade_group_stop`.
+  the pose-only `NearSingular` predicate trips. The *limit* comparison is
+  `app`'s (it reads `AXIS_CONFIGS[axis].max_speed`, which `motion-core` must
+  not know) — but note the shape changed when roadmap 7 absorbed this:
+  bounding the rate *reactively* per cycle is one comparison into the
+  existing `cascade_group_stop`, while bounding it *preemptively* means
+  contributing a term to the speed envelope at install. The plan file takes
+  the latter; the former survives only as a backstop.
 - **The SCARA's equal links put a *reachable* singularity at the origin**
-  (kinematics T3). Equal links collapse the inner unreachable hole to a
-  point, so `r = 0` is reachable and a straight move from `(x, y)` to
-  `(−x, −y)` crosses it with both endpoints validating cleanly. The
-  user's explicit call, made with this understood: handle it reactively
-  rather than contorting the geometry (unequal links, or an artificial
-  `r_min` keep-out). Until T3, **"don't cross the origin" is a convention
+  (roadmap 7). Equal links collapse the inner unreachable hole to a point,
+  so `r = 0` is reachable and a straight move from `(x, y)` to `(−x, −y)`
+  crosses it with both endpoints validating cleanly. The user's explicit
+  call, made with this understood: handle it reactively rather than
+  contorting the geometry (unequal links, or an artificial `r_min`
+  keep-out). Until roadmap 7, **"don't cross the origin" is a convention
   enforced by test and demo target choice, not by the code.**
-- No joint *position* limits (kinematics T4) — `AXIS_CONFIGS` for the SCARA
-  joints has `position_limits: None`.
+- No joint *position* limits — `AXIS_CONFIGS` for the SCARA joints has
+  `position_limits: None`. Distinct from rate limiting, and not part of
+  roadmap 7.
 - No redundant/reduced-DOF kinematic models; the design assumes
   `dof() == axes.len()`.
 - No straight-segment override within a path. `SegmentKind` was removed

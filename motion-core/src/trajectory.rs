@@ -74,6 +74,13 @@ pub enum TrajectoryError {
     /// [`TrapezoidalProfile::new_with_start_velocity`] is NaN or
     /// +/-infinity.
     NonFiniteStartVelocity(f64),
+    /// `max_jerk` must be a finite, positive number *when given at all*.
+    /// "No jerk limit" is `None`, not infinity — see
+    /// [`JerkFilteredProfile`], and note that every other limit in this
+    /// crate must likewise be finite.
+    ///
+    /// [`JerkFilteredProfile`]: crate::jerk_filter::JerkFilteredProfile
+    InvalidMaxJerk(f64),
 }
 
 impl std::fmt::Display for TrajectoryError {
@@ -98,9 +105,13 @@ impl std::fmt::Display for TrajectoryError {
                 f,
                 "position ({position}) and velocity ({velocity}) must both be finite numbers"
             ),
-            TrajectoryError::NonFiniteStartVelocity(v) => write!(
+            TrajectoryError::NonFiniteStartVelocity(v) => {
+                write!(f, "start_velocity must be a finite number (got {v})")
+            }
+            TrajectoryError::InvalidMaxJerk(v) => write!(
                 f,
-                "start_velocity must be a finite number (got {v})"
+                "max_jerk must be a finite, positive number when given (got {v}); \
+                 use no jerk limit rather than infinity"
             ),
         }
     }
@@ -184,6 +195,18 @@ pub struct TrajectorySample {
     /// Target velocity at the queried time. Useful as a feed-forward signal
     /// even though position alone drives the move.
     pub velocity: f64,
+    /// Target acceleration at the queried time — the second feed-forward
+    /// term, and the one a drive turns into a torque offset (it is
+    /// proportional to the inertia it has to accelerate). Carried through
+    /// the backend seam for that reason rather than being re-derived by
+    /// whoever wants it.
+    ///
+    /// Exact and closed-form, not differenced: every profile here knows its
+    /// own acceleration analytically. It is piecewise *constant* for an
+    /// unfiltered trapezoid (stepping at each phase boundary) and piecewise
+    /// linear once jerk-limited — which is the whole visible difference
+    /// between the two.
+    pub acceleration: f64,
 }
 
 impl TrapezoidalProfile {
@@ -206,13 +229,20 @@ impl TrapezoidalProfile {
         max_deceleration: f64,
     ) -> Result<Self, TrajectoryError> {
         Self::validate_limits(start, end, max_speed, max_acceleration, max_deceleration)?;
-        let seg = Self::build_main_segment(start, end, 0.0, max_speed, max_acceleration, max_deceleration);
+        let seg = Self::build_main_segment(
+            start,
+            end,
+            0.0,
+            max_speed,
+            max_acceleration,
+            max_deceleration,
+        );
         Ok(Self::from_segment(
             start,
             end,
             max_acceleration,
             max_deceleration,
-            0.0, // rest-to-rest: no start velocity
+            0.0,  // rest-to-rest: no start velocity
             None, // no prefix
             seg,
         ))
@@ -441,8 +471,7 @@ impl TrapezoidalProfile {
         prefix: Option<(f64, f64, f64)>,
         seg: MainSegment,
     ) -> Self {
-        let (prefix_velocity, t_prefix_end, main_start) =
-            prefix.unwrap_or((0.0, 0.0, start));
+        let (prefix_velocity, t_prefix_end, main_start) = prefix.unwrap_or((0.0, 0.0, start));
 
         Self {
             start,
@@ -473,6 +502,97 @@ impl TrapezoidalProfile {
     /// The commanded end position.
     pub fn target(&self) -> f64 {
         self.end
+    }
+
+    /// The area under the position curve: `∫₀ᵗ position(τ) dτ`.
+    ///
+    /// Exists for [`JerkFilteredProfile`], whose box-filtered position is
+    /// the *mean* position over a trailing window — that is, a difference
+    /// of this integral at two times, divided by the window. Piecewise over
+    /// exactly the phases [`sample`] uses, so the two cannot disagree about
+    /// where a phase ends.
+    ///
+    /// Outside the move this follows `sample`'s own clamping: zero for
+    /// `t <= 0` (this profile holds at `start` before it begins), and
+    /// holding at `end` after. The *linear* backward extension a filtered
+    /// profile needs at a non-zero start velocity is the filter's business,
+    /// not this method's — see `JerkFilteredProfile`.
+    ///
+    /// [`JerkFilteredProfile`]: crate::jerk_filter::JerkFilteredProfile
+    /// [`sample`]: TrapezoidalProfile::sample
+    pub(crate) fn position_integral(&self, t: f64) -> f64 {
+        if t <= 0.0 {
+            return 0.0;
+        }
+        let mut total = 0.0;
+
+        // --- Prefix: p(τ) = start + pv·τ − pd·½·pdec·τ² ---
+        let tp = t.min(self.t_prefix_end);
+        if tp > 0.0 {
+            let pd = self.prefix_velocity.signum();
+            total += self.start * tp + self.prefix_velocity * tp * tp / 2.0
+                - pd * self.prefix_decel * tp * tp * tp / 6.0;
+        }
+        if t <= self.t_prefix_end {
+            return total;
+        }
+
+        // --- Main segment, in its own local time ---
+        let u = t.min(self.t_total) - self.t_prefix_end;
+        total += self.main_start * u + self.direction * self.main_distance_integral(u);
+        if t <= self.t_total {
+            return total;
+        }
+
+        // --- After the move: sitting at `end`. ---
+        total + self.end * (t - self.t_total)
+    }
+
+    /// `∫₀ᵘ x(w) dw`, where `x` is the main segment's distance travelled
+    /// along the direction of motion — the `pos_along` of [`sample`], with
+    /// `u` local to the main segment (absolute time minus `t_prefix_end`).
+    ///
+    /// [`sample`]: TrapezoidalProfile::sample
+    fn main_distance_integral(&self, u: f64) -> f64 {
+        let t_accel = self.t_accel - self.t_prefix_end;
+        let t_cruise_end = self.t_cruise_end - self.t_prefix_end;
+        let t_total = self.t_total - self.t_prefix_end;
+
+        // Same ramp direction `sample` picks, for the same reason.
+        let ramping_up = self.cruise_speed >= self.main_start_velocity;
+        let (sign, rate) = if ramping_up {
+            (1.0, self.accel)
+        } else {
+            (-1.0, self.decel)
+        };
+
+        // --- Phase 1: x(w) = v₀·w + ½·s·r·w² ---
+        let w = u.min(t_accel);
+        let mut total = self.main_start_velocity * w * w / 2.0 + sign * rate * w * w * w / 6.0;
+        if u <= t_accel {
+            return total;
+        }
+
+        // --- Phase 2 (cruise): x(w) = d_accel + cruise·w, w from t_accel ---
+        let w = u.min(t_cruise_end) - t_accel;
+        total += self.d_accel * w + self.cruise_speed * w * w / 2.0;
+        if u <= t_cruise_end {
+            return total;
+        }
+
+        // --- Phase 3: x(w) = distance − ½·decel·(t_total − w)², so the
+        // integral runs backwards from the stop. ---
+        let w = u.min(t_total);
+        let td_start = t_total - t_cruise_end;
+        let td_end = t_total - w;
+        total += self.distance * (w - t_cruise_end)
+            - self.decel * (td_start * td_start * td_start - td_end * td_end * td_end) / 6.0;
+        if u <= t_total {
+            return total;
+        }
+
+        // Past the main segment: distance is constant at `distance`.
+        total + self.distance * (u - t_total)
     }
 
     /// Which phase the move is in at absolute elapsed time `t` (seconds).
@@ -526,6 +646,10 @@ impl TrapezoidalProfile {
             return TrajectorySample {
                 position: self.start,
                 velocity,
+                // Before the move begins nothing is being commanded to
+                // change yet, so the feed-forward term is zero — even
+                // when `velocity` is not, on a move entered in motion.
+                acceleration: 0.0,
             };
         }
         // After the move (this also covers the zero-distance case, since
@@ -534,6 +658,7 @@ impl TrapezoidalProfile {
             return TrajectorySample {
                 position: self.end,
                 velocity: 0.0,
+                acceleration: 0.0,
             };
         }
 
@@ -545,6 +670,7 @@ impl TrapezoidalProfile {
                 position: self.start + self.prefix_velocity * t
                     - pd * 0.5 * self.prefix_decel * t * t,
                 velocity: self.prefix_velocity - pd * self.prefix_decel * t,
+                acceleration: -pd * self.prefix_decel,
             };
         }
 
@@ -557,7 +683,9 @@ impl TrapezoidalProfile {
 
         // Compute position/speed magnitude for a positive-direction move,
         // then re-sign into direction-aware position/velocity below.
-        let (pos_along, speed_along) = if t_local < t_accel_local {
+        // Acceleration comes out of the same branches, exactly: it is the
+        // rate each phase was built around, not a difference of samples.
+        let (pos_along, speed_along, accel_along) = if t_local < t_accel_local {
             // --- Phase 1: ramp from main_start_velocity to cruise_speed ---
             // Accelerating if cruise_speed >= main_start_velocity,
             // decelerating into cruise otherwise.
@@ -571,14 +699,14 @@ impl TrapezoidalProfile {
             };
             let v = self.main_start_velocity + sign * rate * t_local;
             let x = self.main_start_velocity * t_local + 0.5 * sign * rate * t_local * t_local;
-            (x, v)
+            (x, v, sign * rate)
         } else if t_local < t_cruise_end_local {
             // --- Cruise phase (constant speed) ---
             //   v(t) = cruise_speed
             //   x(t) = d_accel + cruise_speed * (t - t_accel)
             let v = self.cruise_speed;
             let x = self.d_accel + self.cruise_speed * (t_local - t_accel_local);
-            (x, v)
+            (x, v, 0.0)
         } else {
             // --- Deceleration phase ---
             // Measure time remaining until the move ends and integrate
@@ -590,12 +718,13 @@ impl TrapezoidalProfile {
             let td = t_total_local - t_local;
             let v = self.decel * td;
             let x = self.distance - 0.5 * self.decel * td * td;
-            (x, v)
+            (x, v, -self.decel)
         };
 
         TrajectorySample {
             position: self.main_start + self.direction * pos_along,
             velocity: self.direction * speed_along,
+            acceleration: self.direction * accel_along,
         }
     }
 }
@@ -658,8 +787,8 @@ impl StopRamp {
         let direction = start_velocity.signum();
         let t_stop = start_velocity.abs() / max_deceleration;
         // v^2 = 2*a*d => d = v^2/(2a), signed by direction of travel.
-        let final_position =
-            start_position + direction * (start_velocity.abs() * start_velocity.abs()) / (2.0 * max_deceleration);
+        let final_position = start_position
+            + direction * (start_velocity.abs() * start_velocity.abs()) / (2.0 * max_deceleration);
 
         Ok(Self {
             start_position,
@@ -706,11 +835,19 @@ impl StopRamp {
     /// `t < 0` returns the starting state, `t > duration` holds at rest at
     /// [`target`](Self::target).
     pub fn sample(&self, t: f64) -> TrajectorySample {
-        let t = t.clamp(0.0, self.t_stop);
+        let clamped = t.clamp(0.0, self.t_stop);
         TrajectorySample {
-            position: self.start_position + self.start_velocity * t
-                - self.direction * 0.5 * self.decel * t * t,
-            velocity: self.start_velocity - self.direction * self.decel * t,
+            position: self.start_position + self.start_velocity * clamped
+                - self.direction * 0.5 * self.decel * clamped * clamped,
+            velocity: self.start_velocity - self.direction * self.decel * clamped,
+            // Constant through the ramp and zero once stopped. Compared
+            // against the *unclamped* `t` so the held-at-rest tail doesn't
+            // keep reporting a deceleration nothing is doing.
+            acceleration: if t > 0.0 && t < self.t_stop {
+                -self.direction * self.decel
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -809,13 +946,7 @@ mod tests {
             let t = dur * (i as f64) / (n as f64);
             let a = p.sample(t).position - 0.0;
             let b = 200.0 - p.sample(dur - t).position;
-            assert!(
-                (a - b).abs() < 1e-6,
-                "asymmetry at t={}: {} vs {}",
-                t,
-                a,
-                b
-            );
+            assert!((a - b).abs() < 1e-6, "asymmetry at t={}: {} vs {}", t, a, b);
         }
     }
 
@@ -1120,10 +1251,8 @@ mod tests {
         // v0=20, distance=200, max_speed=50, accel=decel=100.
         // d_accel = (50^2-20^2)/200 = 10.5, d_decel = 2500/200 = 12.5,
         // sum=23 <= 200, so trapezoidal: cruise reaches the full max_speed.
-        let p = TrapezoidalProfile::new_with_start_velocity(
-            0.0, 20.0, 200.0, 50.0, 100.0, 100.0,
-        )
-        .unwrap();
+        let p = TrapezoidalProfile::new_with_start_velocity(0.0, 20.0, 200.0, 50.0, 100.0, 100.0)
+            .unwrap();
         assert!(approx(p.cruise_speed, 50.0));
         // At t=0 the profile reports the actual (nonzero) start velocity,
         // unlike a plain new() move.
@@ -1147,9 +1276,8 @@ mod tests {
         // max_speed would need d_accel+d_decel = 12+12.5 = 24.5 > 15, so
         // triangular. v_peak = sqrt((2*a*d*dist + v0^2*d)/(a+d))
         //                     = sqrt((300000+10000)/200) = sqrt(1550).
-        let p =
-            TrapezoidalProfile::new_with_start_velocity(0.0, 10.0, 15.0, 50.0, 100.0, 100.0)
-                .unwrap();
+        let p = TrapezoidalProfile::new_with_start_velocity(0.0, 10.0, 15.0, 50.0, 100.0, 100.0)
+            .unwrap();
         let expected_peak = 1550.0_f64.sqrt();
         assert!(approx(p.cruise_speed, expected_peak));
         assert!(p.cruise_speed < 50.0);
@@ -1166,10 +1294,8 @@ mod tests {
         // v0=80 exceeds the new move's max_speed=50: phase 1 must
         // decelerate into cruise, not accelerate. min_stop_distance =
         // 80^2/200 = 32 <= 500, so there's room.
-        let p = TrapezoidalProfile::new_with_start_velocity(
-            0.0, 80.0, 500.0, 50.0, 100.0, 100.0,
-        )
-        .unwrap();
+        let p = TrapezoidalProfile::new_with_start_velocity(0.0, 80.0, 500.0, 50.0, 100.0, 100.0)
+            .unwrap();
         assert!(approx(p.cruise_speed, 50.0));
         assert!(approx(p.t_prefix_end, 0.0)); // rides straight in, no prefix
         assert!(approx(p.sample(0.0).velocity, 80.0));
@@ -1198,9 +1324,8 @@ mod tests {
         // v0=50, end at 5: min_stop_distance = 2500/200 = 12.5 > 5, so no
         // way to stop at the target directly. Must decelerate to rest
         // (overshooting to 12.5) then come back.
-        let p =
-            TrapezoidalProfile::new_with_start_velocity(0.0, 50.0, 5.0, 50.0, 100.0, 100.0)
-                .unwrap();
+        let p = TrapezoidalProfile::new_with_start_velocity(0.0, 50.0, 5.0, 50.0, 100.0, 100.0)
+            .unwrap();
         assert!(approx(p.t_prefix_end, 0.5)); // 50/100
         let prefix_end = p.sample(p.t_prefix_end);
         assert!(approx(prefix_end.position, 12.5)); // overshoot past 5.0
@@ -1219,9 +1344,8 @@ mod tests {
         // v0=-20 points away from end=100. Must decelerate to rest first
         // (landing at -2.0, further from `end` than `start`), then a
         // normal forward move.
-        let p =
-            TrapezoidalProfile::new_with_start_velocity(0.0, -20.0, 100.0, 50.0, 100.0, 100.0)
-                .unwrap();
+        let p = TrapezoidalProfile::new_with_start_velocity(0.0, -20.0, 100.0, 50.0, 100.0, 100.0)
+            .unwrap();
         assert!(approx(p.t_prefix_end, 0.2)); // 20/100
         let prefix_end = p.sample(p.t_prefix_end);
         assert!(approx(prefix_end.position, -2.0));
@@ -1237,9 +1361,8 @@ mod tests {
     fn start_velocity_position_is_continuous_across_all_boundaries() {
         // No jumps anywhere, including the new prefix/main-segment seam,
         // for a profile that exercises overshoot-and-reverse.
-        let p =
-            TrapezoidalProfile::new_with_start_velocity(0.0, 50.0, 5.0, 50.0, 100.0, 100.0)
-                .unwrap();
+        let p = TrapezoidalProfile::new_with_start_velocity(0.0, 50.0, 5.0, 50.0, 100.0, 100.0)
+            .unwrap();
         for &boundary in &[p.t_prefix_end, p.t_accel, p.t_cruise_end] {
             let just_before = p.sample(boundary - EPS).position;
             let just_after = p.sample(boundary + EPS).position;
@@ -1255,14 +1378,8 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_start_velocity() {
-        match TrapezoidalProfile::new_with_start_velocity(
-            0.0,
-            f64::NAN,
-            100.0,
-            50.0,
-            100.0,
-            100.0,
-        ) {
+        match TrapezoidalProfile::new_with_start_velocity(0.0, f64::NAN, 100.0, 50.0, 100.0, 100.0)
+        {
             Err(TrajectoryError::NonFiniteStartVelocity(v)) => assert!(v.is_nan()),
             other => panic!("expected NonFiniteStartVelocity, got {other:?}"),
         }

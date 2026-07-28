@@ -69,7 +69,12 @@ const ACCEL_EPS: f64 = 1e-9;
 /// held in place if ever reached. Unlike the fault path, a *commanded*
 /// stop (`AxisSetpoint::stopping`) never touches this state machine at
 /// all — see `exchange`'s handling of it and `stopping`'s own docs for why.
-fn step_ds402(current: Ds402State, enabled: bool, fault_reset: bool, fault_detected: bool) -> Ds402State {
+fn step_ds402(
+    current: Ds402State,
+    enabled: bool,
+    fault_reset: bool,
+    fault_detected: bool,
+) -> Ds402State {
     use Ds402State::*;
 
     if fault_detected {
@@ -115,6 +120,7 @@ impl SimAxisGroup {
                 AxisFeedback {
                     position: 0.0,
                     velocity: 0.0,
+                    acceleration: 0.0,
                     fault: None,
                     state: AxisState::Disabled,
                     motion: MotionFlags::default(),
@@ -145,7 +151,8 @@ impl AxisGroup for SimAxisGroup {
             // still holds last cycle's *actual* speed here, before this
             // cycle overwrites it below.
             let was_moving = fb.velocity.abs() > STANDSTILL_EPS;
-            let fault_detected = fb.ds402_state == Ds402State::OperationEnabled && !sp.enabled && was_moving;
+            let fault_detected =
+                fb.ds402_state == Ds402State::OperationEnabled && !sp.enabled && was_moving;
 
             fb.ds402_state = step_ds402(fb.ds402_state, sp.enabled, sp.fault_reset, fault_detected);
             fb.fault = if fault_detected {
@@ -173,6 +180,13 @@ impl AxisGroup for SimAxisGroup {
             if operational {
                 fb.position += speed * self.dt;
             }
+            // Reported from the velocity change this plant actually
+            // applied, not copied from `sp.acceleration` — feedback must
+            // describe what happened, and what happened is `speed`, which
+            // is zeroed while the axis isn't operational. This is the one
+            // honest acceleration a pure integrator can report; a real
+            // drive rarely offers one at all (see `AxisFeedback`).
+            fb.acceleration = (speed - prev_speed) / self.dt;
             fb.velocity = speed;
 
             let moving = speed.abs() > STANDSTILL_EPS;
@@ -328,7 +342,11 @@ mod tests {
     /// every cycle. Isolates the flag-transition logic itself, independent
     /// of any real trajectory shape (see the trapezoidal-profile tests below
     /// for that).
-    fn drive_and_check(sim: &mut SimAxisGroup, velocities: &[f64], expected: &[(AxisState, MotionFlags)]) {
+    fn drive_and_check(
+        sim: &mut SimAxisGroup,
+        velocities: &[f64],
+        expected: &[(AxisState, MotionFlags)],
+    ) {
         assert_eq!(velocities.len(), expected.len());
         for (i, (&velocity, &(want_state, want_motion))) in
             velocities.iter().zip(expected).enumerate()
@@ -359,9 +377,30 @@ mod tests {
         let mut sim = SimAxisGroup::new(1, 0.004);
         warm_up_enabled(&mut sim, 1);
         let velocities = [0.0, 2.0, 4.0, 4.0, 4.0, 2.0, 0.0];
-        let accel = (AxisState::DiscreteMotion, MotionFlags { accelerating: true, constant_velocity: false, decelerating: false });
-        let cruise = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: true, decelerating: false });
-        let decel = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: false, decelerating: true });
+        let accel = (
+            AxisState::DiscreteMotion,
+            MotionFlags {
+                accelerating: true,
+                constant_velocity: false,
+                decelerating: false,
+            },
+        );
+        let cruise = (
+            AxisState::DiscreteMotion,
+            MotionFlags {
+                accelerating: false,
+                constant_velocity: true,
+                decelerating: false,
+            },
+        );
+        let decel = (
+            AxisState::DiscreteMotion,
+            MotionFlags {
+                accelerating: false,
+                constant_velocity: false,
+                decelerating: true,
+            },
+        );
         let rest = (AxisState::StandStill, MotionFlags::default());
         let expected = [rest, accel, accel, cruise, cruise, decel, rest];
         drive_and_check(&mut sim, &velocities, &expected);
@@ -375,9 +414,30 @@ mod tests {
         let mut sim = SimAxisGroup::new(1, 0.004);
         warm_up_enabled(&mut sim, 1);
         let velocities = [0.0, -2.0, -4.0, -4.0, -4.0, -2.0, 0.0];
-        let accel = (AxisState::DiscreteMotion, MotionFlags { accelerating: true, constant_velocity: false, decelerating: false });
-        let cruise = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: true, decelerating: false });
-        let decel = (AxisState::DiscreteMotion, MotionFlags { accelerating: false, constant_velocity: false, decelerating: true });
+        let accel = (
+            AxisState::DiscreteMotion,
+            MotionFlags {
+                accelerating: true,
+                constant_velocity: false,
+                decelerating: false,
+            },
+        );
+        let cruise = (
+            AxisState::DiscreteMotion,
+            MotionFlags {
+                accelerating: false,
+                constant_velocity: true,
+                decelerating: false,
+            },
+        );
+        let decel = (
+            AxisState::DiscreteMotion,
+            MotionFlags {
+                accelerating: false,
+                constant_velocity: false,
+                decelerating: true,
+            },
+        );
         let rest = (AxisState::StandStill, MotionFlags::default());
         let expected = [rest, accel, accel, cruise, cruise, decel, rest];
         drive_and_check(&mut sim, &velocities, &expected);
@@ -646,7 +706,10 @@ mod tests {
         let fb = sim.exchange(&[disable_setpoint]).unwrap();
         assert_eq!(fb[0].ds402_state, Ds402State::Fault);
         assert_eq!(fb[0].fault, Some(AxisFault::DisabledWhileMoving));
-        assert_eq!(fb[0].position, 10.0, "position must stay frozen while faulted");
+        assert_eq!(
+            fb[0].position, 10.0,
+            "position must stay frozen while faulted"
+        );
 
         // Stuck at Fault — toggling `enabled` alone doesn't get it out.
         let fb = sim

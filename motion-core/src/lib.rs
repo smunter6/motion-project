@@ -24,12 +24,14 @@
 //! - [`path_profile`] — speed profile over a [`waypoint_path::WaypointPath`].
 //! - [`kinematics`] — the joint-space ↔ task-space seam.
 
+pub mod jerk_filter;
 pub mod kinematics;
 pub mod linear_move;
 pub mod path_profile;
 pub mod trajectory;
 pub mod waypoint_path;
 
+pub use jerk_filter::JerkFilteredProfile;
 pub use kinematics::{
     IdentityKinematics, KinematicBranch, KinematicModel, KinematicVector, KinematicsError, Linkage,
     MAX_LINKAGE_POINTS, ScaraKinematics,

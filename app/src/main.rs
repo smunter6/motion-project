@@ -91,19 +91,58 @@ use std::time::{Duration, Instant};
 use axis_backend::{AxisGroup, AxisSetpoint, AxisState, Ds402State};
 use backend_sim::SimAxisGroup;
 use motion_core::{
-    LinearMove, LinearMoveError, MotionPhase, PathProfile, PathProfileError, StopRamp,
-    TrajectoryError, TrapezoidalProfile,
+    JerkFilteredProfile, LinearMove, LinearMoveError, MotionPhase, PathProfile, PathProfileError,
+    StopRamp, TrajectoryError,
 };
 use recording::{History, RecordingAxisGroup};
 use viz::VizApp;
 
 const CONTROL_RATE_HZ: f64 = 250.0;
-/// Defaults for *Cartesian* (group / path) moves, which are TCP-space
-/// quantities regardless of what kind of axes carry them out. Single-axis
-/// commands don't use these — they use the axis's own `AxisConfig`, whose
-/// units may not be mm at all. See `AXIS_CONFIGS`.
-const DEFAULT_CARTESIAN_MAX_SPEED: f64 = 50.0; // mm/s
-const DEFAULT_CARTESIAN_MAX_ACCELERATION: f64 = 200.0; // mm/s^2
+
+/// One thing's dynamic capability, in whatever units that thing works in —
+/// mm/s for a linear axis or a Cartesian group's TCP, rad/s for a rotary
+/// joint. Shared by `AxisConfig` (joint space, per axis) and
+/// `AxisGroupDef` (task space, per group), because it is the same four
+/// numbers either way and keeping one shape stops the two drifting apart.
+///
+/// **Which one applies is a units question, not a preference.** A
+/// single-axis `move axis3` is a joint-space command and takes the axis's
+/// limits; a group move is a TCP-space command and takes the group's, even
+/// though rotary joints carry it out. Mixing them is the silent unit error
+/// `AxisConfig`'s own docs describe.
+///
+/// The tables below are the *startup* values. `setlimits` overrides them at
+/// runtime, which is why the control loop keeps its own mutable copy rather
+/// than reading these constants directly — see `run_control_loop`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MotionLimits {
+    max_speed: f64,
+    max_acceleration: f64,
+    max_deceleration: f64,
+    /// `None` means no jerk limit — which is not "jerk is unimportant" but
+    /// the exact `max_jerk → ∞` case: the profile degenerates to the plain
+    /// trapezoid, acceleration steps, and nothing is filtered. See
+    /// `motion_core::JerkFilteredProfile`.
+    ///
+    /// Expressed as an `Option` rather than as a large number, matching
+    /// `position_limits`' own "None means unbounded" convention — and
+    /// because `motion-core` requires every limit it *is* given to be
+    /// finite, so infinity isn't available to mean this.
+    max_jerk: Option<f64>,
+}
+
+/// Default limits for *Cartesian* (group / path) moves — TCP-space
+/// quantities regardless of what kind of axes carry them out. Each group
+/// gets its own copy in `AXIS_GROUPS` and can differ; this is just the
+/// starting point they currently share.
+const DEFAULT_CARTESIAN_LIMITS: MotionLimits = MotionLimits {
+    max_speed: 50.0,         // mm/s
+    max_acceleration: 200.0, // mm/s^2
+    max_deceleration: 200.0, // mm/s^2
+    // 4000 mm/s^3 against 200 mm/s^2 gives a 50 ms filter window — about
+    // 12 control cycles at 250 Hz, and 50 ms added to every move.
+    max_jerk: Some(4000.0), // mm/s^3
+};
 const STATUS_PRINT_PERIOD: Duration = Duration::from_millis(250);
 
 /// Below this speed, an axis counts as already at rest for `stop`'s
@@ -137,10 +176,14 @@ const AT_REST_EPS: f64 = 1e-6;
 /// Compile-time like `AXIS_GROUPS`, for the same reason: this is machine
 /// configuration, and there's no runtime-config infrastructure to hang it
 /// on yet. The shape deserializes unchanged if that ever arrives.
+///
+/// These are the **startup** values. `setlimits` edits the control loop's
+/// own copy (`RuntimeLimits`) rather than this table, so a change lasts
+/// until exit and nothing here is ever mutated. Read these for "what the
+/// machine boots as", not "what it is limited to right now".
 struct AxisConfig {
-    max_speed: f64,
-    max_acceleration: f64,
-    max_deceleration: f64,
+    /// This axis's own dynamic capability, in its own units.
+    limits: MotionLimits,
     /// Display only — `motion-core` never sees units. Used by `status` and
     /// the heartbeat so a rotary joint doesn't print "mm".
     units: &'static str,
@@ -155,16 +198,22 @@ struct AxisConfig {
 /// length matches `NUM_AXES`.
 const AXIS_CONFIGS: &[AxisConfig] = &[
     AxisConfig {
-        max_speed: 50.0,
-        max_acceleration: 200.0,
-        max_deceleration: 200.0,
+        limits: MotionLimits {
+            max_speed: 50.0,
+            max_acceleration: 200.0,
+            max_deceleration: 200.0,
+            max_jerk: Some(4000.0), // 50 ms filter window
+        },
         units: "mm",
         position_limits: Some((-500.0, 500.0)),
     },
     AxisConfig {
-        max_speed: 50.0,
-        max_acceleration: 200.0,
-        max_deceleration: 200.0,
+        limits: MotionLimits {
+            max_speed: 50.0,
+            max_acceleration: 200.0,
+            max_deceleration: 200.0,
+            max_jerk: Some(4000.0),
+        },
         units: "mm",
         position_limits: Some((-500.0, 500.0)),
     },
@@ -178,20 +227,85 @@ const AXIS_CONFIGS: &[AxisConfig] = &[
     // group move's install-time IK check covers, and which says nothing
     // about a raw single-axis jog anyway.
     AxisConfig {
-        max_speed: 2.0,
-        max_acceleration: 8.0,
-        max_deceleration: 8.0,
+        limits: MotionLimits {
+            max_speed: 2.0,
+            max_acceleration: 8.0,
+            max_deceleration: 8.0,
+            // 160 rad/s^3 against 8 rad/s^2 is the same 50 ms window the
+            // linear axes get — the window is a *time*, so matching it
+            // across axes in different units is what keeps their smoothing
+            // comparable.
+            max_jerk: Some(160.0), // rad/s^3
+        },
         units: "rad",
         position_limits: None,
     },
     AxisConfig {
-        max_speed: 2.0,
-        max_acceleration: 8.0,
-        max_deceleration: 8.0,
+        limits: MotionLimits {
+            max_speed: 2.0,
+            max_acceleration: 8.0,
+            max_deceleration: 8.0,
+            max_jerk: Some(160.0),
+        },
         units: "rad",
         position_limits: None,
     },
 ];
+
+/// One group's Cartesian sample converted into joint space for this cycle:
+/// `(position, velocity, acceleration)`. Computed once per group and read
+/// per member — the conversion is a whole-vector operation, so doing it per
+/// axis would be both wrong and N times the work.
+type GroupJointSample = (
+    motion_core::KinematicVector,
+    motion_core::KinematicVector,
+    motion_core::KinematicVector,
+);
+
+/// The control loop's live copy of every axis's and group's limits, seeded
+/// from the compile-time tables and mutable by `setlimits`.
+///
+/// Lives here rather than in the `const` tables because those are shared,
+/// immutable, and read from the stdin thread as well. It is deliberately
+/// *not* shared back to the parser: a command carries what the user typed
+/// (`Option<f64>` per limit) and this fills the gaps at handling time, so a
+/// `setlimits` always affects the very next command rather than racing it.
+struct RuntimeLimits {
+    axes: Vec<MotionLimits>,
+    groups: Vec<MotionLimits>,
+}
+
+impl RuntimeLimits {
+    fn new() -> Self {
+        Self {
+            axes: AXIS_CONFIGS.iter().map(|c| c.limits).collect(),
+            groups: AXIS_GROUPS.iter().map(|g| g.limits).collect(),
+        }
+    }
+
+    /// Fill in whatever the command didn't specify.
+    ///
+    /// Note `dmax` falls back to the configured deceleration, **not** to
+    /// whatever `amax` resolved to, which is what it used to do. That old
+    /// rule pre-dated per-axis config and meant a configured
+    /// `max_deceleration` was silently ignored by every `move` — visible the
+    /// moment `setlimits` lets someone set one and watch it not apply.
+    /// `stop` and the group cascade always used the configured value, so
+    /// this also makes the two agree.
+    /// `max_jerk` has no command-line form, so it always comes from
+    /// configuration — see the `move` command's docs.
+    fn resolve(
+        limits: &MotionLimits,
+        given: (Option<f64>, Option<f64>, Option<f64>),
+    ) -> MotionLimits {
+        MotionLimits {
+            max_speed: given.0.unwrap_or(limits.max_speed),
+            max_acceleration: given.1.unwrap_or(limits.max_acceleration),
+            max_deceleration: given.2.unwrap_or(limits.max_deceleration),
+            max_jerk: limits.max_jerk,
+        }
+    }
+}
 
 /// Rejects a single-axis move target outside the axis's soft travel limits.
 ///
@@ -239,6 +353,11 @@ struct AxisGroupDef {
     /// once per group per cycle, which is nothing next to the trig it
     /// guards.
     kinematics: &'static dyn motion_core::KinematicModel,
+    /// The group's *task-space* (TCP) dynamic limits, and the defaults a
+    /// `move`/`movepath` on this group uses when the command doesn't
+    /// override them. Per group rather than one global set: an arm's TCP
+    /// capability is not a gantry's, even measured in the same mm/s.
+    limits: MotionLimits,
 }
 
 /// The pass-through model for 2-axis Cartesian groups. Carries its own DOF
@@ -270,11 +389,13 @@ const AXIS_GROUPS: &[AxisGroupDef] = &[
         name: "axisGroup0",
         axes: &[0, 1],
         kinematics: &IDENTITY_KINEMATICS_2,
+        limits: DEFAULT_CARTESIAN_LIMITS,
     },
     AxisGroupDef {
         name: "axisGroup1",
         axes: &[2, 3],
         kinematics: &SCARA_KINEMATICS,
+        limits: DEFAULT_CARTESIAN_LIMITS,
     },
 ];
 
@@ -311,9 +432,9 @@ enum Command {
     Move {
         axis: usize,
         target: f64,
-        max_speed: f64,
-        max_acceleration: f64,
-        max_deceleration: f64,
+        max_speed: Option<f64>,
+        max_acceleration: Option<f64>,
+        max_deceleration: Option<f64>,
         buffer_mode: BufferMode,
     },
     Enable {
@@ -332,9 +453,9 @@ enum Command {
     MoveGroup {
         group: usize,
         targets: Vec<f64>,
-        max_speed: f64,
-        max_acceleration: f64,
-        max_deceleration: f64,
+        max_speed: Option<f64>,
+        max_acceleration: Option<f64>,
+        max_deceleration: Option<f64>,
         buffer_mode: BufferMode,
     },
     EnableGroup {
@@ -368,10 +489,25 @@ enum Command {
     MovePath {
         group: usize,
         waypoints: Vec<Vec<f64>>,
-        max_speed: f64,
-        max_acceleration: f64,
-        max_deceleration: f64,
+        max_speed: Option<f64>,
+        max_acceleration: Option<f64>,
+        max_deceleration: Option<f64>,
         buffer_mode: BufferMode,
+    },
+    /// Change some of an axis's or a group's dynamic limits at runtime, and
+    /// report the result. An empty `update` reports without changing.
+    ///
+    /// Takes effect on the *next* move built, not on one already running —
+    /// a profile is constructed once at install and is a pure function of
+    /// time thereafter, so there is nowhere for a mid-flight limit change to
+    /// land. Stopping and re-commanding is how you apply one immediately.
+    SetLimits {
+        axis: usize,
+        update: LimitsUpdate,
+    },
+    SetGroupLimits {
+        group: usize,
+        update: LimitsUpdate,
     },
     Verbose,
     Status,
@@ -534,6 +670,10 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
             Target::Axis(axis) => Ok(Some(Command::Reset { axis })),
             Target::Group(group) => Ok(Some(Command::ResetGroup { group })),
         },
+        // Accepts `setLimits` too: it reads naturally and is what this was
+        // first asked for as, even though every other verb here is
+        // lowercase.
+        ["setlimits" | "setLimits", rest @ ..] => parse_set_limits(rest, line),
         ["stop", target] => match parse_target(target)? {
             Target::Axis(axis) => Ok(Some(Command::Stop {
                 axis,
@@ -588,17 +728,11 @@ fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>
         .collect::<Result<_, _>>()?;
 
     // A single-axis move defaults to that axis's own limits (which may be
-    // deg/s, not mm/s); a group move is Cartesian and defaults to the
-    // TCP-space constants. See `AxisConfig`.
-    let defaults = match target {
-        Target::Axis(a) => (AXIS_CONFIGS[a].max_speed, AXIS_CONFIGS[a].max_acceleration),
-        Target::Group(_) => (
-            DEFAULT_CARTESIAN_MAX_SPEED,
-            DEFAULT_CARTESIAN_MAX_ACCELERATION,
-        ),
-    };
-    let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
-        parse_buffer_mode_and_limits(rest, line, defaults)?;
+    // rad/s, not mm/s); a group move is Cartesian and defaults to that
+    // group's own TCP-space limits. See `MotionLimits`.
+    // Defaults are not applied here — see `parse_kinematic_limits`.
+    let (buffer_mode, (max_speed, max_acceleration, max_deceleration)) =
+        parse_buffer_mode_and_limits(rest, line)?;
 
     match target {
         Target::Axis(axis) => Ok(Some(Command::Move {
@@ -680,7 +814,7 @@ fn parse_move_path_inline(
         .collect::<Result<_, _>>()?;
     let waypoints: Vec<Vec<f64>> = flat.chunks(coord_count).map(|c| c.to_vec()).collect();
 
-    let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
+    let (buffer_mode, (max_speed, max_acceleration, max_deceleration)) =
         parse_movepath_buffer_mode_and_limits(rest, line)?;
     Ok(Some(Command::MovePath {
         group,
@@ -708,7 +842,7 @@ fn parse_move_path_file(
     line: &str,
 ) -> Result<Option<Command>, String> {
     let waypoints = read_waypoints_file(path, coord_count)?;
-    let (buffer_mode, max_speed, max_acceleration, max_deceleration) =
+    let (buffer_mode, (max_speed, max_acceleration, max_deceleration)) =
         parse_movepath_buffer_mode_and_limits(rest, line)?;
     Ok(Some(Command::MovePath {
         group,
@@ -770,16 +904,15 @@ fn parse_waypoint_lines(contents: &str, coord_count: usize) -> Result<Vec<Vec<f6
 fn parse_buffer_mode_and_limits(
     rest: &[&str],
     line: &str,
-    defaults: (f64, f64),
-) -> Result<(BufferMode, f64, f64, f64), String> {
+) -> Result<(BufferMode, ParsedLimits), String> {
     let (buffer_mode, numeric_rest) = match rest.last() {
         Some(&"aborting") => (BufferMode::Aborting, &rest[..rest.len() - 1]),
         Some(&"buffered") => (BufferMode::Buffered, &rest[..rest.len() - 1]),
         _ => (BufferMode::Buffered, rest),
     };
     let (max_speed, max_acceleration, max_deceleration) =
-        parse_kinematic_limits(numeric_rest, line, defaults)?;
-    Ok((buffer_mode, max_speed, max_acceleration, max_deceleration))
+        parse_kinematic_limits(numeric_rest, line)?;
+    Ok((buffer_mode, (max_speed, max_acceleration, max_deceleration)))
 }
 
 /// `movepath`'s own version of `parse_buffer_mode_and_limits` — identical
@@ -788,50 +921,146 @@ fn parse_buffer_mode_and_limits(
 fn parse_movepath_buffer_mode_and_limits(
     rest: &[&str],
     line: &str,
-) -> Result<(BufferMode, f64, f64, f64), String> {
+) -> Result<(BufferMode, ParsedLimits), String> {
     let (buffer_mode, numeric_rest) = match rest.last() {
         Some(&"aborting") => (BufferMode::Aborting, &rest[..rest.len() - 1]),
         Some(&"buffered") => (BufferMode::Buffered, &rest[..rest.len() - 1]),
         Some(&"blend") => (BufferMode::Blend, &rest[..rest.len() - 1]),
         _ => (BufferMode::Buffered, rest),
     };
-    let (max_speed, max_acceleration, max_deceleration) = parse_kinematic_limits(
-        numeric_rest,
-        line,
-        (
-            DEFAULT_CARTESIAN_MAX_SPEED,
-            DEFAULT_CARTESIAN_MAX_ACCELERATION,
-        ),
-    )?;
-    Ok((buffer_mode, max_speed, max_acceleration, max_deceleration))
+    let (max_speed, max_acceleration, max_deceleration) =
+        parse_kinematic_limits(numeric_rest, line)?;
+    Ok((buffer_mode, (max_speed, max_acceleration, max_deceleration)))
 }
 
-/// The trailing up-to-3 numeric kinematic-limit args shared by both
-/// `movepath` forms (`[vmax] [amax] [dmax]`, each defaulting the same way
-/// `move`'s do: `vmax`/`amax` fall back to the global defaults, `dmax`
-/// falls back to whatever `amax` resolved to).
-fn parse_kinematic_limits(
-    rest: &[&str],
-    line: &str,
-    defaults: (f64, f64),
-) -> Result<(f64, f64, f64), String> {
+/// `(vmax, amax, dmax)` exactly as typed — `None` for each one omitted.
+/// Jerk is absent by design: it has no command-line form, only `setlimits`.
+type ParsedLimits = (Option<f64>, Option<f64>, Option<f64>);
+
+/// The trailing up-to-3 numeric kinematic-limit args shared by `move` and
+/// both `movepath` forms: `[vmax] [amax] [dmax]`, each `None` when the user
+/// didn't give it.
+///
+/// **Deliberately does not apply defaults.** It reports what was *typed*;
+/// the control loop fills the gaps from its live limits table (see
+/// `RuntimeLimits::resolve`). That split exists because `setlimits` can
+/// change those limits at runtime, and this parser runs on the stdin thread
+/// with no access to loop state — resolving here would silently pin every
+/// command to the compile-time values.
+fn parse_kinematic_limits(rest: &[&str], line: &str) -> Result<ParsedLimits, String> {
     if rest.len() > 3 {
         return Err(format!("too many arguments: {line:?}"));
     }
     let mut numeric_rest = rest.iter();
-    let max_speed = match numeric_rest.next() {
-        Some(v) => parse_f64(v)?,
-        None => defaults.0,
+    let mut next =
+        || -> Result<Option<f64>, String> { numeric_rest.next().map(|v| parse_f64(v)).transpose() };
+    Ok((next()?, next()?, next()?))
+}
+
+/// A **partial** change to a target's limits: only the named ones move.
+///
+/// Named rather than positional (`setlimits axis0 accel 100 jerk 500`, not
+/// `setlimits axis0 ,,100,500`). Position-counting on a comma form puts the
+/// wrong *valid* number into the wrong limit when you miscount — silently,
+/// on a parameter that governs machine motion. Names are also
+/// order-independent, readable back in a log, and survive a new limit being
+/// added (phase 2's lateral-acceleration bound would otherwise become a new
+/// column everyone has to count past).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct LimitsUpdate {
+    max_speed: Option<f64>,
+    max_acceleration: Option<f64>,
+    max_deceleration: Option<f64>,
+    /// Two levels, and both matter: the **outer** `None` means "not named,
+    /// leave it alone", while an inner `None` means "named as `none`, i.e.
+    /// no jerk limit at all". Collapsing them would make "don't touch jerk"
+    /// and "remove the jerk limit" the same command.
+    max_jerk: Option<Option<f64>>,
+}
+
+impl LimitsUpdate {
+    /// Whether this names nothing — `setlimits <target>`, which reports the
+    /// current limits instead of changing any.
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn apply(&self, limits: &mut MotionLimits) {
+        if let Some(v) = self.max_speed {
+            limits.max_speed = v;
+        }
+        if let Some(a) = self.max_acceleration {
+            limits.max_acceleration = a;
+        }
+        if let Some(d) = self.max_deceleration {
+            limits.max_deceleration = d;
+        }
+        if let Some(j) = self.max_jerk {
+            limits.max_jerk = j;
+        }
+    }
+}
+
+/// `setlimits <target> [<name> <value>]...` — for example
+/// `setlimits axis0 accel 100 jerk 500`. With no pairs at all it reports
+/// the target's current limits and changes nothing.
+///
+/// Each limit is accepted under two names: the `speed`/`accel`/`decel`/
+/// `jerk` spelling, and the `vmax`/`amax`/`dmax`/`jmax` one that `move`'s
+/// own positional arguments already use in `help`. Both vocabularies exist
+/// in this app already; refusing one would just be a trap.
+///
+/// `jerk none` is the `max_jerk → ∞` case: no filtering, acceleration
+/// steps, exactly the trapezoidal profile. A word rather than a huge number
+/// because the limit genuinely isn't a number — see `MotionLimits`.
+///
+/// Validated here, where the user typed it, rather than at the next move —
+/// the same "fail where it was written" precedent `check_target_in_limits`
+/// follows.
+fn parse_set_limits(rest: &[&str], line: &str) -> Result<Option<Command>, String> {
+    let Some((target, pairs)) = rest.split_first() else {
+        return Err(format!(
+            "expected: setlimits <target> [<name> <value>]..., got {line:?}"
+        ));
     };
-    let max_acceleration = match numeric_rest.next() {
-        Some(a) => parse_f64(a)?,
-        None => defaults.1,
+    let target = parse_target(target)?;
+
+    let positive = |name: &str, text: &str| -> Result<f64, String> {
+        let v = parse_f64(text)?;
+        if !v.is_finite() || v <= 0.0 {
+            return Err(format!("{name} must be a positive number (got {v})"));
+        }
+        Ok(v)
     };
-    let max_deceleration = match numeric_rest.next() {
-        Some(d) => parse_f64(d)?,
-        None => max_acceleration,
-    };
-    Ok((max_speed, max_acceleration, max_deceleration))
+
+    let mut update = LimitsUpdate::default();
+    let mut pairs = pairs.iter();
+    while let Some(name) = pairs.next() {
+        let value = pairs
+            .next()
+            .ok_or_else(|| format!("{name:?} needs a value: {line:?}"))?;
+        match *name {
+            "speed" | "vmax" => update.max_speed = Some(positive("speed", value)?),
+            "accel" | "amax" => update.max_acceleration = Some(positive("accel", value)?),
+            "decel" | "dmax" => update.max_deceleration = Some(positive("decel", value)?),
+            "jerk" | "jmax" => {
+                update.max_jerk = Some(match *value {
+                    "none" => None,
+                    v => Some(positive("jerk", v)?),
+                })
+            }
+            other => {
+                return Err(format!(
+                    "unknown limit {other:?} (expected speed, accel, decel or jerk): {line:?}"
+                ));
+            }
+        }
+    }
+
+    Ok(Some(match target {
+        Target::Axis(axis) => Command::SetLimits { axis, update },
+        Target::Group(group) => Command::SetGroupLimits { group, update },
+    }))
 }
 
 /// What a command verb (`enable`/`disable`/`reset`/`stop`/`move`) is aimed
@@ -929,6 +1158,14 @@ fn print_help() {
         "same, waypoints read from a file (one per line)",
     );
     cmd_line("stop <target> [decel]", "decelerate to a stop");
+    cmd_line(
+        "setlimits <target> [speed|accel|decel|jerk <value>]...",
+        "change some limits (jerk takes `none`); applies to the next move",
+    );
+    cmd_line(
+        "setlimits <target>",
+        "report the target's current limits, changing nothing",
+    );
     cmd_line("enable <target>", "power up and enable");
     cmd_line("disable <target>", "disable (faults it if actively moving)");
     cmd_line("reset <target>", "clear a fault");
@@ -1019,7 +1256,7 @@ struct SharedPathMove {
 /// without caring which one it is — except where it does care (`is_stop`),
 /// for messages that should read differently for a stop than for a move.
 enum Profile {
-    Move(TrapezoidalProfile),
+    Move(JerkFilteredProfile),
     Stop(StopRamp),
     Group {
         shared: Rc<SharedGroupMove>,
@@ -1041,6 +1278,7 @@ impl Profile {
                 motion_core::TrajectorySample {
                     position: s.position()[*index],
                     velocity: s.velocity()[*index],
+                    acceleration: s.acceleration()[*index],
                 }
             }
             Profile::Path { shared, index } => {
@@ -1048,6 +1286,7 @@ impl Profile {
                 motion_core::TrajectorySample {
                     position: s.position()[*index],
                     velocity: s.velocity()[*index],
+                    acceleration: s.acceleration()[*index],
                 }
             }
         }
@@ -1176,14 +1415,16 @@ impl ActiveGroupMove {
     ) -> (
         motion_core::KinematicVector,
         motion_core::KinematicVector,
+        motion_core::KinematicVector,
         motion_core::KinematicBranch,
     ) {
-        let (position, velocity, branch) = match self {
+        let (position, velocity, acceleration, branch) = match self {
             ActiveGroupMove::Group(s) => {
                 let sample = s.profile.sample(t);
                 (
                     motion_core::KinematicVector::from_slice(sample.position()),
                     motion_core::KinematicVector::from_slice(sample.velocity()),
+                    motion_core::KinematicVector::from_slice(sample.acceleration()),
                     s.branch,
                 )
             }
@@ -1192,6 +1433,7 @@ impl ActiveGroupMove {
                 (
                     motion_core::KinematicVector::from_slice(sample.position()),
                     motion_core::KinematicVector::from_slice(sample.velocity()),
+                    motion_core::KinematicVector::from_slice(sample.acceleration()),
                     s.branch,
                 )
             }
@@ -1199,6 +1441,7 @@ impl ActiveGroupMove {
         (
             position.expect("profile sample is always a valid kinematic vector"),
             velocity.expect("profile sample is always a valid kinematic vector"),
+            acceleration.expect("profile sample is always a valid kinematic vector"),
             branch,
         )
     }
@@ -1267,7 +1510,7 @@ fn cascade_group_stop(
         // Each sibling decelerates at *its own* limit, not the group move's.
         // The group's `max_deceleration` is a Cartesian TCP quantity, and
         // this ramp is built in joint space — see `AxisConfig`.
-        let decel = AXIS_CONFIGS[other].max_deceleration;
+        let decel = AXIS_CONFIGS[other].limits.max_deceleration;
         let units = AXIS_CONFIGS[other].units;
         if Some(other) == except {
             continue;
@@ -1375,9 +1618,7 @@ fn install_group_move(
     group: usize,
     members: &'static [usize],
     targets: Vec<f64>,
-    max_speed: f64,
-    max_acceleration: f64,
-    max_deceleration: f64,
+    limits: &MotionLimits,
 ) -> Result<f64, GroupMoveError> {
     let model = AXIS_GROUPS[group].kinematics;
     let joint_start = commanded_vector(axes, members, |ax| ax.commanded_position)?;
@@ -1395,13 +1636,17 @@ fn install_group_move(
     let joint_target =
         model.inverse_position(motion_core::KinematicVector::from_slice(&targets)?, branch)?;
 
+    // `limits` is already resolved against the group's live configuration
+    // (see `RuntimeLimits::resolve`) and is task-space throughout, jerk
+    // included.
     let profile = LinearMove::new_with_start_velocity(
         start.as_slice().to_vec(),
         start_velocity.as_slice().to_vec(),
         targets,
-        max_speed,
-        max_acceleration,
-        max_deceleration,
+        limits.max_speed,
+        limits.max_acceleration,
+        limits.max_deceleration,
+        limits.max_jerk,
     )?;
     let duration = profile.duration();
     let shared = Rc::new(SharedGroupMove {
@@ -1450,10 +1695,15 @@ fn install_path_move_impl(
     group: usize,
     members: &'static [usize],
     waypoints: Vec<Vec<f64>>,
-    max_speed: f64,
-    max_acceleration: f64,
-    max_deceleration: f64,
-    build: impl FnOnce(Vec<Vec<f64>>, Vec<f64>, f64, f64, f64) -> Result<PathProfile, PathProfileError>,
+    limits: &MotionLimits,
+    build: impl FnOnce(
+        Vec<Vec<f64>>,
+        Vec<f64>,
+        f64,
+        f64,
+        f64,
+        Option<f64>,
+    ) -> Result<PathProfile, PathProfileError>,
 ) -> Result<f64, GroupMoveError> {
     let model = AXIS_GROUPS[group].kinematics;
     let joint_start = commanded_vector(axes, members, |ax| ax.commanded_position)?;
@@ -1483,9 +1733,10 @@ fn install_path_move_impl(
     let profile = build(
         all_waypoints,
         start_velocity.as_slice().to_vec(),
-        max_speed,
-        max_acceleration,
-        max_deceleration,
+        limits.max_speed,
+        limits.max_acceleration,
+        limits.max_deceleration,
+        limits.max_jerk,
     )?;
     let duration = profile.duration();
     let shared = Rc::new(SharedPathMove {
@@ -1517,18 +1768,14 @@ fn install_path_move(
     group: usize,
     members: &'static [usize],
     waypoints: Vec<Vec<f64>>,
-    max_speed: f64,
-    max_acceleration: f64,
-    max_deceleration: f64,
+    limits: &MotionLimits,
 ) -> Result<f64, GroupMoveError> {
     install_path_move_impl(
         axes,
         group,
         members,
         waypoints,
-        max_speed,
-        max_acceleration,
-        max_deceleration,
+        limits,
         PathProfile::new_with_start_velocity,
     )
 }
@@ -1540,18 +1787,14 @@ fn install_path_move_blended(
     group: usize,
     members: &'static [usize],
     waypoints: Vec<Vec<f64>>,
-    max_speed: f64,
-    max_acceleration: f64,
-    max_deceleration: f64,
+    limits: &MotionLimits,
 ) -> Result<f64, GroupMoveError> {
     install_path_move_impl(
         axes,
         group,
         members,
         waypoints,
-        max_speed,
-        max_acceleration,
-        max_deceleration,
+        limits,
         PathProfile::new_blended,
     )
 }
@@ -1607,7 +1850,7 @@ fn handle_stop(ax: &mut AxisRuntime, axis: usize, max_deceleration: Option<f64>)
         ax.pending.clear();
         println!("  -> {}: already at rest", axis_label(axis));
     } else {
-        let decel = max_deceleration.unwrap_or(AXIS_CONFIGS[axis].max_deceleration);
+        let decel = max_deceleration.unwrap_or(AXIS_CONFIGS[axis].limits.max_deceleration);
         let units = AXIS_CONFIGS[axis].units;
         abort_into(ax, axis, "stop", move |position, velocity| {
             let ramp = StopRamp::new(position, velocity, decel)?;
@@ -1633,9 +1876,10 @@ struct ActiveMove {
 
 struct PendingMove {
     target: f64,
-    max_speed: f64,
-    max_acceleration: f64,
-    max_deceleration: f64,
+    /// Resolved when the command was accepted, not when it is promoted:
+    /// a queued move runs under the limits in force when it was issued,
+    /// so a later `setlimits` cannot retroactively rewrite it.
+    limits: MotionLimits,
 }
 
 /// The group-level analog of `PendingMove` — one entry in a hard-coded
@@ -1649,15 +1893,11 @@ struct PendingMove {
 enum PendingGroupMove {
     Move {
         targets: Vec<f64>,
-        max_speed: f64,
-        max_acceleration: f64,
-        max_deceleration: f64,
+        limits: MotionLimits,
     },
     Path {
         waypoints: Vec<Vec<f64>>,
-        max_speed: f64,
-        max_acceleration: f64,
-        max_deceleration: f64,
+        limits: MotionLimits,
     },
 }
 
@@ -1672,6 +1912,9 @@ struct AxisRuntime {
     // below — never to seed a profile. See `commanded_position`.
     position: f64,
     velocity: f64,
+    /// Measured acceleration — reporting only, and an estimate rather
+    /// than ground truth (see `axis_backend::AxisFeedback::acceleration`).
+    acceleration: f64,
     // The *commanded* (model) position/velocity: exactly what was sent as
     // this axis's `AxisSetpoint` last cycle. This — not feedback — is what
     // every profile is seeded from: a new move, an aborting redirect, a
@@ -1739,6 +1982,7 @@ impl AxisRuntime {
         Self {
             position: 0.0,
             velocity: 0.0,
+            acceleration: 0.0,
             commanded_position: 0.0,
             commanded_velocity: 0.0,
             active: None,
@@ -1760,6 +2004,9 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
     // for why this can't just live inside `AxisRuntime`).
     let mut group_pending: Vec<VecDeque<PendingGroupMove>> =
         (0..AXIS_GROUPS.len()).map(|_| VecDeque::new()).collect();
+    // Live limits, seeded from the compile-time tables and editable via
+    // `setlimits`.
+    let mut runtime_limits = RuntimeLimits::new();
     // Recording is a passive tap at the AxisGroup seam (see recording.rs) —
     // everything below this line is unchanged from before viz existed.
     let mut backend =
@@ -1796,12 +2043,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                 continue;
             }
             while let Some(p) = ax.pending.pop_front() {
-                match TrapezoidalProfile::new(
+                match JerkFilteredProfile::new(
                     ax.commanded_position,
                     p.target,
-                    p.max_speed,
-                    p.max_acceleration,
-                    p.max_deceleration,
+                    p.limits.max_speed,
+                    p.limits.max_acceleration,
+                    p.limits.max_deceleration,
+                    p.limits.max_jerk,
                 ) {
                     Ok(profile) => {
                         println!(
@@ -1857,36 +2105,14 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                 // vs PathProfileError) — .to_string() unifies them, since the
                 // caller only ever needs to print whichever it got.
                 let result = match p {
-                    PendingGroupMove::Move {
-                        targets,
-                        max_speed,
-                        max_acceleration,
-                        max_deceleration,
-                    } => install_group_move(
-                        &mut axes,
-                        g,
-                        members,
-                        targets,
-                        max_speed,
-                        max_acceleration,
-                        max_deceleration,
-                    )
-                    .map_err(|e| e.to_string()),
-                    PendingGroupMove::Path {
-                        waypoints,
-                        max_speed,
-                        max_acceleration,
-                        max_deceleration,
-                    } => install_path_move(
-                        &mut axes,
-                        g,
-                        members,
-                        waypoints,
-                        max_speed,
-                        max_acceleration,
-                        max_deceleration,
-                    )
-                    .map_err(|e| e.to_string()),
+                    PendingGroupMove::Move { targets, limits } => {
+                        install_group_move(&mut axes, g, members, targets, &limits)
+                            .map_err(|e| e.to_string())
+                    }
+                    PendingGroupMove::Path { waypoints, limits } => {
+                        install_path_move(&mut axes, g, members, waypoints, &limits)
+                            .map_err(|e| e.to_string())
+                    }
                 };
                 match result {
                     Ok(duration) => {
@@ -1914,13 +2140,15 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
         //
         //     The branch comes from the move — resolved once at install,
         //     never re-resolved here. See `SharedGroupMove::branch`.
-        let mut group_joint: Vec<
-            Option<(motion_core::KinematicVector, motion_core::KinematicVector)>,
-        > = vec![None; AXIS_GROUPS.len()];
+        let mut group_joint: Vec<Option<GroupJointSample>> = vec![None; AXIS_GROUPS.len()];
         // A failed conversion can't cascade from inside this pass (that
-        // needs `&mut` across the whole slice), so failures are collected
-        // and applied after the setpoint map — the same collect-then-apply
-        // shape the feedback fold below already uses.
+        // needs `&mut` across the whole slice while this loop is reading
+        // it), so failures are collected here and applied in 1d — the same
+        // collect-then-apply shape the feedback fold below uses.
+        //
+        // 1d, not after the setpoint pass: the ramps it builds start from
+        // each member's `commanded_velocity`, and the setpoint pass is what
+        // overwrites that. See 1d for why the ordering matters.
         let mut ik_failures: Vec<(ActiveGroupMove, String)> = Vec::new();
         for (g, group) in AXIS_GROUPS.iter().enumerate() {
             // Any member driving this group's move is a valid
@@ -1943,8 +2171,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             };
             let (shared, started_at) = shared;
             let elapsed = started_at.elapsed().as_secs_f64();
-            let (cartesian_position, cartesian_velocity, branch) = shared.sample(elapsed);
+            let (cartesian_position, cartesian_velocity, cartesian_acceleration, branch) =
+                shared.sample(elapsed);
 
+            // Position, then velocity, then acceleration — each needs the
+            // one before it. Joint acceleration additionally needs the
+            // joint *velocity* (the `J̇·q̇` term), which is why it can't be
+            // a second independent conversion of the Cartesian sample.
             let model = group.kinematics;
             let converted =
                 model
@@ -1952,7 +2185,12 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     .and_then(|joint_position| {
                         let joint_velocity =
                             model.inverse_velocity(joint_position, cartesian_velocity)?;
-                        Ok((joint_position, joint_velocity))
+                        let joint_acceleration = model.inverse_acceleration(
+                            joint_position,
+                            joint_velocity,
+                            cartesian_acceleration,
+                        )?;
+                        Ok((joint_position, joint_velocity, joint_acceleration))
                     });
             match converted {
                 Ok(pair) => group_joint[g] = Some(pair),
@@ -2016,9 +2254,10 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     // also this axis's setpoint.
                     Some(mv) => match mv.profile.group_and_index() {
                         Some((g, index)) => match &group_joint[g] {
-                            Some((position, velocity)) => AxisSetpoint {
+                            Some((position, velocity, acceleration)) => AxisSetpoint {
                                 position: position.as_slice()[index],
                                 velocity: velocity.as_slice()[index],
+                                acceleration: acceleration.as_slice()[index],
                                 enabled: ax.want_enabled,
                                 fault_reset,
                                 stopping: mv.profile.is_stop(),
@@ -2034,6 +2273,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             None => AxisSetpoint {
                                 position: ax.commanded_position,
                                 velocity: 0.0,
+                                acceleration: 0.0,
                                 enabled: ax.want_enabled,
                                 fault_reset,
                                 stopping: false,
@@ -2045,6 +2285,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             AxisSetpoint {
                                 position: sample.position,
                                 velocity: sample.velocity,
+                                acceleration: sample.acceleration,
                                 enabled: ax.want_enabled,
                                 fault_reset,
                                 stopping: mv.profile.is_stop(),
@@ -2054,6 +2295,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     None => AxisSetpoint {
                         position: ax.commanded_position,
                         velocity: 0.0,
+                        acceleration: 0.0,
                         enabled: ax.want_enabled,
                         fault_reset,
                         stopping: false,
@@ -2089,6 +2331,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             let was_operational = axis_operational(ax.axis_state);
             ax.position = feedback[i].position;
             ax.velocity = feedback[i].velocity;
+            ax.acceleration = feedback[i].acceleration;
             ax.axis_state = feedback[i].state;
 
             // The one resync point: coming back from non-operational
@@ -2201,10 +2444,12 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             || now.duration_since(ax.last_status_print) >= STATUS_PRINT_PERIOD)
                     {
                         println!(
-                            "     {}  t={elapsed:>6.3}s  pos={:>9.3} {units}  vel={:>8.3} {units}/s  {}",
+                            "     {}  t={elapsed:>6.3}s  pos={:>9.3} {units}  vel={:>8.3} {units}/s  \
+                             acc={:>9.3} {units}/s^2  {}",
                             axis_label(i),
                             ax.position,
                             ax.velocity,
+                            ax.acceleration,
                             phase_label(phase),
                             units = AXIS_CONFIGS[i].units
                         );
@@ -2238,6 +2483,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_deceleration,
                     buffer_mode,
                 } => {
+                    // Whatever the command didn't specify comes from the
+                    // *live* limits, so a `setlimits` applies from the very
+                    // next move onward.
+                    let limits = RuntimeLimits::resolve(
+                        &runtime_limits.axes[axis],
+                        (max_speed, max_acceleration, max_deceleration),
+                    );
                     let ax = &mut axes[axis];
                     if !axis_operational(ax.axis_state) {
                         println!(
@@ -2267,13 +2519,14 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                 let previous_group =
                                     ax.active.as_ref().and_then(|mv| group_of(&mv.profile));
                                 abort_into(ax, axis, "move", move |position, velocity| {
-                                    let profile = TrapezoidalProfile::new_with_start_velocity(
+                                    let profile = JerkFilteredProfile::new_with_start_velocity(
                                         position,
                                         velocity,
                                         target,
-                                        max_speed,
-                                        max_acceleration,
-                                        max_deceleration,
+                                        limits.max_speed,
+                                        limits.max_acceleration,
+                                        limits.max_deceleration,
+                                        limits.max_jerk,
                                     )?;
                                     println!(
                                         "  -> {}: move (aborting): {:.3} -> {target:.3} {units} ({:.3}s)",
@@ -2295,12 +2548,13 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                 }
                             }
                             BufferMode::Buffered if ax.active.is_none() => {
-                                match TrapezoidalProfile::new(
+                                match JerkFilteredProfile::new(
                                     ax.commanded_position,
                                     target,
-                                    max_speed,
-                                    max_acceleration,
-                                    max_deceleration,
+                                    limits.max_speed,
+                                    limits.max_acceleration,
+                                    limits.max_deceleration,
+                                    limits.max_jerk,
                                 ) {
                                     Ok(profile) => {
                                         println!(
@@ -2327,12 +2581,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                     ax.pending.len(),
                                     units = AXIS_CONFIGS[axis].units
                                 );
-                                ax.pending.push_back(PendingMove {
-                                    target,
-                                    max_speed,
-                                    max_acceleration,
-                                    max_deceleration,
-                                });
+                                ax.pending.push_back(PendingMove { target, limits });
                             }
                         }
                     }
@@ -2406,6 +2655,12 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_deceleration,
                     buffer_mode,
                 } => {
+                    // Group limits, not the members' own — a group move is
+                    // a TCP-space command. See `MotionLimits`.
+                    let limits = RuntimeLimits::resolve(
+                        &runtime_limits.groups[group],
+                        (max_speed, max_acceleration, max_deceleration),
+                    );
                     let members = AXIS_GROUPS[group].axes;
                     let all_operational = members
                         .iter()
@@ -2425,27 +2680,14 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             group_label(group),
                             group_pending[group].len()
                         );
-                        group_pending[group].push_back(PendingGroupMove::Move {
-                            targets,
-                            max_speed,
-                            max_acceleration,
-                            max_deceleration,
-                        });
+                        group_pending[group].push_back(PendingGroupMove::Move { targets, limits });
                     } else {
                         // Either idle, or Aborting redirecting a busy group
                         // right now — either way, seizing control clears
                         // anything this group had queued, same as
                         // `abort_into` does for a single axis.
                         group_pending[group].clear();
-                        match install_group_move(
-                            &mut axes,
-                            group,
-                            members,
-                            targets,
-                            max_speed,
-                            max_acceleration,
-                            max_deceleration,
-                        ) {
+                        match install_group_move(&mut axes, group, members, targets, &limits) {
                             Ok(duration) => {
                                 println!("  -> {}: move ({duration:.3}s)", group_label(group));
                             }
@@ -2463,6 +2705,10 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_deceleration,
                     buffer_mode,
                 } => {
+                    let limits = RuntimeLimits::resolve(
+                        &runtime_limits.groups[group],
+                        (max_speed, max_acceleration, max_deceleration),
+                    );
                     let members = AXIS_GROUPS[group].axes;
                     let all_operational = members
                         .iter()
@@ -2483,12 +2729,8 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             group_label(group),
                             group_pending[group].len()
                         );
-                        group_pending[group].push_back(PendingGroupMove::Path {
-                            waypoints,
-                            max_speed,
-                            max_acceleration,
-                            max_deceleration,
-                        });
+                        group_pending[group]
+                            .push_back(PendingGroupMove::Path { waypoints, limits });
                     } else {
                         // Either idle, or Aborting/Blend redirecting a busy
                         // group right now (mid-flight, from wherever it
@@ -2499,25 +2741,9 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         // install_path_move_impl's docs.
                         group_pending[group].clear();
                         let result = if buffer_mode == BufferMode::Blend {
-                            install_path_move_blended(
-                                &mut axes,
-                                group,
-                                members,
-                                waypoints,
-                                max_speed,
-                                max_acceleration,
-                                max_deceleration,
-                            )
+                            install_path_move_blended(&mut axes, group, members, waypoints, &limits)
                         } else {
-                            install_path_move(
-                                &mut axes,
-                                group,
-                                members,
-                                waypoints,
-                                max_speed,
-                                max_acceleration,
-                                max_deceleration,
-                            )
+                            install_path_move(&mut axes, group, members, waypoints, &limits)
                         };
                         match result {
                             Ok(duration) => {
@@ -2531,6 +2757,26 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             }
                         }
                     }
+                }
+                Command::SetLimits { axis, update } => {
+                    update.apply(&mut runtime_limits.axes[axis]);
+                    print_limits(
+                        &axis_label(axis),
+                        &runtime_limits.axes[axis],
+                        AXIS_CONFIGS[axis].units,
+                        !update.is_empty(),
+                    );
+                }
+                Command::SetGroupLimits { group, update } => {
+                    // Groups are Cartesian regardless of what carries them,
+                    // so the units label is mm, not the members'.
+                    update.apply(&mut runtime_limits.groups[group]);
+                    print_limits(
+                        group_label(group),
+                        &runtime_limits.groups[group],
+                        "mm",
+                        !update.is_empty(),
+                    );
                 }
                 Command::Verbose => {
                     verbose = !verbose;
@@ -2659,6 +2905,27 @@ fn print_status(axes: &[AxisRuntime]) {
     }
 }
 
+/// Report a target's limits in its own units — after a `setlimits` changed
+/// some (`changed`), or as a plain query when it named none.
+///
+/// Always prints *all four*, not just the ones that moved: the useful
+/// question after a partial update is what the machine will now do, not
+/// which words were typed.
+fn print_limits(label: &str, limits: &MotionLimits, units: &str, changed: bool) {
+    let jerk = match limits.max_jerk {
+        Some(j) => format!("{j:.3} {units}/s^3"),
+        None => "none (unfiltered)".to_string(),
+    };
+    println!(
+        "  -> {label}: {}: speed {:.3} {units}/s, accel {:.3} {units}/s^2, \
+         decel {:.3} {units}/s^2, jerk {jerk}",
+        if changed { "limits set" } else { "limits" },
+        limits.max_speed,
+        limits.max_acceleration,
+        limits.max_deceleration
+    );
+}
+
 fn phase_label(phase: MotionPhase) -> &'static str {
     match phase {
         MotionPhase::Pre => "pre",
@@ -2743,19 +3010,131 @@ mod tests {
         );
     }
 
+    /// Unspecified limits stay `None` through parsing — the control loop
+    /// fills them from its *live* table, so `setlimits` can change what a
+    /// later bare `move` means. Resolving them here would pin every command
+    /// to the compile-time values.
     #[test]
-    fn parse_command_move_defaults() {
+    fn parse_command_move_leaves_unspecified_limits_open() {
         assert_eq!(
             parse_command("move axis0 100"),
             Ok(Some(Command::Move {
                 axis: 0,
                 target: 100.0,
-                max_speed: AXIS_CONFIGS[0].max_speed,
-                max_acceleration: AXIS_CONFIGS[0].max_acceleration,
-                max_deceleration: AXIS_CONFIGS[0].max_acceleration,
+                max_speed: None,
+                max_acceleration: None,
+                max_deceleration: None,
                 buffer_mode: BufferMode::Buffered,
             }))
         );
+    }
+
+    #[test]
+    fn setlimits_changes_only_what_it_names() {
+        let cmd = parse_command("setlimits axis0 accel 100 jerk 500");
+        let Ok(Some(Command::SetLimits { axis: 0, update })) = cmd else {
+            panic!("expected a SetLimits for axis0, got {cmd:?}");
+        };
+        assert_eq!(update.max_acceleration, Some(100.0));
+        assert_eq!(update.max_jerk, Some(Some(500.0)));
+        // Untouched: speed and decel keep whatever the axis already had.
+        assert_eq!(update.max_speed, None);
+        assert_eq!(update.max_deceleration, None);
+
+        let mut limits = MotionLimits {
+            max_speed: 1.0,
+            max_acceleration: 2.0,
+            max_deceleration: 3.0,
+            max_jerk: Some(4.0),
+        };
+        update.apply(&mut limits);
+        assert_eq!(limits.max_speed, 1.0);
+        assert_eq!(limits.max_acceleration, 100.0);
+        assert_eq!(limits.max_deceleration, 3.0);
+        assert_eq!(limits.max_jerk, Some(500.0));
+    }
+
+    /// "Don't touch jerk" and "remove the jerk limit" must not be the same
+    /// command — the two-level Option is what keeps them apart.
+    #[test]
+    fn setlimits_distinguishes_unnamed_jerk_from_jerk_none() {
+        let mut limits = MotionLimits {
+            max_speed: 1.0,
+            max_acceleration: 2.0,
+            max_deceleration: 3.0,
+            max_jerk: Some(4.0),
+        };
+
+        let Ok(Some(Command::SetLimits { update, .. })) = parse_command("setlimits axis0 speed 9")
+        else {
+            panic!("expected SetLimits");
+        };
+        update.apply(&mut limits);
+        assert_eq!(limits.max_jerk, Some(4.0), "unnamed jerk is untouched");
+
+        let Ok(Some(Command::SetLimits { update, .. })) =
+            parse_command("setlimits axis0 jerk none")
+        else {
+            panic!("expected SetLimits");
+        };
+        update.apply(&mut limits);
+        assert_eq!(limits.max_jerk, None, "`jerk none` removes the limit");
+    }
+
+    #[test]
+    fn setlimits_with_no_pairs_is_a_query() {
+        let Ok(Some(Command::SetLimits { axis: 0, update })) = parse_command("setlimits axis0")
+        else {
+            panic!("expected SetLimits");
+        };
+        assert!(update.is_empty());
+    }
+
+    #[test]
+    fn setlimits_accepts_a_group_and_the_vmax_spellings() {
+        let Ok(Some(Command::SetGroupLimits { group: 0, update })) =
+            parse_command("setlimits axisGroup0 amax 7 jmax 8")
+        else {
+            panic!("expected SetGroupLimits");
+        };
+        assert_eq!(update.max_acceleration, Some(7.0));
+        assert_eq!(update.max_jerk, Some(Some(8.0)));
+    }
+
+    #[test]
+    fn setlimits_rejects_bad_names_values_and_dangling_pairs() {
+        // Unknown limit name.
+        assert!(parse_command("setlimits axis0 jrk 5").is_err());
+        // Name with no value.
+        assert!(parse_command("setlimits axis0 accel").is_err());
+        // Non-positive and non-finite values.
+        assert!(parse_command("setlimits axis0 accel 0").is_err());
+        assert!(parse_command("setlimits axis0 speed -1").is_err());
+        assert!(parse_command("setlimits axis0 jerk inf").is_err());
+        // `none` is only meaningful for jerk.
+        assert!(parse_command("setlimits axis0 speed none").is_err());
+    }
+
+    #[test]
+    fn unspecified_limits_resolve_against_the_live_table() {
+        let configured = MotionLimits {
+            max_speed: 11.0,
+            max_acceleration: 22.0,
+            max_deceleration: 33.0,
+            max_jerk: Some(44.0),
+        };
+        // Nothing given: every limit comes from configuration.
+        let all_default = RuntimeLimits::resolve(&configured, (None, None, None));
+        assert_eq!(all_default, configured);
+
+        // Given values win, and `dmax` falls back to the *configured*
+        // deceleration rather than to whatever `amax` resolved to.
+        let partial = RuntimeLimits::resolve(&configured, (Some(1.0), Some(2.0), None));
+        assert_eq!(partial.max_speed, 1.0);
+        assert_eq!(partial.max_acceleration, 2.0);
+        assert_eq!(partial.max_deceleration, 33.0);
+        // Jerk has no command-line form, so it is always the configured one.
+        assert_eq!(partial.max_jerk, Some(44.0));
     }
 
     #[test]
@@ -2786,9 +3165,9 @@ mod tests {
             Ok(Some(Command::Move {
                 axis: 0,
                 target: 100.0,
-                max_speed: 10.0,
-                max_acceleration: 20.0,
-                max_deceleration: 30.0,
+                max_speed: Some(10.0),
+                max_acceleration: Some(20.0),
+                max_deceleration: Some(30.0),
                 buffer_mode: BufferMode::Buffered,
             }))
         );
@@ -2801,9 +3180,9 @@ mod tests {
             Ok(Some(Command::Move {
                 axis: 0,
                 target: 100.0,
-                max_speed: 10.0,
-                max_acceleration: 20.0,
-                max_deceleration: 30.0,
+                max_speed: Some(10.0),
+                max_acceleration: Some(20.0),
+                max_deceleration: Some(30.0),
                 buffer_mode: BufferMode::Aborting,
             }))
         );
@@ -2813,9 +3192,9 @@ mod tests {
             Ok(Some(Command::Move {
                 axis: 0,
                 target: 100.0,
-                max_speed: AXIS_CONFIGS[0].max_speed,
-                max_acceleration: AXIS_CONFIGS[0].max_acceleration,
-                max_deceleration: AXIS_CONFIGS[0].max_acceleration,
+                max_speed: None,
+                max_acceleration: None,
+                max_deceleration: None,
                 buffer_mode: BufferMode::Aborting,
             }))
         );
@@ -2844,9 +3223,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![10.0, 0.0], vec![10.0, 10.0]],
-                max_speed: DEFAULT_CARTESIAN_MAX_SPEED,
-                max_acceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
+                max_speed: None,
+                max_acceleration: None,
+                max_deceleration: None,
                 buffer_mode: BufferMode::Buffered,
             }))
         );
@@ -2859,9 +3238,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![5.0, 5.0]],
-                max_speed: 10.0,
-                max_acceleration: 20.0,
-                max_deceleration: 30.0,
+                max_speed: Some(10.0),
+                max_acceleration: Some(20.0),
+                max_deceleration: Some(30.0),
                 buffer_mode: BufferMode::Buffered,
             }))
         );
@@ -2874,9 +3253,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![5.0, 5.0]],
-                max_speed: 10.0,
-                max_acceleration: 20.0,
-                max_deceleration: 30.0,
+                max_speed: Some(10.0),
+                max_acceleration: Some(20.0),
+                max_deceleration: Some(30.0),
                 buffer_mode: BufferMode::Aborting,
             }))
         );
@@ -2886,9 +3265,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![5.0, 5.0]],
-                max_speed: DEFAULT_CARTESIAN_MAX_SPEED,
-                max_acceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
+                max_speed: None,
+                max_acceleration: None,
+                max_deceleration: None,
                 buffer_mode: BufferMode::Aborting,
             }))
         );
@@ -2901,9 +3280,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![5.0, 5.0]],
-                max_speed: 10.0,
-                max_acceleration: 20.0,
-                max_deceleration: 30.0,
+                max_speed: Some(10.0),
+                max_acceleration: Some(20.0),
+                max_deceleration: Some(30.0),
                 buffer_mode: BufferMode::Blend,
             }))
         );
@@ -2990,9 +3369,9 @@ mod tests {
             Ok(Some(Command::MovePath {
                 group: 0,
                 waypoints: vec![vec![10.0, 0.0], vec![10.0, 10.0]],
-                max_speed: 30.0,
-                max_acceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
-                max_deceleration: DEFAULT_CARTESIAN_MAX_ACCELERATION,
+                max_speed: Some(30.0),
+                max_acceleration: None,
+                max_deceleration: None,
                 buffer_mode: BufferMode::Buffered,
             }))
         );

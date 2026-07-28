@@ -4,9 +4,16 @@
 //! existing scalar profile" pattern [`crate::LinearMove`] established for
 //! the one-segment case, just composed with richer geometry underneath.
 
-use crate::trajectory::{MotionPhase, TrajectoryError, TrapezoidalProfile};
-use crate::waypoint_path::{WaypointPath, WaypointPathError};
+use crate::jerk_filter::JerkFilteredProfile;
 use crate::linear_move::MAX_GROUP_AXES;
+use crate::trajectory::{MotionPhase, TrajectoryError};
+use crate::waypoint_path::{WaypointPath, WaypointPathError};
+
+/// Arc-length step for the central difference that gives `dT̂/ds` — the
+/// curvature term of a path sample's acceleration. Small enough to resolve
+/// the tightest corner these splines produce, large enough to stay clear of
+/// cancellation in the tangent, which is itself a finite difference.
+const CURVATURE_STEP: f64 = 1e-3;
 
 /// Reasons a [`PathProfile`] could not be constructed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -45,6 +52,7 @@ impl std::error::Error for PathProfileError {}
 pub struct PathSample {
     positions: [f64; MAX_GROUP_AXES],
     velocities: [f64; MAX_GROUP_AXES],
+    accelerations: [f64; MAX_GROUP_AXES],
     len: usize,
 }
 
@@ -58,6 +66,12 @@ impl PathSample {
     pub fn velocity(&self) -> &[f64] {
         &self.velocities[..self.len]
     }
+
+    /// Commanded acceleration for each participating axis — tangential
+    /// *and* centripetal. See `PathProfile::sample`.
+    pub fn acceleration(&self) -> &[f64] {
+        &self.accelerations[..self.len]
+    }
 }
 
 /// A multi-waypoint move across `N` axes, driven by a single scalar
@@ -68,7 +82,7 @@ impl PathSample {
 #[derive(Debug, PartialEq)]
 pub struct PathProfile {
     path: WaypointPath,
-    speed: TrapezoidalProfile,
+    speed: JerkFilteredProfile,
 }
 
 impl PathProfile {
@@ -86,6 +100,7 @@ impl PathProfile {
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+        max_jerk: Option<f64>,
     ) -> Result<Self, PathProfileError> {
         let start_velocity = vec![0.0; waypoints.first().map_or(0, |w| w.len())];
         Self::new_with_start_velocity(
@@ -94,6 +109,7 @@ impl PathProfile {
             max_speed,
             max_acceleration,
             max_deceleration,
+            max_jerk,
         )
     }
 
@@ -116,6 +132,7 @@ impl PathProfile {
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+        max_jerk: Option<f64>,
     ) -> Result<Self, PathProfileError> {
         let path = WaypointPath::new(waypoints).map_err(PathProfileError::Path)?;
         if start_velocity.len() != path.axis_count() {
@@ -129,13 +146,14 @@ impl PathProfile {
         for i in 0..path.axis_count() {
             v0_along += start_velocity[i] * tangent0[i];
         }
-        let speed = TrapezoidalProfile::new_with_start_velocity(
+        let speed = JerkFilteredProfile::new_with_start_velocity(
             0.0,
             v0_along,
             path.total_length(),
             max_speed,
             max_acceleration,
             max_deceleration,
+            max_jerk,
         )
         .map_err(PathProfileError::Speed)?;
         Ok(Self { path, speed })
@@ -163,6 +181,7 @@ impl PathProfile {
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+        max_jerk: Option<f64>,
     ) -> Result<Self, PathProfileError> {
         let path = WaypointPath::new_with_start_direction(waypoints, start_velocity.clone())
             .map_err(PathProfileError::Path)?;
@@ -171,13 +190,14 @@ impl PathProfile {
         for i in 0..path.axis_count() {
             v0_along += start_velocity[i] * tangent0[i];
         }
-        let speed = TrapezoidalProfile::new_with_start_velocity(
+        let speed = JerkFilteredProfile::new_with_start_velocity(
             0.0,
             v0_along,
             path.total_length(),
             max_speed,
             max_acceleration,
             max_deceleration,
+            max_jerk,
         )
         .map_err(PathProfileError::Speed)?;
         Ok(Self { path, speed })
@@ -210,13 +230,36 @@ impl PathProfile {
         let s = self.speed.sample(t);
         let position = self.path.position_at_arc_length(s.position);
         let tangent = self.path.tangent_at_arc_length(s.position);
+
+        // Acceleration along a *curved* path has two terms:
+        //
+        //     a = a_t · T̂  +  v² · dT̂/ds
+        //
+        // The first is the scalar profile's own acceleration along the
+        // tangent. The second is centripetal — it points across the path
+        // and exists even at constant speed, which is exactly why omitting
+        // it would be worse than useless as a feed-forward: on a tight
+        // curve at speed it is usually the *larger* of the two.
+        //
+        // `dT̂/ds` by central difference on the tangent, matching how
+        // `tangent_at_arc_length` itself is built (see its docs). This is
+        // also the quantity a curvature-limited feedrate will need — |v²
+        // dT̂/ds| is the lateral acceleration nothing currently bounds.
+        let ds = CURVATURE_STEP.min(self.path.total_length().max(f64::EPSILON));
+        let before = self.path.tangent_at_arc_length(s.position - ds);
+        let after = self.path.tangent_at_arc_length(s.position + ds);
+
         let mut velocities = [0.0; MAX_GROUP_AXES];
+        let mut accelerations = [0.0; MAX_GROUP_AXES];
         for i in 0..self.axis_count() {
             velocities[i] = tangent[i] * s.velocity;
+            let dtangent_ds = (after[i] - before[i]) / (2.0 * ds);
+            accelerations[i] = tangent[i] * s.acceleration + dtangent_ds * s.velocity * s.velocity;
         }
         PathSample {
             positions: position,
             velocities,
+            accelerations,
             len: self.axis_count(),
         }
     }
@@ -242,13 +285,17 @@ mod tests {
             10.0,
             50.0,
             50.0,
+            None,
         )
         .unwrap();
         let at_start = p.sample(0.0);
         let at_end = p.sample(p.duration());
         assert!(approx(at_start.position()[0], 0.0) && approx(at_start.position()[1], 0.0));
         assert!(approx(at_start.velocity()[0], 0.0) && approx(at_start.velocity()[1], 0.0));
-        assert!(approx_eps(at_end.position()[0], 10.0, 1e-2) && approx_eps(at_end.position()[1], 10.0, 1e-2));
+        assert!(
+            approx_eps(at_end.position()[0], 10.0, 1e-2)
+                && approx_eps(at_end.position()[1], 10.0, 1e-2)
+        );
         assert!(approx(at_end.velocity()[0], 0.0) && approx(at_end.velocity()[1], 0.0));
         assert!(approx_eps(p.target()[0], 10.0, 1e-2) && approx_eps(p.target()[1], 10.0, 1e-2));
     }
@@ -261,14 +308,17 @@ mod tests {
         let start = vec![0.0, 0.0];
         let end = vec![30.0, 40.0];
         let (max_speed, max_accel, max_decel) = (10.0, 40.0, 40.0);
-        let linear = LinearMove::new(start.clone(), end.clone(), max_speed, max_accel, max_decel).unwrap();
-        let path = PathProfile::new(
-            vec![start, end],
+        let linear = LinearMove::new(
+            start.clone(),
+            end.clone(),
             max_speed,
             max_accel,
             max_decel,
+            None,
         )
         .unwrap();
+        let path =
+            PathProfile::new(vec![start, end], max_speed, max_accel, max_decel, None).unwrap();
         assert!(approx_eps(path.duration(), linear.duration(), 1e-6));
 
         let n = 200;
@@ -306,6 +356,7 @@ mod tests {
             max_speed,
             30.0,
             30.0,
+            None,
         )
         .unwrap();
         let n = 2000;
@@ -313,7 +364,10 @@ mod tests {
             let t = p.duration() * (i as f64) / (n as f64);
             let s = p.sample(t);
             let norm: f64 = s.velocity().iter().map(|v| v * v).sum::<f64>().sqrt();
-            assert!(norm <= max_speed + 1e-3, "velocity norm {norm} exceeded max_speed {max_speed} at t={t}");
+            assert!(
+                norm <= max_speed + 1e-3,
+                "velocity norm {norm} exceeded max_speed {max_speed} at t={t}"
+            );
         }
     }
 
@@ -324,6 +378,7 @@ mod tests {
             10.0,
             20.0,
             20.0,
+            None,
         )
         .unwrap();
         assert_eq!(p.phase_at(-1.0), MotionPhase::Pre);
@@ -332,15 +387,17 @@ mod tests {
 
     #[test]
     fn rejects_invalid_speed_limits() {
-        match PathProfile::new(vec![vec![0.0], vec![1.0]], -1.0, 10.0, 10.0) {
-            Err(PathProfileError::Speed(TrajectoryError::InvalidMaxSpeed(v))) => assert_eq!(v, -1.0),
+        match PathProfile::new(vec![vec![0.0], vec![1.0]], -1.0, 10.0, 10.0, None) {
+            Err(PathProfileError::Speed(TrajectoryError::InvalidMaxSpeed(v))) => {
+                assert_eq!(v, -1.0)
+            }
             other => panic!("expected Speed(InvalidMaxSpeed), got {other:?}"),
         }
     }
 
     #[test]
     fn rejects_invalid_path_geometry() {
-        match PathProfile::new(vec![vec![0.0]], 10.0, 10.0, 10.0) {
+        match PathProfile::new(vec![vec![0.0]], 10.0, 10.0, 10.0, None) {
             Err(PathProfileError::Path(WaypointPathError::TooFewWaypoints(1))) => {}
             other => panic!("expected Path(TooFewWaypoints), got {other:?}"),
         }
@@ -351,15 +408,10 @@ mod tests {
     #[test]
     fn new_is_thin_wrapper_of_new_with_start_velocity() {
         let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
-        let a = PathProfile::new(waypoints.clone(), 10.0, 50.0, 50.0).unwrap();
-        let b = PathProfile::new_with_start_velocity(
-            waypoints,
-            vec![0.0, 0.0],
-            10.0,
-            50.0,
-            50.0,
-        )
-        .unwrap();
+        let a = PathProfile::new(waypoints.clone(), 10.0, 50.0, 50.0, None).unwrap();
+        let b =
+            PathProfile::new_with_start_velocity(waypoints, vec![0.0, 0.0], 10.0, 50.0, 50.0, None)
+                .unwrap();
         assert_eq!(a, b);
     }
 
@@ -375,6 +427,7 @@ mod tests {
             5.0,
             10.0,
             10.0,
+            None,
         )
         .unwrap();
         let path = PathProfile::new_with_start_velocity(
@@ -383,6 +436,7 @@ mod tests {
             5.0,
             10.0,
             10.0,
+            None,
         )
         .unwrap();
         assert!(approx_eps(path.duration(), linear.duration(), 1e-6));
@@ -410,6 +464,7 @@ mod tests {
             10.0,
             50.0,
             50.0,
+            None,
         )
         .unwrap();
         let at_start = path.sample(0.0);
@@ -431,11 +486,15 @@ mod tests {
             PathProfile::new_with_start_velocity(
                 vec![vec![0.0, 0.0], vec![10.0, 0.0]],
                 vec![1.0, 2.0, 3.0],
-                    10.0,
                 10.0,
                 10.0,
+                10.0,
+                None,
             ),
-            Err(PathProfileError::StartVelocityDimensionMismatch { expected: 2, got: 3 })
+            Err(PathProfileError::StartVelocityDimensionMismatch {
+                expected: 2,
+                got: 3
+            })
         );
     }
 
@@ -461,6 +520,7 @@ mod tests {
             20.0,
             40.0,
             40.0,
+            None,
         )
         .unwrap();
         let t_mid = old.duration() * 0.5; // well into cruise: velocity ~= (20, 0) exactly
@@ -474,12 +534,18 @@ mod tests {
             20.0,
             40.0,
             40.0,
+            None,
         )
         .unwrap();
         let at_start = new.sample(0.0);
 
         let old_speed: f64 = start_velocity.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let new_speed: f64 = at_start.velocity().iter().map(|v| v * v).sum::<f64>().sqrt();
+        let new_speed: f64 = at_start
+            .velocity()
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
         assert!(
             approx_eps(old_speed, new_speed, old_speed * 0.05),
             "speed discontinuity: old {old_speed} vs new {new_speed}"
@@ -512,12 +578,21 @@ mod tests {
             20.0,
             40.0,
             40.0,
+            None,
         )
         .unwrap();
         let at_start = new.sample(0.0);
         assert!(at_start.velocity().iter().all(|v| v.is_finite()));
-        let new_speed: f64 = at_start.velocity().iter().map(|v| v * v).sum::<f64>().sqrt();
-        assert!(new_speed <= 20.0 + 1e-6, "speed grew past the incoming magnitude: {new_speed}");
+        let new_speed: f64 = at_start
+            .velocity()
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            new_speed <= 20.0 + 1e-6,
+            "speed grew past the incoming magnitude: {new_speed}"
+        );
         // Still leans toward the incoming +X direction rather than
         // snapping straight to the new path's own +Y-ish heading.
         assert!(at_start.velocity()[0] > 0.0);
@@ -526,15 +601,9 @@ mod tests {
     #[test]
     fn blended_reduces_to_reflection_when_velocity_is_zero() {
         let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
-        let plain = PathProfile::new(waypoints.clone(), 10.0, 50.0, 50.0).unwrap();
-        let blended = PathProfile::new_blended(
-            waypoints,
-            vec![0.0, 0.0],
-            10.0,
-            50.0,
-            50.0,
-        )
-        .unwrap();
+        let plain = PathProfile::new(waypoints.clone(), 10.0, 50.0, 50.0, None).unwrap();
+        let blended =
+            PathProfile::new_blended(waypoints, vec![0.0, 0.0], 10.0, 50.0, 50.0, None).unwrap();
         assert_eq!(plain, blended);
     }
 }

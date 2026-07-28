@@ -13,7 +13,8 @@
 //! Same absolute-time model as `TrapezoidalProfile` — no dt-stepping state
 //! here either, `sample(t)` is a pure function of elapsed time.
 
-use crate::trajectory::{MotionPhase, TrajectoryError, TrapezoidalProfile};
+use crate::jerk_filter::JerkFilteredProfile;
+use crate::trajectory::{MotionPhase, TrajectoryError};
 
 /// Upper bound on how many axes a single [`LinearMove`] can span. Exists so
 /// the per-cycle sample type ([`LinearMoveSample`]) can be a fixed-size,
@@ -82,6 +83,7 @@ impl std::error::Error for LinearMoveError {}
 pub struct LinearMoveSample {
     positions: [f64; MAX_GROUP_AXES],
     velocities: [f64; MAX_GROUP_AXES],
+    accelerations: [f64; MAX_GROUP_AXES],
     len: usize,
 }
 
@@ -95,6 +97,15 @@ impl LinearMoveSample {
     /// Commanded velocity for each participating axis.
     pub fn velocity(&self) -> &[f64] {
         &self.velocities[..self.len]
+    }
+
+    /// Commanded acceleration for each participating axis.
+    ///
+    /// A straight line has no curvature, so this is purely the scalar
+    /// path acceleration projected onto the same fixed unit direction the
+    /// other two use — no centripetal term exists to miss.
+    pub fn acceleration(&self) -> &[f64] {
+        &self.accelerations[..self.len]
     }
 }
 
@@ -110,7 +121,7 @@ pub struct LinearMove {
     start: [f64; MAX_GROUP_AXES],
     unit_direction: [f64; MAX_GROUP_AXES],
     len: usize,
-    speed: TrapezoidalProfile,
+    speed: JerkFilteredProfile,
 }
 
 impl LinearMove {
@@ -126,6 +137,7 @@ impl LinearMove {
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+        max_jerk: Option<f64>,
     ) -> Result<Self, LinearMoveError> {
         let start_velocity = vec![0.0; start.len()];
         Self::new_with_start_velocity(
@@ -135,6 +147,7 @@ impl LinearMove {
             max_speed,
             max_acceleration,
             max_deceleration,
+            max_jerk,
         )
     }
 
@@ -159,6 +172,7 @@ impl LinearMove {
         max_speed: f64,
         max_acceleration: f64,
         max_deceleration: f64,
+        max_jerk: Option<f64>,
     ) -> Result<Self, LinearMoveError> {
         if start.len() != end.len() {
             return Err(LinearMoveError::DimensionMismatch {
@@ -219,13 +233,14 @@ impl LinearMove {
             v0_along += start_velocity[i] * unit_direction[i];
         }
 
-        let speed = TrapezoidalProfile::new_with_start_velocity(
+        let speed = JerkFilteredProfile::new_with_start_velocity(
             0.0,
             v0_along,
             length,
             max_speed,
             max_acceleration,
             max_deceleration,
+            max_jerk,
         )
         .map_err(LinearMoveError::Speed)?;
 
@@ -265,13 +280,16 @@ impl LinearMove {
         let s = self.speed.sample(t);
         let mut positions = [0.0; MAX_GROUP_AXES];
         let mut velocities = [0.0; MAX_GROUP_AXES];
+        let mut accelerations = [0.0; MAX_GROUP_AXES];
         for i in 0..self.len {
             positions[i] = self.start[i] + self.unit_direction[i] * s.position;
             velocities[i] = self.unit_direction[i] * s.velocity;
+            accelerations[i] = self.unit_direction[i] * s.acceleration;
         }
         LinearMoveSample {
             positions,
             velocities,
+            accelerations,
             len: self.len,
         }
     }
@@ -285,6 +303,9 @@ impl LinearMove {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Several tests check a LinearMove against the bare scalar profile it
+    // reduces to when unfiltered.
+    use crate::trajectory::TrapezoidalProfile;
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
@@ -295,7 +316,7 @@ mod tests {
         // 3-4-5 triangle: start=(0,0), end=(3,4), length=5,
         // unit_direction=(0.6, 0.8) — hand-checkable.
         let scalar = TrapezoidalProfile::new(0.0, 5.0, 2.5, 5.0, 5.0).unwrap();
-        let linear = LinearMove::new(vec![0.0, 0.0], vec![3.0, 4.0], 2.5, 5.0, 5.0).unwrap();
+        let linear = LinearMove::new(vec![0.0, 0.0], vec![3.0, 4.0], 2.5, 5.0, 5.0, None).unwrap();
         assert!(approx(linear.duration(), scalar.duration()));
 
         let n = 200;
@@ -312,7 +333,7 @@ mod tests {
 
     #[test]
     fn degenerate_same_point_start_end_is_inert() {
-        let linear = LinearMove::new(vec![1.0, 2.0], vec![1.0, 2.0], 5.0, 5.0, 5.0).unwrap();
+        let linear = LinearMove::new(vec![1.0, 2.0], vec![1.0, 2.0], 5.0, 5.0, 5.0, None).unwrap();
         assert!(approx(linear.duration(), 0.0));
         for &t in &[-1.0, 0.0, 1.0, 100.0] {
             let s = linear.sample(t);
@@ -335,6 +356,7 @@ mod tests {
             5.0,
             10.0,
             10.0,
+            None,
         )
         .unwrap();
         assert!(approx(linear.duration(), scalar.duration()));
@@ -364,6 +386,7 @@ mod tests {
             5.0,
             10.0,
             10.0,
+            None,
         )
         .unwrap();
         let at_start = linear.sample(0.0);
@@ -382,9 +405,15 @@ mod tests {
     #[test]
     fn never_exceeds_max_speed_as_vector_norm() {
         let max_speed = 5.0;
-        let linear =
-            LinearMove::new(vec![0.0, 0.0, 0.0], vec![100.0, -50.0, 25.0], max_speed, 10.0, 10.0)
-                .unwrap();
+        let linear = LinearMove::new(
+            vec![0.0, 0.0, 0.0],
+            vec![100.0, -50.0, 25.0],
+            max_speed,
+            10.0,
+            10.0,
+            None,
+        )
+        .unwrap();
         let n = 2000;
         for i in 0..=n {
             let t = linear.duration() * (i as f64) / (n as f64);
@@ -400,7 +429,7 @@ mod tests {
     #[test]
     fn dimension_mismatch_rejected() {
         assert_eq!(
-            LinearMove::new(vec![0.0, 0.0], vec![1.0, 2.0, 3.0], 5.0, 5.0, 5.0),
+            LinearMove::new(vec![0.0, 0.0], vec![1.0, 2.0, 3.0], 5.0, 5.0, 5.0, None),
             Err(LinearMoveError::DimensionMismatch {
                 start_len: 2,
                 end_len: 3
@@ -417,7 +446,8 @@ mod tests {
                 vec![5.0, 5.0],
                 5.0,
                 5.0,
-                5.0
+                5.0,
+                None
             ),
             Err(LinearMoveError::StartVelocityDimensionMismatch {
                 start_len: 2,
@@ -431,14 +461,14 @@ mod tests {
         let start = vec![0.0; MAX_GROUP_AXES + 1];
         let end = vec![1.0; MAX_GROUP_AXES + 1];
         assert_eq!(
-            LinearMove::new(start, end, 5.0, 5.0, 5.0),
+            LinearMove::new(start, end, 5.0, 5.0, 5.0, None),
             Err(LinearMoveError::TooManyAxes(MAX_GROUP_AXES + 1))
         );
     }
 
     #[test]
     fn non_finite_coordinate_rejected() {
-        match LinearMove::new(vec![0.0, 0.0], vec![1.0, f64::NAN], 5.0, 5.0, 5.0) {
+        match LinearMove::new(vec![0.0, 0.0], vec![1.0, f64::NAN], 5.0, 5.0, 5.0, None) {
             Err(LinearMoveError::NonFiniteCoordinate { axis_index, value }) => {
                 assert_eq!(axis_index, 1);
                 assert!(value.is_nan());
@@ -451,9 +481,10 @@ mod tests {
     fn new_is_thin_wrapper_of_new_with_start_velocity() {
         let start = vec![1.0, 2.0];
         let end = vec![11.0, -3.0];
-        let a = LinearMove::new(start.clone(), end.clone(), 5.0, 10.0, 8.0).unwrap();
-        let b = LinearMove::new_with_start_velocity(start, vec![0.0, 0.0], end, 5.0, 10.0, 8.0)
-            .unwrap();
+        let a = LinearMove::new(start.clone(), end.clone(), 5.0, 10.0, 8.0, None).unwrap();
+        let b =
+            LinearMove::new_with_start_velocity(start, vec![0.0, 0.0], end, 5.0, 10.0, 8.0, None)
+                .unwrap();
         assert_eq!(a, b);
     }
 
@@ -468,6 +499,7 @@ mod tests {
             50.0,
             100.0,
             100.0,
+            None,
         )
         .unwrap();
         let n = 5000;

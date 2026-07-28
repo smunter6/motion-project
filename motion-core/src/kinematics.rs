@@ -274,6 +274,29 @@ pub trait KinematicModel {
         task_velocity: KinematicVector,
     ) -> Result<KinematicVector, KinematicsError>;
 
+    /// Task-space acceleration → joint acceleration:
+    ///
+    /// ```text
+    /// q̈ = J⁻¹ · (ẍ − J̇ · q̇)
+    /// ```
+    ///
+    /// **The `J̇·q̇` term is why this can't be composed from
+    /// [`inverse_velocity`].** A rotating linkage accelerates its own tool
+    /// even at constant joint rates — that is the centripetal/Coriolis
+    /// content of the mapping, and dropping it gives a feed-forward that is
+    /// wrong exactly when it matters most, at speed on a curve.
+    ///
+    /// Fails on the same near-singular poses [`inverse_velocity`] does, and
+    /// for the same reason: it inverts the same Jacobian.
+    ///
+    /// [`inverse_velocity`]: KinematicModel::inverse_velocity
+    fn inverse_acceleration(
+        &self,
+        joint_position: KinematicVector,
+        joint_velocity: KinematicVector,
+        task_acceleration: KinematicVector,
+    ) -> Result<KinematicVector, KinematicsError>;
+
     /// Where this mechanism physically *is* at the given pose, as a
     /// drawable polyline from base to tool — see [`Linkage`].
     ///
@@ -347,6 +370,17 @@ impl KinematicModel for IdentityKinematics {
     ) -> Result<KinematicVector, KinematicsError> {
         check_dimension(self.dof, task_velocity)?;
         Ok(task_velocity)
+    }
+
+    /// `J` is the identity, so `J̇` is zero and this is a pass-through too.
+    fn inverse_acceleration(
+        &self,
+        _joint_position: KinematicVector,
+        _joint_velocity: KinematicVector,
+        task_acceleration: KinematicVector,
+    ) -> Result<KinematicVector, KinematicsError> {
+        check_dimension(self.dof, task_acceleration)?;
+        Ok(task_acceleration)
     }
 }
 
@@ -549,6 +583,54 @@ impl KinematicModel for ScaraKinematics {
         out[0] = (j[1][1] * v[0] - j[0][1] * v[1]) / det;
         out[1] = (-j[1][0] * v[0] + j[0][0] * v[1]) / det;
         Ok(KinematicVector::from_parts(out, 2))
+    }
+
+    /// Inverts the same Jacobian [`inverse_velocity`] does, after removing
+    /// the `J̇·q̇` term — the acceleration the linkage produces on its own
+    /// while rotating, even at constant joint rates.
+    ///
+    /// `J̇` is the entry-wise time derivative of the 2x2 Jacobian, which
+    /// for this arm is elementary: every entry is a sine or cosine of `q1`
+    /// or `q1 + q2_eff`, so differentiating brings down `q̇1` or
+    /// `q̇1 + q̇2` and swaps the trig function.
+    ///
+    /// [`inverse_velocity`]: KinematicModel::inverse_velocity
+    fn inverse_acceleration(
+        &self,
+        joint_position: KinematicVector,
+        joint_velocity: KinematicVector,
+        task_acceleration: KinematicVector,
+    ) -> Result<KinematicVector, KinematicsError> {
+        check_dimension(2, joint_position)?;
+        check_dimension(2, joint_velocity)?;
+        check_dimension(2, task_acceleration)?;
+        let q = joint_position.as_slice();
+        let dq = joint_velocity.as_slice();
+
+        let q2_eff = Self::q2_eff(q[1]);
+        let (s1, c1) = q[0].sin_cos();
+        let (s12, c12) = (q[0] + q2_eff).sin_cos();
+        // Rates of the two angles the trig terms actually depend on.
+        let w1 = dq[0];
+        let w12 = dq[0] + dq[1];
+
+        let jdot = [
+            [
+                -self.l1 * c1 * w1 - self.l2 * c12 * w12,
+                -self.l2 * c12 * w12,
+            ],
+            [
+                -self.l1 * s1 * w1 - self.l2 * s12 * w12,
+                -self.l2 * s12 * w12,
+            ],
+        ];
+        let a = task_acceleration.as_slice();
+        // ẍ − J̇·q̇, then the same inversion `inverse_velocity` performs.
+        let mut residual = [0.0; MAX_GROUP_AXES];
+        residual[0] = a[0] - (jdot[0][0] * dq[0] + jdot[0][1] * dq[1]);
+        residual[1] = a[1] - (jdot[1][0] * dq[0] + jdot[1][1] * dq[1]);
+
+        self.inverse_velocity(joint_position, KinematicVector::from_parts(residual, 2))
     }
 
     /// Three points: the base at the origin, the elbow at the end of link
@@ -820,6 +902,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Round-trip through the *full* acceleration mapping, checked against
+    /// a numerical second derivative of forward kinematics.
+    ///
+    /// Integrate a constant joint acceleration forward, differentiate the
+    /// resulting tool path twice to get the true task-space acceleration,
+    /// then ask `inverse_acceleration` to recover the joint acceleration we
+    /// started from. This is what catches a wrong or missing `J̇·q̇` term —
+    /// with `q̇ ≠ 0` the two disagree substantially.
+    #[test]
+    fn inverse_acceleration_recovers_joint_acceleration_through_jdot() {
+        let arm = arm();
+        let h = 1e-5;
+        for &(q1, q2, w1, w2, a1, a2) in &[
+            (0.3, 0.4, 0.9, -0.7, 0.5, 1.1),
+            (-1.1, 0.8, -0.6, 0.4, -0.9, 0.3),
+            (2.0, -0.5, 1.3, 1.1, 0.2, -0.8),
+        ] {
+            let joint = v(&[q1, q2]);
+            let rates = v(&[w1, w2]);
+
+            // Tool position either side of now, under constant joint accel.
+            let pose_at = |dt: f64| {
+                v(&[
+                    q1 + w1 * dt + 0.5 * a1 * dt * dt,
+                    q2 + w2 * dt + 0.5 * a2 * dt * dt,
+                ])
+            };
+            let p_minus = arm.forward_position(pose_at(-h));
+            let p_now = arm.forward_position(pose_at(0.0));
+            let p_plus = arm.forward_position(pose_at(h));
+
+            let mut task_accel = [0.0; 2];
+            for (i, slot) in task_accel.iter_mut().enumerate() {
+                *slot = (p_plus.as_slice()[i] - 2.0 * p_now.as_slice()[i] + p_minus.as_slice()[i])
+                    / (h * h);
+            }
+
+            let recovered = arm
+                .inverse_acceleration(joint, rates, v(&task_accel))
+                .unwrap();
+            assert!(
+                (recovered.as_slice()[0] - a1).abs() < 1e-3
+                    && (recovered.as_slice()[1] - a2).abs() < 1e-3,
+                "recovered {:?}, expected [{a1}, {a2}]",
+                recovered.as_slice()
+            );
+        }
+    }
+
+    /// The `J̇·q̇` term is not decoration: with the joints already moving,
+    /// treating acceleration as if it were velocity gives a materially
+    /// different answer. Guards against the term being quietly dropped.
+    #[test]
+    fn jdot_term_matters_when_the_joints_are_moving() {
+        let arm = arm();
+        let joint = v(&[0.3, 0.4]);
+        let task_accel = v(&[10.0, -5.0]);
+
+        let at_rest = arm
+            .inverse_acceleration(joint, v(&[0.0, 0.0]), task_accel)
+            .unwrap();
+        let naive = arm.inverse_velocity(joint, task_accel).unwrap();
+        // At rest J̇·q̇ vanishes, so the two coincide.
+        assert!(approx(at_rest.as_slice()[0], naive.as_slice()[0]));
+
+        // Measured for this pose and rate: the terms differ by ~0.7 and
+        // ~1.7 rad/s² respectively, against joint accelerations of the same
+        // order — so this is a leading-order effect, not a correction.
+        let moving = arm
+            .inverse_acceleration(joint, v(&[1.5, -1.0]), task_accel)
+            .unwrap();
+        let shift = moving
+            .as_slice()
+            .iter()
+            .zip(naive.as_slice())
+            .map(|(m, n)| (m - n).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            shift > 0.5,
+            "J̇ term should shift the answer substantially while moving (shift {shift})"
+        );
     }
 
     #[test]
