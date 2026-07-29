@@ -675,6 +675,15 @@ explicitly and let the user choose at decision points. Keep `motion-core`
 pure. Preserve the architectural decisions above unless we explicitly revisit
 one.
 
+**Plans live in `docs/plans/`** — see its `README.md` for the index and what a
+plan is for. Two are live (unified limit scheduling; telemetry), and between
+them they carry nine open questions addressed to the user. **Read the relevant
+plan before starting or discussing a phase**, and don't conclude from the
+roadmap above that work is unplanned. Plan mode writes to `~/.claude/plans/`
+under a generated slug name by default; move it into `docs/plans/` and rename
+it for content once it stabilises, so plans stay versioned with the code they
+describe.
+
 **Verify interactive changes against the built binary** (`./target/debug/app`),
 not `cargo run` — there's a known piped-stdin timing gotcha.
 
