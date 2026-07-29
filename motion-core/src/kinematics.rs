@@ -508,8 +508,10 @@ impl KinematicModel for ScaraKinematics {
 
     /// Law of cosines for the elbow, `atan2` for the shoulder.
     ///
-    /// The returned `q2_eff` is in `[0, π]` on [`ELBOW_A`] and `[-π, 0]` on
-    /// [`ELBOW_B`], so `inverse_position(forward_position(q), resolve_branch(q))`
+    /// The returned `q2_eff` is in `[0, π]` on the elbow-up branch and
+    /// `[-π, 0]` on elbow-down (the two values `resolve_branch` returns;
+    /// which is which is deliberately not part of the public API), so
+    /// `inverse_position(forward_position(q), resolve_branch(q))`
     /// recovers `q` exactly for any pose whose `q2_eff` is already in
     /// `[-π, π]`, and recovers an equivalent pose modulo 2π otherwise.
     fn inverse_position(
@@ -552,9 +554,10 @@ impl KinematicModel for ScaraKinematics {
     /// Inverts the 2x2 Jacobian.
     ///
     /// Refuses with [`KinematicsError::NearSingular`] when the elbow is
-    /// within `asin(SINGULARITY_EPSILON)` of straight or fully folded — see
-    /// [`SINGULARITY_EPSILON`] for why the test is on `sin(q2_eff)` rather
-    /// than on the determinant.
+    /// within `asin(0.05) ≈ 2.9°` of straight or fully folded. The test is on
+    /// `|sin(q2_eff)|`, not on the determinant: the determinant carries units
+    /// of length² and an absolute epsilon on it would silently rescale with
+    /// the link lengths.
     ///
     /// Note what this does *not* catch: a near-singular Jacobian loses rank
     /// in one direction only, so motion along the surviving direction is

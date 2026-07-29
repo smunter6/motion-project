@@ -12,6 +12,8 @@
 //!
 //! Same absolute-time model as `TrapezoidalProfile` — no dt-stepping state
 //! here either, `sample(t)` is a pure function of elapsed time.
+//!
+//! [`TrapezoidalProfile`]: crate::trajectory::TrapezoidalProfile
 
 use crate::jerk_filter::JerkFilteredProfile;
 use crate::trajectory::{MotionPhase, TrajectoryError};
@@ -40,6 +42,8 @@ pub enum LinearMoveError {
     NonFiniteCoordinate { axis_index: usize, value: f64 },
     /// The underlying scalar [`TrapezoidalProfile`] over path distance
     /// rejected the kinematic limits or the projected start velocity.
+    ///
+    /// [`TrapezoidalProfile`]: crate::trajectory::TrapezoidalProfile
     Speed(TrajectoryError),
 }
 
@@ -116,6 +120,8 @@ impl LinearMoveSample {
 /// projected onto a fixed unit direction vector — a straight line traversed
 /// with synchronized speed, not independent per-axis profiles (which
 /// wouldn't trace a straight line at all) or per-axis time-rescaling.
+///
+/// [`TrapezoidalProfile`]: crate::trajectory::TrapezoidalProfile
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearMove {
     start: [f64; MAX_GROUP_AXES],

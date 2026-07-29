@@ -31,16 +31,27 @@
 //! the control loop has ended. Everything except the plots behaves
 //! identically; see `scripts/demo_session.sh`.
 //!
-//! Commands (one per line on stdin):
-//!     move <axisN> <target_mm> [max_speed] [max_acceleration] [max_deceleration] [aborting|buffered]
-//!     stop <axisN> [max_deceleration]
-//!     enable <axisN>
-//!     disable <axisN>
-//!     reset <axisN>
-//!     verbose
-//!     status
-//!     help
-//!     quit
+//! Commands (one per line on stdin). `help` prints the authoritative list at
+//! runtime, including every configured axis and group name:
+//!
+//! ```text
+//! move <target> <coord>... [vmax] [amax] [dmax] [aborting|buffered]
+//! movepath <group> <n> <coord>...  [limits] [aborting|buffered|blend]
+//! movepath <group> file <path>     [limits] [aborting|buffered|blend]
+//! stop <target> [decel]
+//! setlimits <target> [speed|accel|decel|jerk <value>]...
+//! enable <target>
+//! disable <target>
+//! reset <target>
+//! verbose
+//! status
+//! help
+//! quit
+//! ```
+//!
+//! A `<target>` is an axis (`axis0`) or a group (`axisGroup0`). Group
+//! coordinates are Cartesian TCP mm; a single-axis move is raw joint space in
+//! that axis's own units.
 //!
 //! Axes start disabled (DS402's `SwitchOnDisabled`), matching real drive
 //! power-up — `move` on a disabled axis is rejected, not queued. `enable`

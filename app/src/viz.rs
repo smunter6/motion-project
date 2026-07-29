@@ -1,5 +1,6 @@
 //! The viz window: a passive, read-only view over the shared [`History`]
-//! buffer the control loop writes to via [`RecordingAxisGroup`]. Input stays
+//! buffer the control loop writes to via
+//! [`RecordingAxisGroup`](crate::recording::RecordingAxisGroup). Input stays
 //! terminal-driven — this window has no controls, it only plots.
 
 use std::sync::atomic::{AtomicBool, Ordering};

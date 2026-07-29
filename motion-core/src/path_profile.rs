@@ -3,6 +3,8 @@
 //! constant-progress motion along the whole route — exactly the "reuse the
 //! existing scalar profile" pattern [`crate::LinearMove`] established for
 //! the one-segment case, just composed with richer geometry underneath.
+//!
+//! [`TrapezoidalProfile`]: crate::trajectory::TrapezoidalProfile
 
 use crate::jerk_filter::JerkFilteredProfile;
 use crate::linear_move::MAX_GROUP_AXES;
@@ -79,6 +81,8 @@ impl PathSample {
 /// velocity is that one path speed projected onto the path's local tangent
 /// direction at the current arc length — constant progress along the route,
 /// not independent per-axis profiles.
+///
+/// [`TrapezoidalProfile`]: crate::trajectory::TrapezoidalProfile
 #[derive(Debug, PartialEq)]
 pub struct PathProfile {
     path: WaypointPath,

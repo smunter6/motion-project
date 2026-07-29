@@ -39,7 +39,11 @@ use std::fmt;
 /// seam, not this type's.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct AxisSetpoint {
+    /// Commanded position — the primary command in CSP mode, and the one
+    /// quantity a backend must honour. Absolute, in the axis's own units.
     pub position: f64,
+    /// Commanded velocity — a feed-forward term alongside `position`, not an
+    /// independent command. A backend that only does CSP may ignore it.
     pub velocity: f64,
     /// Commanded acceleration — the second feed-forward term.
     ///
@@ -83,7 +87,11 @@ pub struct AxisSetpoint {
 /// A single control-cycle feedback reading for one axis.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisFeedback {
+    /// Measured position, in the axis's own units. Ground truth for
+    /// *reporting*; note `app` plans from its own commanded state instead,
+    /// so this is deliberately not fed back into the planner.
     pub position: f64,
+    /// Measured velocity. Reporting only, for the same reason as `position`.
     pub velocity: f64,
     /// Measured acceleration.
     ///
@@ -209,8 +217,14 @@ impl Ds402State {
 /// right now."
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MotionFlags {
+    /// Speeding up toward the profile's cruise velocity.
     pub accelerating: bool,
+    /// In the profile's cruise phase. Never set on a triangular move, which
+    /// has no cruise phase at all.
     pub constant_velocity: bool,
+    /// Slowing toward rest — whether that's a move's own final phase or a
+    /// commanded stop (see [`AxisSetpoint::stopping`], which distinguishes
+    /// the two).
     pub decelerating: bool,
 }
 
@@ -239,7 +253,12 @@ pub enum AxisFault {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxisGroupError {
     /// `setpoints.len()` didn't match [`AxisGroup::num_axes`].
-    WrongSetpointCount { expected: usize, got: usize },
+    WrongSetpointCount {
+        /// How many setpoints the group wanted — its [`AxisGroup::num_axes`].
+        expected: usize,
+        /// How many were actually passed.
+        got: usize,
+    },
 }
 
 impl fmt::Display for AxisGroupError {
