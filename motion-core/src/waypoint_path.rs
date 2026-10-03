@@ -1,89 +1,59 @@
 //! Multi-waypoint path following, geometry only (no time — see
 //! [`crate::path_profile`] for the scalar speed profile composed on top).
 //!
-//! # Why this exists, and why it isn't just more `LinearMove`
+//! [`crate::LinearMove`] is a straight line between two points. `WaypointPath`
+//! visits several waypoints in one continuous motion, smoothing corners rather
+//! than stopping at them. It is parameterized by arc length so a single scalar
+//! speed profile ([`crate::path_profile::PathProfile`]) can drive it.
 //!
-//! [`crate::LinearMove`] is a straight line between two points. Visiting
-//! several waypoints in one continuous motion, with corners smoothed rather
-//! than stopped at, is a different geometry problem: `WaypointPath` is that
-//! problem's solution, parameterized by arc length so a single scalar speed
-//! profile ([`crate::path_profile::PathProfile`]) can still drive it — the
-//! same "`TrapezoidalProfile` over a scalar distance, composed with the
-//! path's geometry" pattern `LinearMove` established for one segment.
+//! # Spline: centripetal Catmull-Rom
 //!
-//! # Spline choice: centripetal Catmull-Rom
-//!
-//! Each segment is a cubic shaped by its two endpoint waypoints plus their
-//! two neighbors — **local support**: a segment's shape depends only on its
-//! four nearest control points, not the whole path, so editing one waypoint
-//! can't ripple through the whole route. **Centripetal** parameterization
-//! (knot spacing proportional to `distance^0.5`) avoids cusps and
-//! self-intersections on non-uniformly-spaced waypoints (Yuksel, Schaefer,
-//! Keyser 2011).
+//! Each segment is a cubic shaped by its two endpoint waypoints plus their two
+//! neighbors. It has **local support**: a segment depends only on its four
+//! nearest control points, so editing one waypoint doesn't change the whole
+//! route. **Centripetal** parameterization (knot spacing proportional to
+//! `distance^0.5`) avoids cusps and self-intersections on non-uniformly-spaced
+//! waypoints (Yuksel, Schaefer, Keyser 2011).
 //!
 //! The first and last waypoints have no real neighbor on one side, so each
-//! gets a **reflected phantom** control point (`P_-1 = 2*P0 - P1`, not a
-//! duplicate of `P0`, which would zero-length that phantom segment and
-//! divide by zero in the centripetal knot formula). A useful side effect:
-//! for a 2-waypoint path, the four control points end up exactly colinear,
-//! so the spline degenerates to precisely the straight line between them —
-//! the sanity check this module's tests lean on.
+//! gets a **reflected phantom** control point (`P_-1 = 2*P0 - P1`). A
+//! duplicate of `P0` would zero-length that phantom segment and divide by zero
+//! in the centripetal knot formula. For a 2-waypoint path the four control
+//! points are exactly colinear, so the spline is the straight line between
+//! them.
 //!
-//! # Blending onto an in-flight path (`new_with_start_direction`)
+//! # Starting along an in-flight direction (`new_with_start_direction`)
 //!
-//! The reflected phantom is really just an *assumption*: the incoming
-//! direction was a straight-line approach toward P1. That's wrong when
-//! replacing a move already in motion.
-//! [`WaypointPath::new_with_start_direction`] swaps that assumption for the
-//! truth when known: the leading phantom is placed behind `P0` along the
-//! given direction instead of via reflection, at the same characteristic
-//! distance (`|P0-P1|`) the reflection would have used. This is *not* an
-//! exact tangent match (a Catmull-Rom tangent at `P0` blends the phantom
-//! *and* `P1`) — an accepted approximation (see `tangent_at_arc_length`'s
-//! docs). An all-zero (or omitted) direction falls back to the ordinary
-//! reflected phantom.
+//! The reflected phantom assumes the incoming direction was a straight
+//! approach toward P1. [`WaypointPath::new_with_start_direction`] instead
+//! places the leading phantom behind `P0` along a given direction, at the same
+//! distance (`|P0-P1|`) the reflection would use. This does *not* match the
+//! tangent exactly, because a Catmull-Rom tangent at `P0` depends on both the
+//! phantom and `P1` (see `tangent_at_arc_length`). An all-zero direction falls
+//! back to the reflected phantom.
 //!
-//! # Arc length has no closed form for a cubic
+//! # Arc length
 //!
-//! so each segment gets its own lookup table, built once at construction:
-//! ~200 evenly-spaced parameter samples walked to accumulate true Euclidean
-//! distance. A position query uses the LUT only to *locate and refine* a
-//! parameter estimate — the returned position always comes from evaluating
-//! the exact curve at that parameter, never from interpolating stored LUT
+//! A cubic has no closed-form arc length, so each segment has its own lookup
+//! table built at construction: ~200 evenly-spaced parameter samples walked to
+//! accumulate Euclidean distance. A position query uses the table only to
+//! locate and refine a parameter estimate; the returned position is always the
+//! exact curve evaluated at that parameter, not an interpolation of stored
 //! positions.
 //!
-//! # Continuity: G1 only, and why there is no straight-segment override
+//! # Continuity: G1 only
 //!
-//! Catmull-Rom is a **C1** construction. Its tangent at a waypoint is a
-//! local heuristic derived from the neighbors, and adjacent segments agree
-//! on that tangent but *not* on the second derivative — so the unit tangent
-//! is continuous across a waypoint while **curvature steps**. Measured on a
-//! 4-waypoint path, curvature jumps by tens of percent at each interior
-//! waypoint. That is inherent to the curve family, not a bug here.
+//! Catmull-Rom is **C1**. Adjacent segments agree on the tangent at a shared
+//! waypoint but not on the second derivative, so the unit tangent is
+//! continuous across a waypoint while **curvature steps** (by tens of percent
+//! on a 4-waypoint path).
 //!
-//! This module used to offer a per-segment straight-line override
-//! (`SegmentKind::Line`). It was **removed**, not fixed: a cubic with
-//! position and tangent pinned at both ends has no freedom left to also
-//! match a neighbor's direction, so the spline segment beside a forced-line
-//! segment left the shared waypoint along its own neighbor-derived tangent —
-//! a measured **22.5°** velocity-*direction* discontinuity on a
-//! representative path, which is far worse than the curvature step above
-//! (velocity direction jumping, not just its rate of change). No placement
-//! of a control point can repair it: with centripetal knots the junction
-//! tangent is proportional to `L*d + v`, so moving the phantom along `d`
-//! rescales that tangent without ever rotating it.
-//!
-//! Fixing it properly means a different curve family. The planned
-//! replacement is Yuksel's class of C2 interpolating splines (ACM TOG 2020,
-//! same author as the centripetal parameterization this module already
-//! uses): trigonometric blending of an interpolation function through three
-//! consecutive control points, which yields C2 *from the formulation* —
-//! no invented second-derivative rule — while keeping interpolation and
-//! 4-point local support, and which carries exact straight segments and
-//! circular arcs as members of the same family. That is on the roadmap
-//! after jerk-limited profiles and curvature-limited feedrate, which are
-//! worth more first. Until then this module does one thing: smooth splines
-//! through every waypoint.
+//! There is no per-segment straight-line override. With centripetal knots the
+//! tangent at a junction is proportional to `L*d + v`, so a cubic with
+//! position and tangent pinned at both ends can't also match a forced line's
+//! direction: a straight segment beside a spline one produced a 22.5° velocity
+//! direction discontinuity on a representative path. The module only builds
+//! smooth splines through every waypoint.
 
 use crate::linear_move::MAX_GROUP_AXES;
 
@@ -162,9 +132,8 @@ impl std::fmt::Display for WaypointPathError {
 impl std::error::Error for WaypointPathError {}
 
 /// How many parameter samples each segment's arc-length lookup table gets.
-/// A one-time construction cost (not a per-cycle hot path — that's
-/// `position_at_arc_length`/`tangent_at_arc_length`, which are O(log n)
-/// lookups against this table), so generous accuracy is cheap.
+/// This is a one-time construction cost; the per-cycle queries
+/// (`position_at_arc_length`/`tangent_at_arc_length`) are O(log n) lookups.
 const LUT_SAMPLES_PER_SEGMENT: usize = 200;
 
 type Point = [f64; MAX_GROUP_AXES];
@@ -193,7 +162,11 @@ fn reflect(p: &Point, q: &Point, axes: usize) -> Point {
 /// Catmull-Rom recursion is built from.
 fn lerp_param(pa: &Point, pb: &Point, ta: f64, tb: f64, t: f64, axes: usize) -> Point {
     let denom = tb - ta;
-    let w = if denom.abs() < 1e-12 { 0.0 } else { (t - ta) / denom };
+    let w = if denom.abs() < 1e-12 {
+        0.0
+    } else {
+        (t - ta) / denom
+    };
     let mut out = [0.0; MAX_GROUP_AXES];
     for i in 0..axes {
         out[i] = pa[i] + w * (pb[i] - pa[i]);
@@ -240,11 +213,9 @@ fn evaluate_segment(seg: &Segment, axes: usize, u: f64) -> Point {
     lerp_param(&b1, &b2, seg.t1, seg.t2, t, axes)
 }
 
-/// A smooth (or explicitly straight, per segment) route through several
-/// N-dimensional waypoints — see the module docs for the spline choice and
-/// arc-length approach. Geometry only: [`crate::path_profile::PathProfile`]
-/// composes this with a scalar [`crate::TrapezoidalProfile`] over arc length
-/// to add time.
+/// A smooth route through several N-dimensional waypoints. Geometry only:
+/// [`crate::path_profile::PathProfile`] composes it with a scalar profile over
+/// arc length to add time.
 #[derive(Debug, PartialEq)]
 pub struct WaypointPath {
     axes: usize,
@@ -257,25 +228,19 @@ pub struct WaypointPath {
 
 impl WaypointPath {
     /// Build a smooth path through `waypoints` (each an N-coordinate point,
-    /// all the same N). Every segment is a centripetal Catmull-Rom spline;
-    /// there is no per-segment straight-line override (see the module docs'
-    /// continuity section for why it was removed).
+    /// all the same N). Every segment is a centripetal Catmull-Rom spline.
     ///
-    /// A thin wrapper — `new_with_start_direction` with an all-zero
-    /// direction — exactly mirroring this crate's other `new`/
-    /// `new_with_start_velocity` pairs.
+    /// Equivalent to `new_with_start_direction` with an all-zero direction.
     pub fn new(waypoints: Vec<Vec<f64>>) -> Result<Self, WaypointPathError> {
         let start_direction = vec![0.0; waypoints.first().map_or(0, |w| w.len())];
         Self::new_with_start_direction(waypoints, start_direction)
     }
 
-    /// Build a path the same way `new` does, except the path's very first
-    /// phantom control point (see the module docs' "Blending" section) is
-    /// placed along `start_direction` — the group's actual incoming
-    /// velocity, typically — instead of via reflection, so the path's own
-    /// start tangent leans toward matching an in-flight move it's
-    /// replacing. An all-zero `start_direction` (including the all-zero
-    /// vector `new` passes) falls back to the ordinary reflected phantom.
+    /// Build a path the same way `new` does, except the first phantom control
+    /// point (see the module docs) is placed along `start_direction`, typically
+    /// the group's incoming velocity, so the path's start tangent leans toward
+    /// an in-flight move it replaces. An all-zero `start_direction` falls back
+    /// to the reflected phantom.
     pub fn new_with_start_direction(
         waypoints: Vec<Vec<f64>>,
         start_direction: Vec<f64>,
@@ -337,10 +302,9 @@ impl WaypointPath {
             }
         }
 
-        // The leading phantom: placed along start_direction (at the same
-        // characteristic distance a reflection would use) whenever a
-        // nonzero direction was given, otherwise the ordinary reflected
-        // phantom — see the module docs' "Blending" section.
+        // The leading phantom: along start_direction (at the distance a
+        // reflection would use) when the direction is nonzero, otherwise the
+        // reflected phantom.
         let mut dir_arr = [0.0; MAX_GROUP_AXES];
         dir_arr[..axes].copy_from_slice(&start_direction);
         let dir_norm: f64 = dir_arr[..axes].iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -436,7 +400,6 @@ impl WaypointPath {
 
     /// Cumulative arc length at each waypoint, in waypoint order
     /// (`waypoint_arc_lengths()[0] == 0.0`, last entry `== total_length()`).
-    /// Falls out of the LUT build for free.
     pub fn waypoint_arc_lengths(&self) -> &[f64] {
         &self.waypoint_arc_lengths
     }
@@ -473,8 +436,7 @@ impl WaypointPath {
     }
 
     /// Position at global arc length `s` along the path (clamped to
-    /// `[0, total_length()]`). Always evaluated exactly at the LUT-refined
-    /// parameter — never interpolated from stored LUT positions.
+    /// `[0, total_length()]`), evaluated exactly at the LUT-refined parameter.
     pub fn position_at_arc_length(&self, s: f64) -> [f64; MAX_GROUP_AXES] {
         let (seg_idx, u) = self.locate(s);
         evaluate_segment(&self.segments[seg_idx], self.axes, u)
@@ -482,11 +444,11 @@ impl WaypointPath {
 
     /// Unit tangent direction at global arc length `s`, via central finite
     /// difference in the arc-length domain (degrades to one-sided at the
-    /// path's own endpoints, via `position_at_arc_length`'s clamping). Not
-    /// an analytic derivative of the Catmull-Rom curve — arc-length
-    /// parameterization already means `|dP/ds| ~= 1`, so a small-step finite
-    /// difference plus a final re-normalize is accurate enough for the
-    /// velocity feed-forward this exists for.
+    /// path's own endpoints, via `position_at_arc_length`'s clamping). Not an
+    /// analytic derivative of the Catmull-Rom curve: arc-length
+    /// parameterization gives `|dP/ds| ~= 1`, so a small-step finite
+    /// difference plus a re-normalize is accurate enough for velocity
+    /// feed-forward.
     pub fn tangent_at_arc_length(&self, s: f64) -> [f64; MAX_GROUP_AXES] {
         let eps = (self.total_length * 1e-6).max(1e-9);
         let minus = self.position_at_arc_length(s - eps);
@@ -521,10 +483,8 @@ mod tests {
 
     #[test]
     fn two_waypoint_path_is_exact_straight_line() {
-        // Reflected phantoms make 4 colinear "control points" for a
-        // 2-waypoint path, so the spline must degenerate to exactly the
-        // straight line between them — the key sanity check for the whole
-        // reflection scheme.
+        // Reflected phantoms make 4 colinear control points for a 2-waypoint
+        // path, so the spline must be exactly the straight line between them.
         let path = WaypointPath::new(
             vec![vec![0.0, 0.0], vec![30.0, 40.0]], // 3-4-5 triangle scaled by 10
         )
@@ -553,11 +513,8 @@ mod tests {
 
     #[test]
     fn tangent_is_continuous_at_interior_waypoints() {
-        // G1 across every waypoint — the property that made removing the
-        // straight-segment override worthwhile, since a `Line` neighbour
-        // used to break it by 22.5 degrees. Note this asserts G1 only:
-        // Catmull-Rom is C1, so *curvature* still steps at each waypoint
-        // (see the module docs) until the C2 spline-family upgrade.
+        // G1 across every waypoint. This asserts G1 only: curvature still
+        // steps at each waypoint (see the module docs).
         let path = WaypointPath::new(vec![
             vec![0.0, 0.0],
             vec![10.0, 0.0],
@@ -580,9 +537,7 @@ mod tests {
 
     #[test]
     fn two_waypoint_path_tangent_is_constant_unit_direction() {
-        let path =
-            WaypointPath::new(vec![vec![0.0, 0.0], vec![30.0, 40.0]])
-                .unwrap();
+        let path = WaypointPath::new(vec![vec![0.0, 0.0], vec![30.0, 40.0]]).unwrap();
         let n = 50;
         for i in 1..n {
             // avoid the very ends where the one-sided difference is weakest
@@ -595,16 +550,25 @@ mod tests {
 
     #[test]
     fn waypoint_arc_lengths_hit_exact_waypoints() {
-        let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0], vec![0.0, 10.0]];
+        let waypoints = vec![
+            vec![0.0, 0.0],
+            vec![10.0, 0.0],
+            vec![10.0, 10.0],
+            vec![0.0, 10.0],
+        ];
         let path = WaypointPath::new(waypoints.clone()).unwrap();
         let arc_lengths = path.waypoint_arc_lengths().to_vec();
         assert_eq!(arc_lengths.len(), waypoints.len());
         assert!(approx(arc_lengths[0], 0.0));
-        assert!(approx(arc_lengths[arc_lengths.len() - 1], path.total_length()));
+        assert!(approx(
+            arc_lengths[arc_lengths.len() - 1],
+            path.total_length()
+        ));
         for (i, &s) in arc_lengths.iter().enumerate() {
             let pos = path.position_at_arc_length(s);
             assert!(
-                approx_eps(pos[0], waypoints[i][0], 1e-2) && approx_eps(pos[1], waypoints[i][1], 1e-2),
+                approx_eps(pos[0], waypoints[i][0], 1e-2)
+                    && approx_eps(pos[1], waypoints[i][1], 1e-2),
                 "waypoint {i} mismatch: got [{}, {}], expected {:?}",
                 pos[0],
                 pos[1],
@@ -615,13 +579,12 @@ mod tests {
 
     #[test]
     fn position_has_no_large_jumps_across_the_whole_path() {
-        let path = WaypointPath::new(
-            vec![
-                vec![0.0, 0.0, 0.0],
-                vec![10.0, 5.0, 0.0],
-                vec![15.0, 15.0, 5.0],
-                vec![5.0, 20.0, 10.0],
-            ])
+        let path = WaypointPath::new(vec![
+            vec![0.0, 0.0, 0.0],
+            vec![10.0, 5.0, 0.0],
+            vec![15.0, 15.0, 5.0],
+            vec![5.0, 20.0, 10.0],
+        ])
         .unwrap();
         let n = 2000;
         let step = path.total_length() / (n as f64);
@@ -672,9 +635,7 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_coordinate() {
-        match WaypointPath::new(
-            vec![vec![0.0, 0.0], vec![1.0, f64::NAN]],
-        ) {
+        match WaypointPath::new(vec![vec![0.0, 0.0], vec![1.0, f64::NAN]]) {
             Err(WaypointPathError::NonFiniteCoordinate {
                 waypoint_index,
                 axis_index,
@@ -692,17 +653,14 @@ mod tests {
     fn rejects_too_many_axes() {
         let axes = MAX_GROUP_AXES + 1;
         assert_eq!(
-            WaypointPath::new(vec![vec![0.0; axes], vec![1.0; axes]])
-                .unwrap_err(),
+            WaypointPath::new(vec![vec![0.0; axes], vec![1.0; axes]]).unwrap_err(),
             WaypointPathError::TooManyAxes(axes)
         );
     }
 
     #[test]
     fn position_at_arc_length_clamps_outside_range() {
-        let path =
-            WaypointPath::new(vec![vec![0.0, 0.0], vec![10.0, 0.0]])
-                .unwrap();
+        let path = WaypointPath::new(vec![vec![0.0, 0.0], vec![10.0, 0.0]]).unwrap();
         let before = path.position_at_arc_length(-5.0);
         let start = path.position_at_arc_length(0.0);
         assert!(approx(before[0], start[0]) && approx(before[1], start[1]));
@@ -711,14 +669,13 @@ mod tests {
         assert!(approx(after[0], end[0]) && approx(after[1], end[1]));
     }
 
-    // --- new_with_start_direction ("blend") -----------------------------
+    // --- new_with_start_direction ---------------------------------------
 
     #[test]
-    fn new_is_thin_wrapper_of_new_with_start_direction() {
+    fn new_matches_new_with_start_direction_given_zero_direction() {
         let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
         let a = WaypointPath::new(waypoints.clone()).unwrap();
-        let b = WaypointPath::new_with_start_direction(waypoints, vec![0.0, 0.0])
-            .unwrap();
+        let b = WaypointPath::new_with_start_direction(waypoints, vec![0.0, 0.0]).unwrap();
         assert_eq!(a, b);
     }
 
@@ -740,26 +697,25 @@ mod tests {
     fn zero_start_direction_falls_back_to_reflection() {
         let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, 10.0]];
         let reflected = WaypointPath::new(waypoints.clone()).unwrap();
-        let blended = WaypointPath::new_with_start_direction(waypoints, vec![0.0, 0.0])
-            .unwrap();
+        let blended = WaypointPath::new_with_start_direction(waypoints, vec![0.0, 0.0]).unwrap();
         assert_eq!(reflected, blended);
     }
 
     #[test]
     fn start_direction_tangent_is_close_to_given_direction() {
-        // Not exact (see module docs), but should land much closer to the
-        // requested direction than the plain reflected-phantom tangent
-        // would for a path that turns sharply away from it.
+        // Not exact (see module docs), but much closer to the requested
+        // direction than the reflected-phantom tangent would be.
         let waypoints = vec![vec![0.0, 0.0], vec![10.0, 0.0], vec![10.0, -10.0]];
-        // Incoming direction is +Y, even though the path immediately heads
-        // toward +X then -Y — a deliberately sharp mismatch with the
-        // default reflection (which would point along +X).
+        // Incoming direction is +Y, though the path heads toward +X then -Y.
+        // The default reflection would point along +X.
         let blended = WaypointPath::new_with_start_direction(waypoints, vec![0.0, 1.0]).unwrap();
         let tangent = blended.tangent_at_arc_length(0.0);
-        // Cosine similarity to (0, 1) should be strongly positive (tangent
-        // leans toward +Y), unlike the default reflection's tangent which
-        // would point along +X (cosine ~= 0 against (0,1)).
-        assert!(tangent[1] > 0.5, "tangent {tangent:?} doesn't lean toward the given direction");
+        // The tangent leans toward +Y (cosine similarity to (0, 1) is
+        // clearly positive); the default tangent would be ~0.
+        assert!(
+            tangent[1] > 0.5,
+            "tangent {tangent:?} doesn't lean toward the given direction"
+        );
     }
 
     #[test]
@@ -768,9 +724,12 @@ mod tests {
             WaypointPath::new_with_start_direction(
                 vec![vec![0.0, 0.0], vec![1.0, 1.0]],
                 vec![1.0, 2.0, 3.0],
-                )
+            )
             .unwrap_err(),
-            WaypointPathError::StartDirectionDimensionMismatch { expected: 2, got: 3 }
+            WaypointPathError::StartDirectionDimensionMismatch {
+                expected: 2,
+                got: 3
+            }
         );
     }
 

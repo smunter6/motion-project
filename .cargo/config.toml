@@ -2,11 +2,9 @@
 #
 #   cargo docs  ->  target/doc/index.html, this workspace's crates only
 #
-# `--no-deps` is what keeps dependency crates out. Note it only controls what
-# gets *generated*: rustdoc writes to `target/doc` and cargo never cleans that
-# directory, so if a bare `cargo doc` ever populates it with the ~150
-# dependency crates, they persist and later `--no-deps` runs just write
-# alongside them. Remove `target/doc` first if that happens.
+# `--no-deps` keeps dependency crates out of newly generated docs, but cargo
+# never cleans `target/doc`. Remove it first if a bare `cargo doc` has already
+# put dependency docs there.
 
 [alias]
 docs = "doc --workspace --no-deps"

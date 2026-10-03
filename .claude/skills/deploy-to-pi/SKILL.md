@@ -31,8 +31,6 @@ build → `rsync` the binary to the Pi → `ssh` in and run it.
 
 ## Notes
 
-- `motion-core` is dependency-free and `no_std`-friendly, so it cross-compiles
-  unchanged — the same crate could later target an RP2350-based master with an
-  embedded TX/RX transport.
-- Real drive testing needs `backend-ethercat` (EtherCRAB + CiA 402), which is
-  roadmap step 7 and not built yet.
+- `motion-core` is dependency-free and cross-compiles unchanged.
+- Real drive testing needs an EtherCAT backend (EtherCRAB + CiA 402), which this
+  repository does not include.

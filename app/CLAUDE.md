@@ -1,26 +1,24 @@
 # `app` — environment gotchas
 
-Loaded only when working under `app/`. Design rationale for the control loop,
-profiles, and group cascade lives in the root `CLAUDE.md`.
+Loaded only when working under `app/`.
 
 ## `--headless` sidesteps every gotcha below
 
 Everything on this page is about getting a GUI window to open under WSL. A
 scripted session doesn't need one: `./target/debug/app --headless` skips viz
-and runs the control loop on the main thread. Use it by default for anything
-automated; the notes below matter only when the change is about the
-visualization itself, or when a human wants to watch the plots.
+and runs the control loop on the main thread. The notes below matter only when
+the change is about the visualization itself, or when you want to watch the
+plots.
 
 ## Viz renderer: use `glow`, not the default `wgpu`
 
 eframe's default `wgpu` renderer **fails at startup in this WSL setup**
 (`WinitEventLoop(ExitFailure(1))`) — there's no `/dev/dri` render node and no
 Vulkan ICD, only WSL's `/dev/dxg` GPU passthrough. `glow` (OpenGL) via Mesa,
-through `/dev/dxg`, works. Don't "fix" the dependency back to `wgpu`.
+through `/dev/dxg`, works. Don't switch the dependency back to `wgpu`.
 
-eframe's default `accesskit` feature is also dropped — AT-SPI/D-Bus
-screen-reader integration is unneeded for a dev plotting tool, and it was
-itself failing on a missing D-Bus session daemon during startup diagnosis.
+eframe's default `accesskit` feature is disabled: it needs a D-Bus session
+daemon, which is absent here.
 
 ## Running a GUI app on a fresh WSL setup
 

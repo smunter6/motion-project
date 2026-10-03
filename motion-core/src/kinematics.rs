@@ -1,30 +1,24 @@
 //! The seam between *task space* (where a move is commanded — Cartesian
-//! X/Y for now) and *joint space* (what an axis actually is — a linear
-//! stage, a rotary joint).
+//! X/Y) and *joint space* (what an axis is — a linear stage, a rotary joint).
 //!
-//! # Why a trait, and why an identity instance
+//! # Trait and identity instance
 //!
-//! Every group in `app` goes through this layer, including the ones whose
-//! axes already *are* Cartesian coordinates. Those use
-//! [`IdentityKinematics`], which is a pass-through in both directions. That
-//! is deliberate: it means the move builders, the control loop and the
-//! status/viz code have exactly one code path, never a
-//! `if group.is_an_arm { .. } else { .. }` fork, and a Cartesian group is
-//! provably unaffected by anything here (identity composed with identity is
-//! a no-op).
+//! Every group in `app` goes through this layer, including groups whose axes
+//! already are Cartesian coordinates. Those use [`IdentityKinematics`], a
+//! pass-through in both directions, so the move builders, the control loop and
+//! the status/viz code have one code path and no special case for arms.
 //!
 //! # Shape of the interface
 //!
-//! Forward kinematics (joint → task) is infallible: every joint pose puts
-//! the tool *somewhere*. Inverse kinematics is not — a task-space point can
-//! be outside the workspace, and the mapping can be locally degenerate.
+//! Forward kinematics (joint → task) is infallible: every joint pose puts the
+//! tool somewhere. Inverse kinematics is not — a task-space point can be
+//! outside the workspace, and the mapping can be locally degenerate.
 //!
 //! IK is also generally *not unique*: a 2-link arm reaches most points
 //! elbow-up or elbow-down. Which solution to take arrives per call as an
-//! opaque [`KinematicBranch`] token, obtained from [`resolve_branch`]. This
-//! crate has no opinion on how long a caller holds one; `app` resolves it
-//! once per move and holds it for that move's duration, which keeps IK a
-//! pure function of task-space position for the whole move.
+//! opaque [`KinematicBranch`] token, obtained from [`resolve_branch`]. `app`
+//! resolves it once per move and holds it for that move's duration, which
+//! keeps IK a pure function of task-space position for the whole move.
 //!
 //! [`resolve_branch`]: KinematicModel::resolve_branch
 
@@ -35,10 +29,9 @@ use core::f64::consts::FRAC_PI_2;
 /// point, or a Cartesian velocity. It is the same shape in every case, so
 /// there is one type rather than four.
 ///
-/// Fixed-size and `Copy`, exactly like [`LinearMoveSample`], and for the
-/// same reason: these are built and consumed once per group per control
-/// cycle. A `Vec<f64>`-returning trait method would quietly require a global
-/// allocator, which this crate must not (see the crate docs).
+/// Fixed-size and `Copy`, like [`LinearMoveSample`]: these are built and
+/// consumed once per group per control cycle, and this crate does not
+/// allocate (see the crate docs).
 ///
 /// [`LinearMoveSample`]: crate::linear_move::LinearMoveSample
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,9 +43,8 @@ pub struct KinematicVector {
 impl KinematicVector {
     /// Build from a slice, rejecting an over-long or non-finite input.
     ///
-    /// This is the only public constructor, so a `KinematicVector` in hand
-    /// is always finite and within [`MAX_GROUP_AXES`] — the models below
-    /// rely on that and do not re-check.
+    /// This is the only public constructor, so a `KinematicVector` is always
+    /// finite and within [`MAX_GROUP_AXES`]; the models below rely on that.
     pub fn from_slice(values: &[f64]) -> Result<Self, KinematicsError> {
         if values.len() > MAX_GROUP_AXES {
             return Err(KinematicsError::TooManyAxes(values.len()));
@@ -86,9 +78,8 @@ impl KinematicVector {
     }
 
     /// Internal constructor for values a model just computed. Skips the
-    /// finiteness check that [`from_slice`] does, because model output is
-    /// only ever non-finite if the model divided by something it had
-    /// already checked — the fallible paths below check first.
+    /// finiteness check [`from_slice`] does: the fallible paths below check
+    /// their divisors first.
     ///
     /// [`from_slice`]: KinematicVector::from_slice
     fn from_parts(values: [f64; MAX_GROUP_AXES], len: usize) -> Self {
@@ -160,15 +151,12 @@ pub const MAX_LINKAGE_POINTS: usize = MAX_GROUP_AXES + 1;
 /// space running from the base outward to the tool, with one point per
 /// joint origin along the way.
 ///
-/// This exists purely so a mechanism can be *drawn*. It is the one thing a
-/// viewer needs that the rest of this interface can't provide —
-/// [`forward_position`] gives the tool point, and nothing gives the elbow
-/// in between. Deriving it outside the model would mean re-implementing the
-/// model's own geometry next to it, which is exactly the duplication this
-/// trait exists to prevent.
+/// This exists so a mechanism can be drawn. [`forward_position`] gives the tool
+/// point, and nothing else gives the elbow in between; deriving it outside the
+/// model would duplicate the model's geometry.
 ///
-/// Fixed-size and `Copy`, like everything else here. A model with nothing
-/// meaningful to draw returns [`Linkage::EMPTY`].
+/// Fixed-size and `Copy`. A model with nothing to draw returns
+/// [`Linkage::EMPTY`].
 ///
 /// [`forward_position`]: KinematicModel::forward_position
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -198,7 +186,7 @@ impl Linkage {
         self.len == 0
     }
 
-    /// Internal constructor — same "values a model just computed" role as
+    /// Internal constructor for points a model just computed, like
     /// [`KinematicVector::from_parts`].
     fn from_parts(points: [KinematicVector; MAX_LINKAGE_POINTS], len: usize) -> Self {
         Self { points, len }
@@ -208,31 +196,29 @@ impl Linkage {
 /// An opaque, model-defined selector for one of the several joint poses
 /// that reach the same task-space point.
 ///
-/// Deliberately not an enum: "elbow up/down" is a SCARA concept, but the
-/// value is stored and forwarded by model-agnostic code in `app`, and an
-/// associated type would break `dyn` object safety. Callers treat this as a
-/// token obtained from [`KinematicModel::resolve_branch`] and handed back to
-/// [`KinematicModel::inverse_position`]; they never interpret the contents.
+/// Not an enum: "elbow up/down" is a SCARA concept, but the value is stored
+/// and forwarded by model-agnostic code in `app`, and an associated type would
+/// break `dyn` object safety. Callers get a token from
+/// [`KinematicModel::resolve_branch`] and hand it back to
+/// [`KinematicModel::inverse_position`] without interpreting it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KinematicBranch(u8);
 
 /// A mapping between joint space and task space.
 ///
 /// Implementors are pure geometry: link lengths and trigonometry, no limits
-/// and no units. Anything that needs to know a *speed* limit (joint-rate
-/// checking, say) belongs to the caller, which is where the per-axis
-/// configuration lives.
+/// and no units. Speed limits belong to the caller, which holds the per-axis
+/// configuration.
 ///
-/// Every vector crossing this interface must have [`dof`] elements. That is
-/// a caller-side invariant, debug-asserted rather than returned as an error
-/// on the infallible forward methods; `app` checks each group's arity
-/// against its model once at startup.
+/// Every vector crossing this interface must have [`dof`] elements. That is a
+/// caller-side invariant, debug-asserted on the infallible forward methods;
+/// `app` checks each group's arity against its model at startup.
 ///
 /// [`dof`]: KinematicModel::dof
 pub trait KinematicModel {
     /// How many joints (equivalently, how many task-space coordinates) this
-    /// model maps between. This design assumes the two are equal — no
-    /// redundant or reduced-DOF models.
+    /// model maps between. The two must be equal; redundant and reduced-DOF
+    /// models are not supported.
     fn dof(&self) -> usize;
 
     /// Joint pose → task-space point. Infallible: every pose is somewhere.
@@ -253,7 +239,6 @@ pub trait KinematicModel {
     /// At a pose that is *itself* singular the branches coincide, so the
     /// answer there is arbitrary: either is an equally true description of
     /// the same pose, but it decides which way the arm breaks as it leaves.
-    /// Not wrong, but not predictable either.
     fn resolve_branch(&self, joint: KinematicVector) -> KinematicBranch;
 
     /// Task-space point → joint pose, taking the solution on `branch`.
@@ -282,9 +267,8 @@ pub trait KinematicModel {
     ///
     /// **The `J̇·q̇` term is why this can't be composed from
     /// [`inverse_velocity`].** A rotating linkage accelerates its own tool
-    /// even at constant joint rates — that is the centripetal/Coriolis
-    /// content of the mapping, and dropping it gives a feed-forward that is
-    /// wrong exactly when it matters most, at speed on a curve.
+    /// even at constant joint rates (the centripetal/Coriolis content of the
+    /// mapping); dropping it makes the feed-forward wrong at speed on a curve.
     ///
     /// Fails on the same near-singular poses [`inverse_velocity`] does, and
     /// for the same reason: it inverts the same Jacobian.
@@ -300,9 +284,7 @@ pub trait KinematicModel {
     /// Where this mechanism physically *is* at the given pose, as a
     /// drawable polyline from base to tool — see [`Linkage`].
     ///
-    /// Defaults to [`Linkage::EMPTY`], because most of what this trait does
-    /// has nothing to do with drawing and a model shouldn't have to answer
-    /// this to exist. Overriding it is how a mechanism becomes visible.
+    /// Defaults to [`Linkage::EMPTY`]; a model overrides it to be drawn.
     fn linkage(&self, _joint: KinematicVector) -> Linkage {
         Linkage::EMPTY
     }
@@ -311,9 +293,8 @@ pub trait KinematicModel {
 /// The pass-through model: joint values *are* task-space coordinates.
 ///
 /// This is what a group of linear stages driving Cartesian X/Y uses. It
-/// carries its own `dof` so that the arity check `app` performs on every
-/// group means something here too, rather than being skipped for the one
-/// model where it would be most easily got wrong.
+/// carries its own `dof` so the arity check `app` performs on every group
+/// applies to it too.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IdentityKinematics {
     dof: usize,
@@ -400,24 +381,28 @@ const ELBOW_A: KinematicBranch = KinematicBranch(0);
 const ELBOW_B: KinematicBranch = KinematicBranch(1);
 
 /// How close to straight (or fully folded) the elbow may get before
-/// [`inverse_velocity`] refuses. Dimensionless — it is a bound on
-/// `|sin(q2_eff)|`, i.e. the elbow is within `asin(0.05) ≈ 2.9°` of a
-/// singular configuration.
+/// [`inverse_velocity`] refuses. Dimensionless: a bound on `|sin(q2_eff)|`,
+/// i.e. the elbow is within `asin(0.05) ≈ 2.9°` of a singular configuration.
 ///
-/// Deliberately *not* a threshold on the determinant, which carries units
-/// of length² and would therefore silently rescale with the link lengths.
+/// This is not a threshold on the determinant, which carries units of length²
+/// and would rescale with the link lengths.
+///
+/// It tests the pose alone. A near-singular Jacobian loses rank in one
+/// direction, so this rejects some realizable commands and accepts some whose
+/// joint rates are already unrealizable. Bounding joint rate needs per-axis
+/// limits, which this crate doesn't know.
 ///
 /// [`inverse_velocity`]: KinematicModel::inverse_velocity
 const SINGULARITY_EPSILON: f64 = 0.05;
 
 /// A 2-link planar arm (SCARA), two rotary joints in a plane.
 ///
-/// # The home-offset convention — read this before using raw joint values
+/// # Home-offset convention
 ///
-/// Textbook form has `q2` measured from link 1, so `(q1, q2) = (0, 0)` is
-/// the *fully extended* arm — which is exactly a singular pose, and exactly
-/// where every axis in this system starts. To keep the natural start pose
-/// safe, this model applies a fixed offset internally: `q2_eff = q2 + π/2`.
+/// Textbook form has `q2` measured from link 1, so `(q1, q2) = (0, 0)` is the
+/// *fully extended* arm, a singular pose, and where every axis here starts. To
+/// keep the start pose non-singular, this model applies a fixed offset
+/// internally: `q2_eff = q2 + π/2`.
 ///
 /// So **raw joint value `q2 = 0` means "elbow bent 90°", not "straight
 /// arm"**, and `(0, 0)` is a comfortably non-singular pose. Everything the
@@ -430,9 +415,9 @@ const SINGULARITY_EPSILON: f64 = 0.05;
 /// at the outer workspace boundary) and `q2_eff = π` (folded back, at
 /// radius `|l1 - l2|`). With equal links that inner one sits at the
 /// *origin*, which is reachable — a straight move from `(x, y)` to
-/// `(-x, -y)` passes through it with both endpoints validating cleanly. It
-/// is guarded reactively, by `inverse_velocity` returning
-/// [`KinematicsError::NearSingular`], not by the geometry forbidding it.
+/// `(-x, -y)` passes through it with both endpoints validating cleanly. It is
+/// guarded only reactively, by `inverse_velocity` returning
+/// [`KinematicsError::NearSingular`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScaraKinematics {
     l1: f64,
@@ -510,7 +495,7 @@ impl KinematicModel for ScaraKinematics {
     ///
     /// The returned `q2_eff` is in `[0, π]` on the elbow-up branch and
     /// `[-π, 0]` on elbow-down (the two values `resolve_branch` returns;
-    /// which is which is deliberately not part of the public API), so
+    /// which is which is not part of the public API), so
     /// `inverse_position(forward_position(q), resolve_branch(q))`
     /// recovers `q` exactly for any pose whose `q2_eff` is already in
     /// `[-π, π]`, and recovers an equivalent pose modulo 2π otherwise.
@@ -555,17 +540,8 @@ impl KinematicModel for ScaraKinematics {
     ///
     /// Refuses with [`KinematicsError::NearSingular`] when the elbow is
     /// within `asin(0.05) ≈ 2.9°` of straight or fully folded. The test is on
-    /// `|sin(q2_eff)|`, not on the determinant: the determinant carries units
-    /// of length² and an absolute epsilon on it would silently rescale with
-    /// the link lengths.
-    ///
-    /// Note what this does *not* catch: a near-singular Jacobian loses rank
-    /// in one direction only, so motion along the surviving direction is
-    /// perfectly realizable. Testing the pose alone therefore rejects some
-    /// commands that were fine, and — more importantly — accepts commands
-    /// whose joint rates are already unrealizable while still short of the
-    /// threshold. Bounding the joint rate itself needs per-axis limits,
-    /// which is the caller's business, not this crate's.
+    /// `|sin(q2_eff)|`, not on the determinant (see `SINGULARITY_EPSILON`,
+    /// which also describes what this pose-only test does not catch).
     fn inverse_velocity(
         &self,
         joint_position: KinematicVector,
@@ -592,10 +568,9 @@ impl KinematicModel for ScaraKinematics {
     /// the `J̇·q̇` term — the acceleration the linkage produces on its own
     /// while rotating, even at constant joint rates.
     ///
-    /// `J̇` is the entry-wise time derivative of the 2x2 Jacobian, which
-    /// for this arm is elementary: every entry is a sine or cosine of `q1`
-    /// or `q1 + q2_eff`, so differentiating brings down `q̇1` or
-    /// `q̇1 + q̇2` and swaps the trig function.
+    /// `J̇` is the entry-wise time derivative of the 2x2 Jacobian. Every entry
+    /// is a sine or cosine of `q1` or `q1 + q2_eff`, so differentiating brings
+    /// down `q̇1` or `q̇1 + q̇2` and swaps the trig function.
     ///
     /// [`inverse_velocity`]: KinematicModel::inverse_velocity
     fn inverse_acceleration(
@@ -636,11 +611,10 @@ impl KinematicModel for ScaraKinematics {
         self.inverse_velocity(joint_position, KinematicVector::from_parts(residual, 2))
     }
 
-    /// Three points: the base at the origin, the elbow at the end of link
-    /// 1, and the tool at the end of link 2. The tool point is
-    /// [`forward_position`] itself, so the drawn arm always ends exactly
-    /// where the rest of the system thinks the TCP is — they cannot drift
-    /// apart, because it is the same call.
+    /// Three points: the base at the origin, the elbow at the end of link 1,
+    /// and the tool at the end of link 2. The tool point is
+    /// [`forward_position`] itself, so the drawn arm ends where the system
+    /// thinks the TCP is.
     ///
     /// [`forward_position`]: KinematicModel::forward_position
     fn linkage(&self, joint: KinematicVector) -> Linkage {
@@ -769,8 +743,8 @@ mod tests {
 
     #[test]
     fn forward_then_inverse_recovers_the_pose_on_either_branch() {
-        // The property the whole per-move-branch design rests on: resolve
-        // the branch from a pose, and IK on that branch returns the pose.
+        // Resolving the branch from a pose and running IK on that branch
+        // returns the pose.
         let arm = arm();
         let mut checked = 0;
         for i in -8..=8 {
@@ -830,8 +804,7 @@ mod tests {
         // Just inside it is fine.
         assert!(arm.inverse_position(v(&[199.0, 0.0]), ELBOW_A).is_ok());
         // Equal links make the inner boundary a single point, so the origin
-        // itself is reachable — that is the singularity this design accepts
-        // and handles reactively.
+        // itself is reachable (a singularity).
         assert!(arm.inverse_position(v(&[0.0, 0.0]), ELBOW_A).is_ok());
     }
 
@@ -907,14 +880,11 @@ mod tests {
         }
     }
 
-    /// Round-trip through the *full* acceleration mapping, checked against
-    /// a numerical second derivative of forward kinematics.
-    ///
-    /// Integrate a constant joint acceleration forward, differentiate the
-    /// resulting tool path twice to get the true task-space acceleration,
-    /// then ask `inverse_acceleration` to recover the joint acceleration we
-    /// started from. This is what catches a wrong or missing `J̇·q̇` term —
-    /// with `q̇ ≠ 0` the two disagree substantially.
+    /// Round-trips the full acceleration mapping against a numerical second
+    /// derivative of forward kinematics: integrate a constant joint
+    /// acceleration, differentiate the tool path twice for the task-space
+    /// acceleration, then check `inverse_acceleration` recovers the joint
+    /// acceleration. A wrong or missing `J̇·q̇` term fails this when `q̇ ≠ 0`.
     #[test]
     fn inverse_acceleration_recovers_joint_acceleration_through_jdot() {
         let arm = arm();
@@ -956,9 +926,8 @@ mod tests {
         }
     }
 
-    /// The `J̇·q̇` term is not decoration: with the joints already moving,
-    /// treating acceleration as if it were velocity gives a materially
-    /// different answer. Guards against the term being quietly dropped.
+    /// With the joints moving, treating acceleration as if it were velocity
+    /// gives a materially different answer, so the `J̇·q̇` term must be kept.
     #[test]
     fn jdot_term_matters_when_the_joints_are_moving() {
         let arm = arm();
@@ -972,9 +941,8 @@ mod tests {
         // At rest J̇·q̇ vanishes, so the two coincide.
         assert!(approx(at_rest.as_slice()[0], naive.as_slice()[0]));
 
-        // Measured for this pose and rate: the terms differ by ~0.7 and
-        // ~1.7 rad/s² respectively, against joint accelerations of the same
-        // order — so this is a leading-order effect, not a correction.
+        // For this pose and rate the answers differ by ~0.7 and ~1.7 rad/s²,
+        // against joint accelerations of the same order.
         let moving = arm
             .inverse_acceleration(joint, v(&[1.5, -1.0]), task_accel)
             .unwrap();
@@ -1003,8 +971,7 @@ mod tests {
             assert!(approx(points[0].as_slice()[0], 0.0));
             assert!(approx(points[0].as_slice()[1], 0.0));
 
-            // Each drawn segment is exactly its link's length, which is the
-            // property that makes the picture a picture of *this* arm.
+            // Each drawn segment is exactly its link's length.
             let segment = |a: KinematicVector, b: KinematicVector| {
                 let (a, b) = (a.as_slice(), b.as_slice());
                 ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
@@ -1012,8 +979,7 @@ mod tests {
             assert!(approx(segment(points[0], points[1]), L));
             assert!(approx(segment(points[1], points[2]), L));
 
-            // The tool point is forward kinematics, not a second
-            // computation of it.
+            // The tool point is the forward kinematics result.
             let tcp = arm.forward_position(joint);
             assert_eq!(points[2], tcp);
         }

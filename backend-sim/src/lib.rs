@@ -1,33 +1,24 @@
 //! `backend-sim`: a software `AxisGroup` implementation — no hardware, no
-//! network, just a plant model you can develop and test against.
+//! network, just a plant model.
 //!
 //! # The plant model
 //!
 //! Each cycle, [`SimAxisGroup`] integrates the *velocity* setpoint into its
-//! own position state (`position += velocity * dt`), rather than snapping
-//! straight to the commanded position. That's still about as simple as a
-//! plant model gets — no lag, no dynamics — but it's genuinely stateful,
-//! dt-stepping simulation (see the `NOTE (dt seam)` comment in
-//! `motion-core`'s `trajectory.rs`), not a pass-through. Euler-integrating a
-//! velocity profile that's actually a closed-form quadratic during
-//! accel/decel leaves a small, real discretization error between the
-//! planner's exact position and the sim's integrated one — a genuine (if
-//! tiny) following error to look at once viz exists, instead of two
-//! identical lines.
+//! own position state (`position += velocity * dt`) rather than snapping to
+//! the commanded position. There is no lag and no dynamics, but the model is
+//! stateful and steps by `dt`. Euler-integrating a velocity profile that is a
+//! closed-form quadratic during accel/decel leaves a small discretization
+//! error between the planner's exact position and the sim's integrated one.
 //!
-//! One consequence worth being aware of: this plant model only reads
-//! `AxisSetpoint::velocity`, never `AxisSetpoint::position` — it's
-//! dead-reckoning position from commanded velocity, not tracking a position
-//! target. That's the opposite of how a real EtherCAT drive in CSP mode
-//! actually works (position is the primary command there; the drive's own
-//! internal servo loop supplies velocity feed-forward and is where real
-//! following error comes from). `backend-ethercat`, when it exists, will
-//! consume these fields the other way around. This sim is a stand-in for
-//! exercising the dt-stepping seam now, not a faithful physical model.
+//! The model only reads `AxisSetpoint::velocity`, never
+//! `AxisSetpoint::position`: it dead-reckons position from commanded velocity
+//! and does not track a position target. A real drive in CSP mode works the
+//! other way around: position is the primary command, and the drive's servo
+//! loop is where following error comes from. This is not a faithful physical
+//! model.
 //!
-//! Richer dynamics (second-order lag, following-error limits) are a
-//! deliberately later step. See `step_ds402` for the one fault this sim can
-//! raise.
+//! It has no second-order lag and no following-error limit. The one fault it
+//! raises is described at `step_ds402`.
 
 use axis_backend::{
     AxisFault, AxisFeedback, AxisGroup, AxisGroupError, AxisSetpoint, AxisState, Ds402State,
@@ -38,9 +29,8 @@ use axis_backend::{
 const STANDSTILL_EPS: f64 = 1e-6;
 
 /// Below this per-cycle change in commanded speed, the axis counts as at
-/// constant velocity rather than accelerating/decelerating. Real ramps move
-/// by many multiples of this every cycle, so a tiny epsilon is enough to
-/// absorb float noise without misclassifying an actual ramp as "constant".
+/// constant velocity rather than accelerating/decelerating. Real ramps change
+/// by many multiples of this every cycle.
 const ACCEL_EPS: f64 = 1e-9;
 
 /// Advances a DS402 power-state by at most one standard transition per
@@ -51,24 +41,20 @@ const ACCEL_EPS: f64 = 1e-9;
 /// `true`, or back down the same three states while it's `false`.
 /// Already-at-target is a no-op either way.
 ///
-/// Real masters negotiate this the same way: each controlword write moves
-/// the drive at most one standard transition, confirmed by the next
-/// statusword read, rather than jumping straight there. DS402 also offers
-/// direct multi-state shortcuts coming down, but this always takes the
-/// granular one-state-at-a-time path, since that's the more interesting
-/// (and testable) case, and a real master is free to choose either.
+/// Each controlword write moves a real drive at most one standard transition,
+/// confirmed by the next statusword read. DS402 also allows multi-state
+/// shortcuts coming down; this always steps one state at a time.
 ///
 /// `fault_detected` (computed by the caller — see `exchange`) preempts
-/// everything else, from any state. From there: `FaultReactionActive`
-/// always advances automatically to `Fault` one cycle later — no
-/// controlword input needed, mirroring a real drive's brief internal
-/// fault-handling window. `Fault` only leaves via `fault_reset` (back to
-/// `SwitchOnDisabled`); toggling `enabled` alone does nothing there.
+/// everything else, from any state. `FaultReactionActive` always advances to
+/// `Fault` one cycle later, with no controlword input. `Fault` only leaves via
+/// `fault_reset` (back to `SwitchOnDisabled`); toggling `enabled` alone does
+/// nothing there.
 ///
-/// `QuickStopActive` isn't reachable yet — no quick-stop command exists —
-/// held in place if ever reached. Unlike the fault path, a *commanded*
-/// stop (`AxisSetpoint::stopping`) never touches this state machine at
-/// all — see `exchange`'s handling of it and `stopping`'s own docs for why.
+/// `QuickStopActive` is unreachable (there is no quick-stop command) and is
+/// held in place if ever reached. A *commanded* stop
+/// (`AxisSetpoint::stopping`) never touches this state machine; see
+/// `AxisSetpoint::stopping`.
 fn step_ds402(
     current: Ds402State,
     enabled: bool,
@@ -108,10 +94,9 @@ impl SimAxisGroup {
     /// `dt` is the fixed control-cycle time in seconds (e.g. `1.0 / 250.0`
     /// for a 250 Hz loop). All axes start at rest at position 0.0.
     ///
-    /// `dt` is a configuration value set by the run loop, not user input —
-    /// misconfiguring it is a programming error, so this panics rather than
-    /// returning `Result` (contrast `TrapezoidalProfile::new`, which
-    /// validates untrusted terminal input).
+    /// # Panics
+    ///
+    /// If `dt` is not positive.
     pub fn new(num_axes: usize, dt: f64) -> Self {
         assert!(dt > 0.0, "dt must be positive, got {dt}");
         Self {
@@ -145,11 +130,8 @@ impl AxisGroup for SimAxisGroup {
             });
         }
         for (fb, sp) in self.feedback.iter_mut().zip(setpoints) {
-            // A real drive can't safely just cut its power stage while
-            // actively moving the way it safely can from rest — treat that
-            // as a fault rather than a graceful disable. `fb.velocity`
-            // still holds last cycle's *actual* speed here, before this
-            // cycle overwrites it below.
+            // Disabling a moving axis is a fault. `fb.velocity` still holds
+            // last cycle's speed here; it is overwritten below.
             let was_moving = fb.velocity.abs() > STANDSTILL_EPS;
             let fault_detected =
                 fb.ds402_state == Ds402State::OperationEnabled && !sp.enabled && was_moving;
@@ -168,33 +150,24 @@ impl AxisGroup for SimAxisGroup {
 
             let operational = fb.ds402_state == Ds402State::OperationEnabled;
 
-            // No lag in this plant, so the commanded setpoint *is* the
-            // axis's actual speed each cycle — but only while the power
-            // stage is actually live (`operational`); otherwise the axis
-            // physically cannot move, no matter what velocity is
-            // commanded, the same way a real disabled (or faulted) drive
-            // ignores motion commands entirely.
+            // No lag, so the commanded velocity is the actual speed, but only
+            // while the power stage is live. A disabled or faulted axis
+            // ignores motion commands.
             let prev_speed = fb.velocity;
             let speed = if operational { sp.velocity } else { 0.0 };
 
             if operational {
                 fb.position += speed * self.dt;
             }
-            // Reported from the velocity change this plant actually
-            // applied, not copied from `sp.acceleration` — feedback must
-            // describe what happened, and what happened is `speed`, which
-            // is zeroed while the axis isn't operational. This is the one
-            // honest acceleration a pure integrator can report; a real
-            // drive rarely offers one at all (see `AxisFeedback`).
+            // Derived from the velocity change actually applied, not copied
+            // from `sp.acceleration`: `speed` is zero while not operational.
             fb.acceleration = (speed - prev_speed) / self.dt;
             fb.velocity = speed;
 
             let moving = speed.abs() > STANDSTILL_EPS;
             let base_state = fb.ds402_state.axis_state(moving);
-            // A commanded stop only ever changes the coarser AxisState, not
-            // Ds402State — see AxisSetpoint::stopping's docs for why. Only
-            // ever replaces DiscreteMotion: a stop request sent while
-            // Disabled/ErrorStop/etc. changes nothing.
+            // A commanded stop changes only AxisState, never Ds402State, and
+            // only replaces DiscreteMotion.
             fb.state = if sp.stopping && base_state == AxisState::DiscreteMotion {
                 AxisState::Stopping
             } else {
@@ -221,13 +194,8 @@ mod tests {
     use super::*;
 
     /// Steps every axis in `sim` through the 3-cycle DS402 enable sequence
-    /// so it's `OperationEnabled` before a test's real assertions begin.
-    /// Axes now start `SwitchOnDisabled` (see `SimAxisGroup::new`), so any
-    /// test that isn't specifically exercising the enable sequence itself
-    /// needs this first — otherwise its very first `exchange()` call would
-    /// still be mid-startup, not moving yet regardless of what velocity it
-    /// commands. See `enabling_steps_through_ds402_states_one_per_cycle`
-    /// below for a test of the sequence itself.
+    /// so it's `OperationEnabled`. Axes start `SwitchOnDisabled`, so tests
+    /// that aren't about the enable sequence call this first.
     fn warm_up_enabled(sim: &mut SimAxisGroup, num_axes: usize) {
         for _ in 0..3 {
             let setpoints = vec![
@@ -267,8 +235,7 @@ mod tests {
     fn only_velocity_drives_the_plant_not_position() {
         let mut sim = SimAxisGroup::new(1, 0.004);
         warm_up_enabled(&mut sim, 1);
-        // A wildly different commanded position is ignored entirely; only
-        // velocity integrates. See the module doc for why.
+        // A different commanded position is ignored; only velocity integrates.
         let setpoints = [AxisSetpoint {
             position: 999.0,
             velocity: -3.0,
@@ -339,9 +306,7 @@ mod tests {
 
     /// Drives one axis through a hand-crafted speed sequence (ramp up,
     /// cruise, ramp down, stop) and checks `AxisState`/`MotionFlags` after
-    /// every cycle. Isolates the flag-transition logic itself, independent
-    /// of any real trajectory shape (see the trapezoidal-profile tests below
-    /// for that).
+    /// every cycle, independent of any real trajectory shape.
     fn drive_and_check(
         sim: &mut SimAxisGroup,
         velocities: &[f64],
@@ -408,9 +373,8 @@ mod tests {
 
     #[test]
     fn state_and_motion_flags_track_a_hand_crafted_ramp_negative_direction() {
-        // Mirror image of the positive-direction case: the flags are
-        // defined on |speed| increasing/decreasing, not signed velocity, so
-        // this should classify identically to the positive case above.
+        // The flags are defined on |speed|, so this classifies identically
+        // to the positive-direction case.
         let mut sim = SimAxisGroup::new(1, 0.004);
         warm_up_enabled(&mut sim, 1);
         let velocities = [0.0, -2.0, -4.0, -4.0, -4.0, -2.0, 0.0];
@@ -446,13 +410,9 @@ mod tests {
     /// Drives a real `motion_core::TrapezoidalProfile`'s sampled velocity
     /// through `SimAxisGroup`, cycle by cycle at the app's real 250 Hz
     /// control rate, and spot-checks state/motion flags at points well
-    /// inside each phase. Spot checks (rather than asserting every single
-    /// cycle) sidestep phase-boundary ambiguity: `phase_at(t)` switches
-    /// labels at an exact continuous-time boundary, but the *cycle* that
-    /// straddles that boundary can legitimately still show the previous
-    /// phase's flag (e.g. the first cycle `phase_at` calls "Cruise" can
-    /// still have a higher speed than the cycle before it, so it's fair for
-    /// `accelerating` to still be true on that one cycle).
+    /// inside each phase. Cycles straddling a phase boundary are skipped:
+    /// `phase_at(t)` switches at an exact continuous-time boundary, but that
+    /// cycle can still show the previous phase's flag.
     fn assert_motion_flags_track_profile(start: f64, end: f64) {
         use motion_core::{MotionPhase, TrapezoidalProfile};
 
@@ -540,9 +500,6 @@ mod tests {
     #[test]
     fn axis_starts_switch_on_disabled() {
         let mut sim = SimAxisGroup::new(1, 0.004);
-        // A fresh axis has never had `exchange()` called on it — check the
-        // very first construction-time state directly, not just after some
-        // `enabled: true` request.
         let fb = sim
             .exchange(&[AxisSetpoint {
                 position: 0.0,
@@ -631,9 +588,7 @@ mod tests {
     #[test]
     fn a_disabled_axis_cannot_move_no_matter_what_velocity_is_commanded() {
         let mut sim = SimAxisGroup::new(1, 0.004);
-        // Never enabled — stays SwitchOnDisabled — yet keeps commanding a
-        // large velocity every cycle, matching a run loop that doesn't
-        // gate its own setpoints on backend-confirmed state.
+        // Never enabled, yet commanding a large velocity every cycle.
         for _ in 0..10 {
             let fb = sim
                 .exchange(&[AxisSetpoint {
@@ -651,11 +606,8 @@ mod tests {
 
     #[test]
     fn disabling_from_standstill_does_not_fault() {
-        // Disabling an axis that was never actually moving (commanded
-        // velocity stayed 0 the whole time) is the safe, graceful case —
-        // no fault, just the normal step-down sequence. Distinguishes this
-        // from `disabling_mid_motion_faults_and_freezes_position` below,
-        // where the axis genuinely was moving.
+        // An axis that was never moving steps down gracefully; contrast
+        // `disabling_mid_motion_faults_and_freezes_position`.
         let mut sim = SimAxisGroup::new(1, 0.004);
         warm_up_enabled(&mut sim, 1);
         let fb = sim
@@ -685,10 +637,7 @@ mod tests {
         let fb = sim.exchange(&[move_setpoint]).unwrap();
         assert_eq!(fb[0].position, 10.0);
 
-        // Disable while still commanding the same nonzero velocity — a real
-        // drive can't safely cut power mid-motion the way it can from rest,
-        // so this faults rather than gracefully disabling. Position freezes
-        // immediately either way.
+        // Disable while still commanding the same nonzero velocity.
         let disable_setpoint = AxisSetpoint {
             position: 0.0,
             velocity: 5.0,

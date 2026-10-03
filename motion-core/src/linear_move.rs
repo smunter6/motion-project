@@ -1,28 +1,20 @@
-//! A straight-line move across several axes at once: "move this group from
-//! here to there in a straight line" rather than "move this one axis."
+//! A straight-line move across several axes at once.
 //!
-//! # Why this exists, and why it isn't `WaypointPath`/`PathProfile`
+//! One scalar profile runs over the Euclidean distance between the start and
+//! end points and is composed with a fixed unit direction vector. It does not
+//! use `WaypointPath`/`PathProfile`: a line needs no spline or arc-length
+//! machinery.
 //!
-//! A multi-axis straight-line move is a special case of general path
-//! following: one segment, always a line, no blending. Rather than the
-//! full spline/arc-length machinery a general path-follower needs, this is
-//! the minimal thing that satisfies it: one scalar [`TrapezoidalProfile`]
-//! over the Euclidean distance between the start and end points, composed
-//! with a fixed unit direction vector.
-//!
-//! Same absolute-time model as `TrapezoidalProfile` — no dt-stepping state
-//! here either, `sample(t)` is a pure function of elapsed time.
+//! Like `TrapezoidalProfile`, `sample(t)` is a pure function of elapsed time.
 //!
 //! [`TrapezoidalProfile`]: crate::trajectory::TrapezoidalProfile
 
 use crate::jerk_filter::JerkFilteredProfile;
 use crate::trajectory::{MotionPhase, TrajectoryError};
 
-/// Upper bound on how many axes a single [`LinearMove`] can span. Exists so
-/// the per-cycle sample type ([`LinearMoveSample`]) can be a fixed-size,
-/// `Copy`, zero-allocation struct rather than heap-allocating every control
-/// cycle. Revisit only if a real need for more than 6 coordinated axes
-/// arises.
+/// Upper bound on how many axes a single [`LinearMove`] can span. It lets the
+/// per-cycle sample type ([`LinearMoveSample`]) be a fixed-size, `Copy`,
+/// allocation-free struct.
 pub const MAX_GROUP_AXES: usize = 6;
 
 /// Reasons a [`LinearMove`] could not be constructed.
@@ -78,11 +70,8 @@ impl std::error::Error for LinearMoveError {}
 /// A sample of a [`LinearMove`] at one instant: the feed-forward reference
 /// for every participating axis this control cycle.
 ///
-/// Fixed-size and `Copy` rather than `Vec`-returning: every group member
-/// samples the same shared [`LinearMove`] independently every control
-/// cycle, so this is a genuine per-cycle hot path — the first one in this
-/// crate to span more than one axis, and it stays allocation-free the same
-/// way every other profile type here does.
+/// Fixed-size and `Copy`: every group member samples the shared
+/// [`LinearMove`] each control cycle, so this path is allocation-free.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LinearMoveSample {
     positions: [f64; MAX_GROUP_AXES],
@@ -105,23 +94,18 @@ impl LinearMoveSample {
 
     /// Commanded acceleration for each participating axis.
     ///
-    /// A straight line has no curvature, so this is purely the scalar
-    /// path acceleration projected onto the same fixed unit direction the
-    /// other two use — no centripetal term exists to miss.
+    /// A straight line has no curvature, so this is the scalar path
+    /// acceleration projected onto the unit direction, with no centripetal term.
     pub fn acceleration(&self) -> &[f64] {
         &self.accelerations[..self.len]
     }
 }
 
-/// A straight-line move across `N` axes (`2 <= N <= MAX_GROUP_AXES` in
-/// practice, though nothing here requires more than one), driven by a
-/// single scalar [`TrapezoidalProfile`] over the Euclidean distance between
-/// `start` and `end`. Every axis's velocity is that one path velocity
-/// projected onto a fixed unit direction vector — a straight line traversed
-/// with synchronized speed, not independent per-axis profiles (which
-/// wouldn't trace a straight line at all) or per-axis time-rescaling.
-///
-/// [`TrapezoidalProfile`]: crate::trajectory::TrapezoidalProfile
+/// A straight-line move across `N` axes (`N <= MAX_GROUP_AXES`), driven by a
+/// single scalar profile over the Euclidean distance between `start` and
+/// `end`. Every axis's velocity is that one path velocity projected onto a
+/// fixed unit direction vector. Independent per-axis profiles would not trace
+/// a straight line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearMove {
     start: [f64; MAX_GROUP_AXES],
@@ -134,9 +118,7 @@ impl LinearMove {
     /// Build a straight-line move from `start` to `end` (rest-to-rest),
     /// across as many axes as `start`/`end` have coordinates.
     ///
-    /// A thin wrapper — `new_with_start_velocity` with an all-zero start
-    /// velocity — exactly mirroring `TrapezoidalProfile::new`'s own
-    /// relationship to `new_with_start_velocity`.
+    /// Equivalent to `new_with_start_velocity` with an all-zero start velocity.
     pub fn new(
         start: Vec<f64>,
         end: Vec<f64>,
@@ -158,19 +140,15 @@ impl LinearMove {
     }
 
     /// Build a straight-line move from `start` to `end`, starting from the
-    /// group's actual per-axis `start_velocity` (backend feedback, not a
-    /// commanded setpoint) rather than assuming rest.
+    /// group's per-axis `start_velocity` rather than assuming rest.
     ///
     /// The N-dimensional `start_velocity` is projected onto the new line's
-    /// unit direction via a dot product, reducing to the same scalar
-    /// problem `TrapezoidalProfile::new_with_start_velocity` already solves.
-    /// **Known limitation**: the component of `start_velocity` perpendicular
-    /// to the new line is discarded, not reconciled — if the axes' actual
-    /// velocity isn't already parallel to the new line, there's a genuine
-    /// velocity discontinuity at `t = 0`. Accepted as a simplification for
-    /// redirecting a moving axis group onto a new line; full reconciliation
-    /// would need a curved/blended transition, not a bigger version of this
-    /// type.
+    /// unit direction via a dot product, reducing to the scalar problem
+    /// `TrapezoidalProfile::new_with_start_velocity` solves.
+    ///
+    /// **Limitation**: the component of `start_velocity` perpendicular to the
+    /// new line is discarded. If the axes' velocity isn't already parallel to
+    /// the new line, velocity is discontinuous at `t = 0`.
     pub fn new_with_start_velocity(
         start: Vec<f64>,
         start_velocity: Vec<f64>,
@@ -274,9 +252,8 @@ impl LinearMove {
             .collect()
     }
 
-    /// Which phase the move is in at absolute elapsed time `t` (seconds) —
-    /// delegates directly to the underlying scalar profile, since every
-    /// axis shares the same path-progress timing.
+    /// Which phase the move is in at absolute elapsed time `t` (seconds).
+    /// Every axis shares the scalar profile's timing.
     pub fn phase_at(&self, t: f64) -> MotionPhase {
         self.speed.phase_at(t)
     }
@@ -309,8 +286,8 @@ impl LinearMove {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Several tests check a LinearMove against the bare scalar profile it
-    // reduces to when unfiltered.
+    // For checking a LinearMove against the scalar profile it reduces to
+    // when unfiltered.
     use crate::trajectory::TrapezoidalProfile;
 
     fn approx(a: f64, b: f64) -> bool {

@@ -1,3 +1,9 @@
 /target
 **/*.rs.bk
 .claude/settings.local.json
+*:Zone.Identifier
+
+# SVG artwork and the waypoint files generated from it (see scripts/utilities)
+scripts/*.svg
+scripts/*/
+!scripts/utilities/

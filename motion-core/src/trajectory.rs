@@ -1,40 +1,31 @@
 //! Trajectory generation: turning "go from A to B" into a stream of
 //! instantaneous position setpoints.
 //!
-//! # Why this exists
-//!
-//! A servo drive wants exactly one thing from us every control cycle: the
-//! *target position for this instant* — not "go to B eventually" but "be at
-//! 12.47 mm right now", then 4 ms later "be at 12.83 mm right now".
+//! A servo drive needs one thing every control cycle: the *target position
+//! for this instant* ("be at 12.47 mm now", then 4 ms later "be at 12.83 mm
+//! now").
 //!
 //! # The model: trapezoidal velocity profile
 //!
-//! An axis can't teleport or change speed instantly, so a well-behaved move
-//! has up to three phases: accelerate to a max speed, cruise, decelerate to
-//! zero exactly at the target. Plotted as speed-vs-time this is a trapezoid
+//! A move has up to three phases: accelerate to a max speed, cruise, decelerate
+//! to zero exactly at the target. Plotted as speed-vs-time this is a trapezoid
 //! (direction is constant through a move and applied separately — see
-//! `direction`). Position, the integral of signed velocity, comes out as a
-//! smooth S-curve.
+//! `direction`). Position, the integral of signed velocity, is a smooth
+//! S-curve.
 //!
-//! If the move is too short to reach `max_speed`, the trapezoid loses its
-//! flat top and becomes a triangle. That case is detected and handled
-//! explicitly.
+//! If the move is too short to reach `max_speed`, the trapezoid loses its flat
+//! top and becomes a triangle.
 //!
-//! # Time model: absolute-time query (not dt-stepping)
+//! # Time model: absolute-time query
 //!
-//! This generator is a **pure function of elapsed time**: ask "where should
-//! the axis be at t = 0.348 s?" and it computes the answer from closed-form
-//! kinematics, with no mutable state. That gives exact results at any
-//! instant, easy-to-verify invariants, and robustness to loop-timing jitter.
-//!
-//! The *stateful*, dt-stepping model belongs to a different layer (sim plant
-//! / real servo loop). See `NOTE (dt seam)` below for where the two meet.
+//! The generator is a **pure function of elapsed time**: asking where the axis
+//! should be at t = 0.348 s computes the answer from closed-form kinematics
+//! with no mutable state. A dt-stepping model belongs to the plant (sim or
+//! servo loop); see `NOTE (dt seam)` below for where the two meet.
 
 /// Which phase of the trapezoidal profile a given instant falls in.
 ///
-/// Exposed because it's genuinely useful (for display, diagnostics, and later
-/// logic), and computing it from the profile's known phase-boundary times is
-/// exact — far better than trying to infer it from speed trends.
+/// Computed from the profile's phase-boundary times, so it is exact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionPhase {
     /// Before the move has started (t <= 0).
@@ -51,12 +42,8 @@ pub enum MotionPhase {
 
 /// Reasons a `TrapezoidalProfile` could not be constructed.
 ///
-/// A typed enum (not a bare `String`) so callers can match on *which*
-/// constraint failed, not just that something did.
-///
-/// Finiteness is checked alongside sign/positivity: `f64::INFINITY > 0.0` is
-/// `true`, so a bare `> 0.0` check would let infinity through to propagate
-/// as NaN/infinity downstream instead of failing fast here.
+/// Finiteness is checked alongside sign: `f64::INFINITY > 0.0` is `true`, so a
+/// bare `> 0.0` check would let infinity through as NaN/infinity downstream.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TrajectoryError {
     /// `start` or `end` is NaN or +/-infinity — not a real position.
@@ -75,9 +62,7 @@ pub enum TrajectoryError {
     /// +/-infinity.
     NonFiniteStartVelocity(f64),
     /// `max_jerk` must be a finite, positive number *when given at all*.
-    /// "No jerk limit" is `None`, not infinity — see
-    /// [`JerkFilteredProfile`], and note that every other limit in this
-    /// crate must likewise be finite.
+    /// "No jerk limit" is `None`, not infinity — see [`JerkFilteredProfile`].
     ///
     /// [`JerkFilteredProfile`]: crate::jerk_filter::JerkFilteredProfile
     InvalidMaxJerk(f64),
@@ -122,12 +107,9 @@ impl std::error::Error for TrajectoryError {}
 /// A single-axis point-to-point move described by a trapezoidal (or, for short
 /// moves, triangular) velocity profile.
 ///
-/// Units are deliberately unspecified but must be *self-consistent*: mm,
-/// mm/s, mm/s^2 throughout this project.
-///
-/// The core stays in `f64` for clean, readable math. Conversion to integer
-/// encoder counts is the backend's job at the hardware seam, not this
-/// planner's.
+/// Units are unspecified but must be self-consistent (mm, mm/s, mm/s^2 in this
+/// project). Values are `f64`; conversion to integer encoder counts belongs to
+/// the backend.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrapezoidalProfile {
     start: f64,
@@ -173,9 +155,9 @@ pub struct TrapezoidalProfile {
 
 /// The main (rest-target) segment of a profile: ramps from some starting
 /// speed up or down to a cruise speed, cruises, then decelerates to rest —
-/// computed in isolation from wherever it actually begins, so both `new()`
-/// and `new_with_start_velocity` can build one and place it (directly, or
-/// after a prefix) into the outer `TrapezoidalProfile`.
+/// computed independently of where it begins, so both `new()` and
+/// `new_with_start_velocity` can build one and place it (directly, or after a
+/// prefix) into the outer `TrapezoidalProfile`.
 struct MainSegment {
     direction: f64,
     distance: f64,
@@ -196,16 +178,11 @@ pub struct TrajectorySample {
     /// even though position alone drives the move.
     pub velocity: f64,
     /// Target acceleration at the queried time — the second feed-forward
-    /// term, and the one a drive turns into a torque offset (it is
-    /// proportional to the inertia it has to accelerate). Carried through
-    /// the backend seam for that reason rather than being re-derived by
-    /// whoever wants it.
+    /// term, which a drive turns into a torque offset.
     ///
-    /// Exact and closed-form, not differenced: every profile here knows its
-    /// own acceleration analytically. It is piecewise *constant* for an
-    /// unfiltered trapezoid (stepping at each phase boundary) and piecewise
-    /// linear once jerk-limited — which is the whole visible difference
-    /// between the two.
+    /// Exact and closed-form, not differenced. It is piecewise *constant* for
+    /// an unfiltered trapezoid (stepping at each phase boundary) and
+    /// piecewise linear once jerk-limited.
     pub acceleration: f64,
 }
 
@@ -214,10 +191,8 @@ impl TrapezoidalProfile {
     ///
     /// `max_speed`, `max_acceleration`, and `max_deceleration` must all be
     /// finite and > 0, and `start`/`end` must both be finite; otherwise this
-    /// returns `Err` rather than panicking. See [`TrajectoryError`] for why
-    /// finiteness is checked, not just sign. Acceleration and deceleration
-    /// are independent, since many real axes allow a faster ramp-up than
-    /// ramp-down (or vice versa).
+    /// returns `Err` rather than panicking. Acceleration and deceleration
+    /// limits are independent.
     ///
     /// A zero-distance move is valid and produces a profile that simply
     /// reports `start` for all time with zero velocity (total duration 0).
@@ -248,17 +223,16 @@ impl TrapezoidalProfile {
         ))
     }
 
-    /// Build a profile for a move from `start` to `end`, but starting from a
-    /// nonzero `start_velocity` — the axis's actual current velocity, not
-    /// the rest-to-rest assumption `new()` makes. This is what backs
-    /// interrupting an in-flight move with a new target: the new move's own
-    /// `max_speed`/`max_acceleration`/`max_deceleration` govern the entire
-    /// resulting profile, including any preamble needed to reconcile
-    /// `start_velocity` with the new target — no blending or carryover from
-    /// whatever move was superseded.
+    /// Build a profile for a move from `start` to `end`, starting from a
+    /// nonzero `start_velocity` rather than the rest-to-rest assumption
+    /// `new()` makes. Used to interrupt an in-flight move with a new target.
+    /// The new move's own `max_speed`/`max_acceleration`/`max_deceleration`
+    /// govern the entire profile, including any preamble needed to reconcile
+    /// `start_velocity` with the new target; nothing carries over from a
+    /// superseded move.
     ///
-    /// Three kinematic cases fall out of the geometry, none requiring the
-    /// caller to pick a case explicitly:
+    /// Three kinematic cases arise from the geometry; the caller does not
+    /// pick one:
     ///
     /// - **Same direction, room to spare**: ramps from `start_velocity` to a
     ///   cruise speed (accelerating, or decelerating into cruise if
@@ -271,10 +245,9 @@ impl TrapezoidalProfile {
     /// - **Opposite direction**: decelerates to rest first, then a normal
     ///   rest-to-rest move from wherever that lands.
     ///
-    /// The last two cases are the same code path — decelerate to rest, then
-    /// hand off to a fresh rest-to-rest segment; which side of `end` the
-    /// landing spot falls on distinguishes "overshoot and come back" from
-    /// "reverse and go".
+    /// The last two cases share a code path: decelerate to rest, then run a
+    /// fresh rest-to-rest segment. Which side of `end` the landing spot falls
+    /// on distinguishes "overshoot and come back" from "reverse and go".
     pub fn new_with_start_velocity(
         start: f64,
         start_velocity: f64,
@@ -294,10 +267,8 @@ impl TrapezoidalProfile {
         // Component of start_velocity along the direction of travel to
         // `end`. Negative means start_velocity points away from `end`.
         let v0_along = start_velocity * direction;
-        // The least distance physically possible to come to rest from
-        // v0_along at max_deceleration — if `end` is closer than this,
-        // there's no way to arrive there directly, no matter the profile
-        // shape.
+        // The least distance in which v0_along can be brought to rest at
+        // max_deceleration. If `end` is closer, it cannot be reached directly.
         let min_stop_distance = (v0_along * v0_along) / (2.0 * max_deceleration);
 
         if v0_along > 0.0 && distance >= min_stop_distance {
@@ -322,8 +293,8 @@ impl TrapezoidalProfile {
             ))
         } else {
             // Not enough room, or start_velocity points the wrong way:
-            // decelerate it to rest first (mirrors StopRamp's math exactly),
-            // then a fresh rest-to-rest segment from wherever that lands.
+            // decelerate it to rest first (the same math as StopRamp), then
+            // a fresh rest-to-rest segment from wherever that lands.
             let prefix_dir = start_velocity.signum();
             let t_prefix_end = start_velocity.abs() / max_deceleration;
             let prefix_distance = (start_velocity * start_velocity) / (2.0 * max_deceleration);
@@ -373,11 +344,8 @@ impl TrapezoidalProfile {
 
     /// Build the main (rest-target) segment: ramp from `start_velocity`
     /// (>= 0, along the direction of travel) to a cruise speed, cruise,
-    /// decelerate to rest at `end`. Assumes the caller has already
-    /// established there's enough room — true by construction for both
-    /// callers (`new()`'s `start_velocity: 0.0`, and
-    /// `new_with_start_velocity`'s room-checked direct case or
-    /// zero-velocity post-prefix case).
+    /// decelerate to rest at `end`. The caller must have established that
+    /// there is enough room to stop.
     fn build_main_segment(
         start: f64,
         end: f64,
@@ -493,8 +461,7 @@ impl TrapezoidalProfile {
         }
     }
 
-    /// Total duration of the move in seconds. Needed later to coordinate
-    /// multiple axes (finish-together time-scaling).
+    /// Total duration of the move in seconds.
     pub fn duration(&self) -> f64 {
         self.t_total
     }
@@ -506,17 +473,15 @@ impl TrapezoidalProfile {
 
     /// The area under the position curve: `∫₀ᵗ position(τ) dτ`.
     ///
-    /// Exists for [`JerkFilteredProfile`], whose box-filtered position is
-    /// the *mean* position over a trailing window — that is, a difference
-    /// of this integral at two times, divided by the window. Piecewise over
-    /// exactly the phases [`sample`] uses, so the two cannot disagree about
-    /// where a phase ends.
+    /// Used by [`JerkFilteredProfile`], whose box-filtered position is the
+    /// *mean* position over a trailing window: a difference of this integral at
+    /// two times, divided by the window. It is piecewise over the same phases
+    /// [`sample`] uses.
     ///
-    /// Outside the move this follows `sample`'s own clamping: zero for
-    /// `t <= 0` (this profile holds at `start` before it begins), and
-    /// holding at `end` after. The *linear* backward extension a filtered
-    /// profile needs at a non-zero start velocity is the filter's business,
-    /// not this method's — see `JerkFilteredProfile`.
+    /// Outside the move this follows `sample`'s clamping: zero for `t <= 0`
+    /// (the profile holds at `start` before it begins), and holding at `end`
+    /// after. The linear backward extension a filtered profile needs at a
+    /// non-zero start velocity is handled by `JerkFilteredProfile`.
     ///
     /// [`JerkFilteredProfile`]: crate::jerk_filter::JerkFilteredProfile
     /// [`sample`]: TrapezoidalProfile::sample
@@ -558,7 +523,7 @@ impl TrapezoidalProfile {
         let t_cruise_end = self.t_cruise_end - self.t_prefix_end;
         let t_total = self.t_total - self.t_prefix_end;
 
-        // Same ramp direction `sample` picks, for the same reason.
+        // Same ramp direction `sample` picks.
         let ramping_up = self.cruise_speed >= self.main_start_velocity;
         let (sign, rate) = if ramping_up {
             (1.0, self.accel)
@@ -629,13 +594,12 @@ impl TrapezoidalProfile {
     /// Times outside `[0, duration]` are clamped: `t < 0` returns the start
     /// (at whatever velocity the move actually began with — 0 for a plain
     /// `new()` move), `t > duration` returns the end (at rest). This makes
-    /// the "move already finished" case trivially correct — no completion
-    /// flag to manage.
+    /// the "move already finished" case need no completion flag.
     ///
-    /// NOTE (dt seam): the control loop will call this once per cycle with the
-    /// *actual* elapsed time, then hand `sample.position` to the backend. The
-    /// backend (sim plant model, later a real drive) is the stateful,
-    /// dt-stepping layer that consumes this setpoint. This method stays pure.
+    /// NOTE (dt seam): the control loop calls this once per cycle with the
+    /// actual elapsed time, then hands the sample to the backend. The backend
+    /// (sim plant model or a real drive) is the stateful, dt-stepping layer
+    /// that consumes the setpoint. This method stays pure.
     pub fn sample(&self, t: f64) -> TrajectorySample {
         if t <= 0.0 {
             let velocity = if self.t_prefix_end > 0.0 {
@@ -646,9 +610,7 @@ impl TrapezoidalProfile {
             return TrajectorySample {
                 position: self.start,
                 velocity,
-                // Before the move begins nothing is being commanded to
-                // change yet, so the feed-forward term is zero — even
-                // when `velocity` is not, on a move entered in motion.
+                // Zero even when `velocity` is not, on a move entered in motion.
                 acceleration: 0.0,
             };
         }
@@ -664,7 +626,7 @@ impl TrapezoidalProfile {
 
         if t < self.t_prefix_end {
             // --- Prefix: decelerating an incompatible start_velocity to
-            // rest, exactly like StopRamp's own math (see its `sample`).
+            // rest, the same math as `StopRamp::sample`.
             let pd = self.prefix_velocity.signum();
             return TrajectorySample {
                 position: self.start + self.prefix_velocity * t
@@ -729,46 +691,36 @@ impl TrapezoidalProfile {
     }
 }
 
-/// A controlled deceleration to rest from wherever an axis actually is right
-/// now — the mirror image of [`TrapezoidalProfile`]'s rest-to-rest move.
+/// A controlled deceleration to rest from the axis's current velocity.
 ///
-/// This is what backs a commanded stop: unlike a move, there's no target
-/// position to aim for and no accel/cruise phase, just "decelerate from
-/// `start_velocity` to zero at `max_deceleration`, holding wherever that
-/// lands." `TrapezoidalProfile` always assumes both ends are at rest, so
-/// this is a separate, much simpler type rather than a generalization of it.
+/// Used for a commanded stop: there is no target position and no accel/cruise
+/// phase, just "decelerate from `start_velocity` to zero at `max_deceleration`,
+/// holding wherever that lands."
 ///
-/// Same absolute-time, pure-function-of-`t` model as `TrapezoidalProfile`
-/// (see the module docs' "Time model" section) — no mutable state here
-/// either.
+/// Like `TrapezoidalProfile`, it is a pure function of elapsed time (see the
+/// module docs' "Time model" section).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StopRamp {
     start_position: f64,
     start_velocity: f64,
     decel: f64,
-    /// Sign of `start_velocity`. Irrelevant (never actually used, since it's
-    /// always multiplied by a clamped `t` that's forced to `0.0`) when
-    /// `start_velocity == 0.0` — `f64::signum()` returns +/-1.0 even for
-    /// zero, never 0.0, but that's harmless here.
+    /// Sign of `start_velocity`. `f64::signum()` returns +/-1.0 even for zero,
+    /// which is harmless: when `start_velocity == 0.0` the ramp has zero
+    /// duration and this is multiplied by a clamped `t` of `0.0`.
     direction: f64,
     /// Time to reach zero velocity: `|start_velocity| / decel`.
     t_stop: f64,
-    /// Position once at rest — precomputed rather than recovered by
-    /// resampling at `t_stop`, matching `TrapezoidalProfile::target()`'s own
-    /// style (a stored field, not a recomputation).
+    /// Position once at rest.
     final_position: f64,
 }
 
 impl StopRamp {
-    /// Build a stop ramp from the axis's *actual* current position and
-    /// velocity (backend feedback, not a commanded setpoint — same
-    /// "feedback is ground truth" principle a new move's start already
-    /// follows).
+    /// Build a stop ramp from the axis's current position and velocity.
     ///
     /// `max_deceleration` must be finite and > 0; `start_position` and
     /// `start_velocity` must both be finite. `start_velocity` may be any
     /// sign (or zero, in which case the ramp has zero duration — the axis
-    /// was already at rest, so there's nothing to decelerate).
+    /// was already at rest).
     pub fn new(
         start_position: f64,
         start_velocity: f64,
@@ -814,12 +766,9 @@ impl StopRamp {
     /// Which phase the ramp is in at elapsed time `t` (seconds since the
     /// stop was commanded).
     ///
-    /// Only ever `Pre`, `Decel`, or `Done` — never `Accel`/`Cruise`, there
-    /// are no such phases here. Unlike `TrapezoidalProfile::phase_at`
-    /// (where a zero-distance move reports `Pre` forever — see its own
-    /// docs), a zero-duration stop reports `Done` immediately for any
-    /// `t >= 0.0`: the axis was already at rest, so there's genuinely
-    /// nothing pending, not an ambiguous "already there" case.
+    /// Only ever `Pre`, `Decel`, or `Done`. Unlike `TrapezoidalProfile::phase_at`
+    /// (where a zero-distance move reports `Pre` forever), a zero-duration stop
+    /// reports `Done` for any `t >= 0.0`: the axis was already at rest.
     pub fn phase_at(&self, t: f64) -> MotionPhase {
         if t < 0.0 {
             MotionPhase::Pre
@@ -841,8 +790,7 @@ impl StopRamp {
                 - self.direction * 0.5 * self.decel * clamped * clamped,
             velocity: self.start_velocity - self.direction * self.decel * clamped,
             // Constant through the ramp and zero once stopped. Compared
-            // against the *unclamped* `t` so the held-at-rest tail doesn't
-            // keep reporting a deceleration nothing is doing.
+            // against the unclamped `t` so the held-at-rest tail reports zero.
             acceleration: if t > 0.0 && t < self.t_stop {
                 -self.direction * self.decel
             } else {
@@ -1031,9 +979,8 @@ mod tests {
         // distance=200, v_max=50, accel=100, decel=50 (half the accel rate).
         // d_accel = 2500/200 = 12.5, d_decel = 2500/100 = 25, sum=37.5 <= 200
         // => trapezoidal. t_accel = 50/100 = 0.5s, t_decel = 50/50 = 1.0s
-        // (twice as long as accel, since decel is half the rate) — with the
-        // old symmetric-only formula t_total would have been 4.25s; with
-        // independent rates it's 4.75s.
+        // (twice as long as accel, since decel is half the rate), so
+        // t_total is 4.75s. Equal rates would give 4.25s.
         let p = TrapezoidalProfile::new(0.0, 200.0, 50.0, 100.0, 50.0).unwrap();
         assert!(approx(p.duration(), 4.75));
         assert!(approx(p.t_accel, 0.5));
@@ -1073,8 +1020,7 @@ mod tests {
         assert!(p.cruise_speed < 50.0);
 
         // Accel phase (0.2s) is a quarter the length of decel (0.8s), since
-        // decel is a quarter the rate of accel — asymmetric in time, unlike
-        // the old symmetric formula which forced them equal.
+        // decel is a quarter the rate of accel.
         assert!(approx(p.t_accel, 0.2));
         assert!(approx(p.duration(), 1.0));
 
@@ -1359,8 +1305,8 @@ mod tests {
 
     #[test]
     fn start_velocity_position_is_continuous_across_all_boundaries() {
-        // No jumps anywhere, including the new prefix/main-segment seam,
-        // for a profile that exercises overshoot-and-reverse.
+        // No jumps anywhere, including the prefix/main-segment seam, for a
+        // profile that exercises overshoot-and-reverse.
         let p = TrapezoidalProfile::new_with_start_velocity(0.0, 50.0, 5.0, 50.0, 100.0, 100.0)
             .unwrap();
         for &boundary in &[p.t_prefix_end, p.t_accel, p.t_cruise_end] {

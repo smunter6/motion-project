@@ -6,11 +6,3 @@ members = [
     "backend-sim",
     "app",
 ]
-
-# As the project grows, new crates get added here:
-#   "backend-ethercat"  - EtherCRAB + CiA 402 implementation (when hardware arrives)
-#   "viz"               - simple 2D + plot visualization
-#
-# "app" (wires planner + backend + viz together) has arrived early, ahead of
-# backend-sim/viz: for now it samples motion-core's trajectory directly and
-# treats the setpoint as ground truth. See app/src/main.rs.

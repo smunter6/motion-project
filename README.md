@@ -1,14 +1,12 @@
 # motion-project
 
-Motion planning / trajectory generation for a small robot, built to eventually
-drive **EtherCAT servo drives** (EtherCRAB + CiA 402, CSP mode) while running
-hardware-free in **simulation** with live visualization. Sim mode is a
-first-class target, not a stopgap — there is no hardware yet.
+Motion planning and trajectory generation for a small robot, written in Rust.
+Trajectories run against a software simulation of servo drives (with a CiA 402
+state machine) and are plotted live. There is no hardware backend: the
+`AxisGroup` trait is the seam a real EtherCAT/CiA 402 backend would implement,
+but none is included.
 
-A learning project, built one deliberate step at a time. This file is the
-*what and how*. The *why* — every design decision, tradeoff, and accepted
-limitation — lives in [`CLAUDE.md`](CLAUDE.md), which is the more interesting
-document and the one to read before changing anything.
+Released as-is. It is a learning project and has not been run on real hardware.
 
 ## Workspace
 
@@ -19,13 +17,10 @@ backend-sim/     software plant implementing the seam (dt-stepping, DS402 model)
 app/             the interactive control loop: terminal commands + egui viz
 ```
 
-`backend-ethercat` (EtherCRAB + CiA 402) slots in behind the same trait when
-hardware arrives. Nothing above it should need to change.
-
 ### `motion-core`
 
-No I/O, no dependencies, no allocation in the per-cycle path — so the same code
-is host-testable in WSL and reusable unchanged on a Pi (or an RP2350 later).
+No I/O, no dependencies, no allocation in the per-cycle path, so it is
+host-testable and portable.
 
 | Module | What it provides |
 | --- | --- |
@@ -39,51 +34,66 @@ is host-testable in WSL and reusable unchanged on a Pi (or an RP2350 later).
 The recurring pattern throughout: reuse one scalar profile over a scalar path
 coordinate, rather than deriving a new profile type per move kind.
 
-### Key invariants
+## Control loop
 
-- **Trajectory is a pure function of elapsed time**; the *plant* is the
-  stateful dt-stepping half. They meet at the setpoint each cycle.
-- **`f64` everywhere in the core.** Encoder-count conversion is the backend's
-  job at the hardware seam.
-- **The planner plans from commanded state, never from feedback.** Feedback is
-  for reporting. Seeding a profile from measured position injects a step into
-  the commanded stream and launders following error into the plan.
-- Control rate **250 Hz** (4 ms cycle); groups bounded by `MAX_GROUP_AXES = 6`.
+`app` runs a stateful control loop against the simulated plant at 250 Hz, set
+by `CONTROL_RATE_HZ` in `app/src/main.rs`.
 
 ## Running it
 
 ```sh
-cargo test                      # host-side unit tests, the bulk in motion-core
-cargo run -p motion-core --bin demo_axis   # print one axis's profile as numbers
-cargo build -p app && ./target/debug/app   # interactive, with viz window
-./target/debug/app --headless              # no window, loop on the main thread
-./scripts/demo_session.sh                  # scripted non-interactive session
+cargo test                                  # host-side unit tests, the bulk in motion-core
+cargo run -p motion-core --bin demo_axis    # print one axis's profile as numbers
+cargo build -p app && ./target/debug/app    # interactive, with viz window
+./target/debug/app --headless               # no window, loop on the main thread
+./scripts/demo_session.sh                   # scripted session, headless
+./scripts/demo_session_viz.sh               # same session with the viz window
 ```
 
-Two notes that will otherwise cost you an afternoon:
+Notes:
 
-- **Verify interactive changes against `./target/debug/app`, not `cargo run`** —
-  there's a piped-stdin timing gotcha.
-- **Anything scripted runs `--headless`.** The viz window needs a display
+- **Drive piped input through `./target/debug/app`, not `cargo run`.**
+  `cargo run`'s startup races piped stdin.
+- **Scripted sessions should use `--headless`.** The viz window needs a display
   server, dominates startup, and outlives the control loop. Headless runs the
   identical loop (recording included) and needs no startup sleep. See
-  [`app/CLAUDE.md`](app/CLAUDE.md) for the WSL renderer setup if you do want a
+  [`app/CLAUDE.md`](app/CLAUDE.md) for the WSL renderer setup if you want a
   window.
 
 ## The machine it simulates
 
-Configured at compile time in `app/src/main.rs` (`AXIS_CONFIGS`, `AXIS_GROUPS`);
-`setlimits` edits a runtime copy that lasts until exit.
+Compile-time configuration, all in `app/src/main.rs`. `setlimits` edits a
+runtime copy of the limits that lasts until exit.
 
-| | Axes | Kinematics | Units |
+**Kinematic models** (`motion-core/src/kinematics.rs`)
+
+| Model | Maps | Used by |
+| --- | --- | --- |
+| `IdentityKinematics` | joints are Cartesian X/Y | `axisGroup0` |
+| `ScaraKinematics` | 2-link planar arm, 100 mm links; raw `q2 = 0` is a 90° elbow, not a straight arm | `axisGroup1` |
+
+**Axes** (`AXIS_CONFIGS`, one entry per axis)
+
+| Axis | Units | Speed | Accel / decel | Jerk | Travel |
+| --- | --- | --- | --- | --- | --- |
+| `axis0`, `axis1` | mm | 50 | 200 | 4000 | ±500 |
+| `axis2`, `axis3` | rad | 2 | 8 | 160 | unlimited |
+
+**Groups** (`AXIS_GROUPS`)
+
+| Group | Axes | Kinematics | Limits (TCP, mm) |
 | --- | --- | --- | --- |
-| `axisGroup0` | `axis0`, `axis1` | identity (Cartesian XY stages) | mm |
-| `axisGroup1` | `axis2`, `axis3` | SCARA, two 100 mm links | **rad** |
+| `axisGroup0` | `axis0`, `axis1` | `IdentityKinematics` | 50 mm/s, 200 mm/s², jerk 4000 |
+| `axisGroup1` | `axis2`, `axis3` | `ScaraKinematics` | same |
 
-Group coordinates are always Cartesian TCP mm; a single-axis `move axisN` is
-raw joint space in that axis's own units. So `move axis3 0.5` means 0.5 rad.
-The SCARA bakes in a `q2 + π/2` home offset — raw `q2 = 0` is *not* a straight
-arm.
+Group coordinates are Cartesian TCP mm; a single-axis `move axisN` is joint
+space in that axis's own units, so `move axis3 0.5` means 0.5 rad.
+
+**Adding a configuration:** append an `AxisConfig` to `AXIS_CONFIGS` and raise
+`NUM_AXES`; add an `AxisGroupDef` to `AXIS_GROUPS` with its kinematic model
+(groups hold up to `MAX_GROUP_AXES = 6` axes). A new model implements
+`KinematicModel` in `motion-core/src/kinematics.rs`. `main()` asserts that the
+tables and each model's degrees of freedom agree.
 
 ## Command language
 
@@ -118,40 +128,68 @@ feedback but nothing of `app`'s higher-level bookkeeping; only `status` can tell
 you whether a *synchronized group move* is active. Plane plots are drawn for
 2-axis groups only (`egui_plot` is strictly 2D).
 
-## State of play
+## Implemented and not implemented
 
-Built: trapezoidal and jerk-limited profiles, redirect-with-start-velocity,
+Implemented: trapezoidal and jerk-limited profiles, redirect-with-start-velocity,
 stop ramps, straight-line and spline path moves with buffering/blending, the
 kinematics seam with a working SCARA, the sim backend with a real DS402 state
 machine and faults, per-axis and per-group runtime limits, group interrupt
 cascades, and viz.
 
-Not built, and worth knowing before you trust it:
+Not implemented:
 
-- **Nothing bounds centripetal acceleration.** One scalar `max_speed` over arc
-  length; `v²κ` is unchecked and today's demo path exceeds `max_acceleration`
-  by roughly 3×.
+- **Centripetal acceleration is not bounded.** One scalar `max_speed` applies
+  over arc length; `v²κ` is unchecked and the demo path exceeds
+  `max_acceleration` by roughly 3×.
 - **No joint-rate limiting and no mid-path reachability checking.** Validation
-  is install-time endpoints only, plus a reactive cascade stop. These plus
-  curvature-limited feedrate are one problem — the next phase (roadmap 7).
-- **Paths are G1, never G2.** Curvature steps at every waypoint; inherent to
-  Catmull-Rom. Fixed by moving to Yuksel C2 splines (roadmap 8), not by tuning.
-- **Coordinated multi-axis time-scaling is deferred.** `app` drives
-  independently issued single-axis moves without synchronizing their durations.
-  Axis *groups* are a different thing and do exist.
-- The SCARA's equal links put a reachable singularity at the origin. "Don't
-  command a move across it" is a convention observed by tests and demo targets,
-  not enforced by code.
+  is install-time endpoints only, plus a reactive cascade stop when inverse
+  kinematics fails mid-move.
+- **Paths are G1, not G2.** Catmull-Rom splines are C1, so curvature steps at
+  every waypoint.
+- **No coordinated time-scaling** of independently issued single-axis moves.
+  `app` runs them without synchronizing their durations. Axis *groups* are a
+  different thing and do exist.
+- **No joint position limits for the SCARA** (`position_limits` is `None`), and
+  limits are checked at a move's commanded endpoint only, not along its path.
+- **No straight-segment override within a path**, and no comment syntax in the
+  `movepath` file format.
+- **No PLCopen blending modes** (`BlendingLow`/`Previous`/`Next`/`High`).
+  `BufferMode::Blend` only changes how a new path's geometry starts.
+- **No redundant or reduced-DOF kinematic models**; `dof()` must equal the
+  group's axis count.
+- **No EtherCAT backend, and no CiA 402 Quick Stop** (`QuickStopActive` is
+  declared but never entered).
+- **No control-loop integration tests.** Profiles, kinematics, parsing and the
+  sim backend are unit-tested; the loop itself is exercised by running it.
+- The SCARA's equal links put a reachable singularity at the origin. A straight
+  move through it validates at both endpoints. Avoiding it is left to the
+  operator.
 - `backend-sim` integrates commanded velocity and models no mechanics, so it
   **hides** whole classes of bug — a commanded-position step, an off-branch IK
   jump, and most of what jerk limiting buys all show up only as a small
-  target-vs-actual gap here, and as an immediate following-error fault on real
-  hardware. Severity is inverted between sim and the real thing.
+  target-vs-actual gap here, and would cause an immediate following-error fault
+  on real hardware.
 
-Full roadmap, with sequencing rationale, is in [`CLAUDE.md`](CLAUDE.md).
+## Utilities
 
-## Deployment
+`scripts/utilities/` holds a tool for drawing SVG artwork on `axisGroup0`:
 
-Develop and test in WSL on the Linux filesystem (not `/mnt/c`). **Real EtherCAT
-bus testing happens on the Pi** — WSL2's virtualized NAT networking can't do raw
-L2 EtherCAT reliably. See the `deploy-to-pi` skill for the cross-compile loop.
+- `svg_to_waypoints.rs` converts an SVG's `<path>` outlines (potrace-style:
+  `M L H V C S Z` with a single `translate`/`scale` transform) into one
+  `movepath` waypoint file per contour, plus a `session.txt`. It is built with
+  plain `rustc` and is not part of the workspace.
+- `draw_svg.sh <contour-dir> [vmax]` feeds that session to `app`. It defaults to
+  12 mm/s because centripetal acceleration on tight corners is not bounded.
+
+See the header of `svg_to_waypoints.rs` for the commands.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
+
+## Development environment
+
+Developed and tested in WSL on the Linux filesystem (not `/mnt/c`). WSL2's
+virtualized NAT networking can't do raw L2 EtherCAT reliably, so a bus test
+would need to run on a separate machine such as a Raspberry Pi.
+`.claude/skills/deploy-to-pi/SKILL.md` describes the cross-compile loop.

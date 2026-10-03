@@ -11,59 +11,50 @@
 //!
 //! **A trapezoidal profile is the `max_jerk → ∞` case of this one**: the
 //! window shrinks to nothing and a zero-width box filter is the identity.
-//! That is the mental model to keep — this type generalizes
-//! [`TrapezoidalProfile`], it isn't a parallel construction. `max_jerk:
-//! None` is that limit, and is bit-for-bit the unfiltered profile.
+//! `max_jerk: None` is that limit, and is bit-for-bit the unfiltered profile.
 //!
-//! # Why filtering rather than a seven-segment profile
+//! # Filtering versus a seven-segment profile
 //!
-//! The classic S-curve derivation is a case analysis — cruise or no cruise,
-//! `a_max` reached or not, plus the short-move degenerate cases — and the
-//! branch count multiplies again once the move can start at a non-zero
-//! velocity, which every redirect here does. Filtering reuses
-//! [`TrapezoidalProfile`] whole and adds no case analysis at all: the same
-//! "reuse the existing scalar profile" pattern `StopRamp`, `LinearMove` and
-//! `PathProfile` already follow.
+//! The classic S-curve derivation is a case analysis (cruise or no cruise,
+//! `a_max` reached or not, short-move degenerate cases) whose branch count
+//! multiplies when the move starts at a non-zero velocity. Filtering reuses
+//! [`TrapezoidalProfile`] whole and adds no case analysis.
 //!
-//! What it costs: the profile is not time-optimal (it runs exactly `T`
-//! longer), and jerk is set indirectly by the window rather than commanded
-//! directly. See [`JerkFilteredProfile::new_with_start_velocity`] for the
-//! one case where the filter needs a correction to stay exact.
+//! The costs: the profile is not time-optimal (it runs exactly `T` longer),
+//! and jerk is set indirectly by the window. See
+//! [`JerkFilteredProfile::new_with_start_velocity`] for the one case where the
+//! filter needs a correction to stay exact.
 //!
 //! # Time model
 //!
-//! Unchanged: `sample(t)` is a pure function of elapsed time. The
-//! convolution is evaluated in closed form from the underlying profile's
-//! position and its analytic integral — there is no running filter and no
-//! state, so this composes with the absolute-time model the rest of the
-//! crate is built on.
+//! `sample(t)` is a pure function of elapsed time. The convolution is
+//! evaluated in closed form from the underlying profile's position and its
+//! analytic integral; there is no running filter and no state.
 
 use crate::trajectory::{MotionPhase, TrajectoryError, TrajectorySample, TrapezoidalProfile};
 
 /// Windows shorter than this are treated as no filtering at all.
 ///
-/// Not a taste threshold — a numerical one. Filtered velocity is the
-/// difference quotient `(p(t) − p(t−T)) / T`, and as `T` shrinks the two
-/// positions agree to more and more significant figures, so the subtraction
-/// keeps only rounding noise and then divides it by something tiny. At
-/// `T = 1e-9` a millimetre-scale profile has already lost most of its
-/// velocity precision.
+/// A numerical threshold. Filtered velocity is the difference quotient
+/// `(p(t) − p(t−T)) / T`; as `T` shrinks the two positions agree to more
+/// significant figures, so the subtraction keeps only rounding noise and
+/// divides it by something tiny. At `T = 1e-9` a millimetre-scale profile has
+/// already lost most of its velocity precision.
 ///
-/// This guards the arithmetic only. A *useful* floor is much larger — a
-/// window shorter than one control cycle cannot change what the drive sees
-/// — but this crate doesn't know the control rate, so that judgement
-/// belongs to the caller.
+/// This guards the arithmetic only. A window shorter than one control cycle
+/// cannot change what the drive sees, but this crate doesn't know the control
+/// rate.
 const MIN_FILTER_WINDOW: f64 = 1e-6;
 
 /// A jerk-limited move: a [`TrapezoidalProfile`] convolved with a
 /// rectangular window.
 ///
 /// Same interface as the profile it wraps (`sample`/`phase_at`/`target`/
-/// `duration`), so it drops into the same compositions.
+/// `duration`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JerkFilteredProfile {
-    /// The profile being filtered. Built to a *corrected* target when the
-    /// move starts in motion — see `new_with_start_velocity`.
+    /// The profile being filtered. Built to a corrected target when the move
+    /// starts in motion — see `new_with_start_velocity`.
     inner: TrapezoidalProfile,
     /// Filter window in seconds. `None` is the unfiltered `max_jerk → ∞`
     /// case, where every query delegates straight through.
@@ -101,24 +92,19 @@ impl JerkFilteredProfile {
 
     /// A jerk-limited move starting from a non-zero velocity.
     ///
-    /// # The correction this needs, and why
+    /// # Start-velocity correction
     ///
     /// For the filtered profile to *begin* at `start_velocity` with zero
-    /// acceleration, the underlying profile has to be extended backwards
-    /// before `t = 0` as a straight line at that velocity — the axis was
-    /// already moving, and the window reaches back into that history.
+    /// acceleration, the underlying profile is extended backwards before
+    /// `t = 0` as a straight line at that velocity; the window reaches back
+    /// into that history.
     ///
-    /// That extension contributes area. Working the convolution through,
-    /// the filtered move overshoots by exactly `start_velocity · T / 2`,
-    /// independent of the profile's shape. So the inner profile is built to
-    /// a target short by that amount, and the same constant offsets the
-    /// start back into place. Both ends then land exactly right: the
-    /// profile begins at `start` moving at `start_velocity`, and ends at
-    /// `end` at rest.
-    ///
-    /// Miss this and you get a mystery overshoot that scales with entry
-    /// speed and vanishes from rest — which is to say, one that every
-    /// rest-to-rest test passes.
+    /// That extension contributes area: the filtered move overshoots by
+    /// exactly `start_velocity · T / 2`, independent of the profile's shape.
+    /// So the inner profile is built to a target short by that amount, and the
+    /// same constant offsets the start back into place. The profile then
+    /// begins at `start` moving at `start_velocity` and ends at `end` at rest.
+    /// The overshoot vanishes from rest, so rest-to-rest moves are unaffected.
     pub fn new_with_start_velocity(
         start: f64,
         start_velocity: f64,
@@ -134,9 +120,9 @@ impl JerkFilteredProfile {
                 return Err(TrajectoryError::InvalidMaxJerk(j));
             }
             Some(j) => {
-                // The window that yields this jerk across the steeper of
-                // the two acceleration steps. Note the bound is exact only
-                // when those steps don't share a window; see `sample`.
+                // The window that yields this jerk across the steeper of the
+                // two acceleration steps. Exact only when those steps don't
+                // share a window; see `sample`.
                 let w = max_acceleration.max(max_deceleration) / j;
                 (w >= MIN_FILTER_WINDOW).then_some(w)
             }
@@ -164,14 +150,13 @@ impl JerkFilteredProfile {
         })
     }
 
-    /// Total duration: the underlying move plus the filter window, which is
-    /// exactly how much smoothing costs in time.
+    /// Total duration: the underlying move plus the filter window.
     pub fn duration(&self) -> f64 {
         self.inner.duration() + self.window.unwrap_or(0.0)
     }
 
-    /// The commanded end position — the *true* one, not the corrected
-    /// target the inner profile was built to.
+    /// The commanded end position, not the corrected target the inner profile
+    /// was built to.
     pub fn target(&self) -> f64 {
         self.target
     }
@@ -179,10 +164,8 @@ impl JerkFilteredProfile {
     /// Which phase the move is in.
     ///
     /// Delegates to the underlying profile, except that its final `Done`
-    /// becomes `Decel` for the length of the filter tail: the axis really
-    /// is still slowing through that window, and reporting `Done` while
-    /// it's moving would be a lie to `status` and to the control loop's
-    /// completion check.
+    /// becomes `Decel` for the length of the filter tail, during which the
+    /// axis is still slowing.
     pub fn phase_at(&self, t: f64) -> MotionPhase {
         let Some(_) = self.window else {
             return self.inner.phase_at(t);
@@ -218,9 +201,8 @@ impl JerkFilteredProfile {
     /// `max(accel, decel) / T`, i.e. exactly `max_jerk`. On a **short move
     /// whose cruise phase is briefer than the window**, one window straddles
     /// both steps and the jerk reaches `(accel + decel) / T` — up to twice
-    /// the limit. Accepted deliberately: sizing the window for that case
-    /// would double it on every move, lengthening all of them to bound a
-    /// case where the axis barely moves.
+    /// the limit. Sizing the window for that case would double it on every
+    /// move.
     pub fn sample(&self, t: f64) -> TrajectorySample {
         let Some(w) = self.window else {
             return self.inner.sample(t);
@@ -229,18 +211,14 @@ impl JerkFilteredProfile {
             position: (self.position_integral(t) - self.position_integral(t - w)) / w
                 + self.start_velocity * w / 2.0,
             velocity: (self.extended_position(t) - self.extended_position(t - w)) / w,
-            // The same telescoping one level up: filtering differentiates
-            // cleanly, so the filtered acceleration is the mean of the
-            // underlying *velocity* over the window. Exact, and the reason
-            // this profile's acceleration is continuous where the
-            // unfiltered one steps.
+            // The same telescoping one level up: the filtered acceleration is
+            // the mean of the underlying velocity over the window.
             acceleration: (self.extended_velocity(t) - self.extended_velocity(t - w)) / w,
         }
     }
 
     /// The underlying velocity, extended before `t = 0` as the constant
-    /// `start_velocity` — the derivative of `extended_position`, and
-    /// consistent with it by construction.
+    /// `start_velocity` — the derivative of `extended_position`.
     fn extended_velocity(&self, t: f64) -> f64 {
         if t < 0.0 {
             self.start_velocity
@@ -250,12 +228,10 @@ impl JerkFilteredProfile {
     }
 
     /// The underlying position, extended before `t = 0` as a straight line
-    /// at `start_velocity` — the assumption that the axis was already
-    /// moving steadily when the move was commanded.
+    /// at `start_velocity`, as if the axis were already moving steadily.
     ///
     /// `TrapezoidalProfile::sample` holds at `start` for `t < 0` instead,
-    /// which is right for an unfiltered move and wrong here: it would make
-    /// the filtered profile begin at rest while the axis is in motion.
+    /// which would make the filtered profile begin at rest.
     fn extended_position(&self, t: f64) -> f64 {
         if t < 0.0 {
             self.start + self.start_velocity * t

@@ -4,11 +4,5 @@ version = "0.1.0"
 edition = "2024"
 description = "I/O-free motion planning and trajectory generation core"
 
-# motion-core is deliberately dependency-free and I/O-free.
-# It holds only pure math: trajectory profiles, kinematics, and motion types.
-# This is what we unit-test on the host (in WSL) with no hardware and no bus,
-# and what eventually runs unchanged on the Raspberry Pi / RP2350.
+# Dependency-free and I/O-free: only pure math.
 [dependencies]
-
-# A binary example lives at src/bin/demo_axis.rs so you can watch a profile
-# get sampled at the control-loop rate without any GUI.

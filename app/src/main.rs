@@ -1,35 +1,29 @@
-//! A continuously-running, multi-axis motion app you can drive from the
-//! terminal. This is the first cut of the "online" architecture: a
-//! fixed-rate control loop running on its own schedule, decoupled from
-//! (blocking) terminal input by a channel.
+//! A continuously-running, multi-axis motion app driven from the terminal. A
+//! fixed-rate control loop runs on its own schedule, decoupled from (blocking)
+//! terminal input by a channel.
 //!
-//! Each cycle, the loop samples `motion-core`'s trajectory to get this
-//! cycle's commanded (position, velocity), sends it through a
-//! `backend_sim::SimAxisGroup` via the `AxisGroup` seam, and treats the
-//! returned feedback — not the raw sample — as the axis's actual position.
-//! `SimAxisGroup` integrates velocity into its own position state rather
-//! than snapping to the commanded position, so there's a small, real
-//! (if currently tiny) gap between "commanded" and "actual" — the same seam
-//! `backend-ethercat` will occupy later, unchanged from the loop's point of
-//! view.
+//! Each cycle, the loop samples `motion-core`'s trajectory to get this cycle's
+//! commanded (position, velocity, acceleration) and sends it through a
+//! `backend_sim::SimAxisGroup` via the `AxisGroup` seam. Profiles are seeded
+//! from the last commanded state, not from feedback (see `AxisRuntime`).
+//! `SimAxisGroup` integrates velocity into its own position state, so there is
+//! a small gap between "commanded" and "actual".
 //!
 //! Axes are independent: `move axis0 100` and `move axis1 50` run
 //! concurrently on their own clocks, with no relationship between their
-//! durations. Driving several axes to arrive together (finish-together
-//! time-scaling) is a distinct, harder feature — deliberately deferred.
+//! durations. Independently issued single-axis moves are not synchronized to
+//! finish together.
 //!
 //! Run from the workspace root with:
 //!
 //!     cargo run -p app                 # terminal + viz window
 //!     cargo run -p app -- --headless   # terminal only, no window
 //!
-//! `--headless` skips the viz window entirely and runs the control loop on
-//! the main thread. It exists for scripted, non-interactive sessions —
-//! piping commands into stdin and reading the printed output back — where a
-//! GUI window is pure overhead and a liability: it needs a display server,
-//! it's the slowest part of startup, and it keeps the process alive after
-//! the control loop has ended. Everything except the plots behaves
-//! identically; see `scripts/demo_session.sh`.
+//! `--headless` skips the viz window and runs the control loop on the main
+//! thread. It is for scripted sessions (piping commands into stdin and
+//! reading the output): a GUI window needs a display server, dominates
+//! startup, and keeps the process alive after the control loop ends. Everything
+//! except the plots behaves identically; see `scripts/demo_session.sh`.
 //!
 //! Commands (one per line on stdin). `help` prints the authoritative list at
 //! runtime, including every configured axis and group name:
@@ -53,39 +47,34 @@
 //! coordinates are Cartesian TCP mm; a single-axis move is raw joint space in
 //! that axis's own units.
 //!
-//! Axes start disabled (DS402's `SwitchOnDisabled`), matching real drive
-//! power-up — `move` on a disabled axis is rejected, not queued. `enable`
-//! steps an axis through the real DS402 sequence (`SwitchOnDisabled` ->
-//! `ReadyToSwitchOn` -> `SwitchedOn` -> `OperationEnabled`), one transition
-//! per control cycle, same as a real master/drive negotiate it. See
-//! `axis-backend`'s `Ds402State` docs.
+//! Axes start disabled (DS402's `SwitchOnDisabled`); `move` on a disabled
+//! axis is rejected, not queued. `enable` steps an axis through the DS402
+//! sequence (`SwitchOnDisabled` -> `ReadyToSwitchOn` -> `SwitchedOn` ->
+//! `OperationEnabled`), one transition per control cycle. See `axis-backend`'s
+//! `Ds402State` docs.
 //!
-//! Disabling an axis that's actually moving is a fault, not a graceful
-//! power-down — a real drive can't safely just cut its power stage
-//! mid-motion the way it safely can from rest. A faulted axis needs `reset`
-//! before it'll accept `enable` again; `reset` alone doesn't re-enable it.
+//! Disabling an axis that's moving is a fault, not a graceful power-down. A
+//! faulted axis needs `reset` before it accepts `enable` again; `reset` alone
+//! doesn't re-enable it.
 //!
 //! `stop` interrupts whatever an axis is doing (active or queued) with a
-//! controlled deceleration to rest, built from the axis's *actual* current
-//! velocity (see `motion_core::StopRamp`). This is not DS402's Quick Stop
-//! (a distinct, typically emergency/safety-triggered mechanism) — the
-//! backend's `Ds402State` is unaffected; only the coarser `AxisState` (via
+//! controlled deceleration to rest, built from the axis's current commanded
+//! velocity (see `motion_core::StopRamp`). This is not DS402's Quick Stop: the
+//! backend's `Ds402State` is unaffected, and only the coarser `AxisState` (via
 //! `AxisSetpoint::stopping`) reports `Stopping` instead of `DiscreteMotion`.
 //!
-//! A `move`'s trailing `aborting`/`buffered` keyword picks its buffer mode:
+//! A `move`'s trailing `aborting`/`buffered` keyword picks its buffer mode.
 //! `buffered` (the default) queues behind a busy axis, FIFO, and runs once
-//! earlier moves finish, same as always; `aborting` takes over immediately
-//! — active or queued — building the new move from the axis's actual
-//! position/velocity via
+//! earlier moves finish. `aborting` takes over immediately, clearing anything
+//! active or queued, and builds the new move from the axis's commanded
+//! position and velocity via
 //! `motion_core::TrapezoidalProfile::new_with_start_velocity` rather than
-//! waiting for it to come to rest first.
+//! waiting for the axis to come to rest.
 //!
-//! `verbose` toggles the periodic per-cycle position/phase line printed
-//! while an axis is moving — off by default. Discrete events (move
-//! started/finished/aborted, enable/disable, faults, DS402 transitions)
-//! always print regardless; only the repetitive heartbeat is affected. Now
-//! that the viz window plots target-vs-actual continuously, that heartbeat
-//! is usually redundant on the terminal.
+//! `verbose` toggles the periodic per-cycle position/phase line printed while
+//! an axis is moving (off by default). Discrete events (move
+//! started/finished/aborted, enable/disable, faults, DS402 transitions) always
+//! print.
 
 mod recording;
 mod viz;
@@ -112,40 +101,33 @@ const CONTROL_RATE_HZ: f64 = 250.0;
 
 /// One thing's dynamic capability, in whatever units that thing works in —
 /// mm/s for a linear axis or a Cartesian group's TCP, rad/s for a rotary
-/// joint. Shared by `AxisConfig` (joint space, per axis) and
-/// `AxisGroupDef` (task space, per group), because it is the same four
-/// numbers either way and keeping one shape stops the two drifting apart.
+/// joint. Shared by `AxisConfig` (joint space, per axis) and `AxisGroupDef`
+/// (task space, per group).
 ///
-/// **Which one applies is a units question, not a preference.** A
-/// single-axis `move axis3` is a joint-space command and takes the axis's
-/// limits; a group move is a TCP-space command and takes the group's, even
-/// though rotary joints carry it out. Mixing them is the silent unit error
-/// `AxisConfig`'s own docs describe.
+/// **Which one applies is a units question.** A single-axis `move axis3` is a
+/// joint-space command and takes the axis's limits; a group move is a
+/// TCP-space command and takes the group's, even though rotary joints carry it
+/// out.
 ///
 /// The tables below are the *startup* values. `setlimits` overrides them at
-/// runtime, which is why the control loop keeps its own mutable copy rather
-/// than reading these constants directly — see `run_control_loop`.
+/// runtime in the control loop's own mutable copy; see `run_control_loop`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct MotionLimits {
     max_speed: f64,
     max_acceleration: f64,
     max_deceleration: f64,
-    /// `None` means no jerk limit — which is not "jerk is unimportant" but
-    /// the exact `max_jerk → ∞` case: the profile degenerates to the plain
-    /// trapezoid, acceleration steps, and nothing is filtered. See
+    /// `None` means no jerk limit: the exact `max_jerk → ∞` case, where the
+    /// profile is the plain trapezoid and nothing is filtered. See
     /// `motion_core::JerkFilteredProfile`.
     ///
-    /// Expressed as an `Option` rather than as a large number, matching
-    /// `position_limits`' own "None means unbounded" convention — and
-    /// because `motion-core` requires every limit it *is* given to be
-    /// finite, so infinity isn't available to mean this.
+    /// An `Option` rather than a large number because `motion-core` requires
+    /// every limit it is given to be finite.
     max_jerk: Option<f64>,
 }
 
 /// Default limits for *Cartesian* (group / path) moves — TCP-space
 /// quantities regardless of what kind of axes carry them out. Each group
-/// gets its own copy in `AXIS_GROUPS` and can differ; this is just the
-/// starting point they currently share.
+/// copies this into its own entry in `AXIS_GROUPS`.
 const DEFAULT_CARTESIAN_LIMITS: MotionLimits = MotionLimits {
     max_speed: 50.0,         // mm/s
     max_acceleration: 200.0, // mm/s^2
@@ -161,47 +143,31 @@ const STATUS_PRINT_PERIOD: Duration = Duration::from_millis(250);
 const AT_REST_EPS: f64 = 1e-6;
 
 /// One axis's own dynamic capability and travel, in **that axis's own
-/// units** — mm for a linear axis, degrees for a rotary joint. Every
+/// units** — mm for a linear axis, radians for a rotary joint. Every
 /// single-axis operation reads these: a raw `move axisN`/`stop axisN`'s
-/// default limits, and — the one that isn't user-visible — the per-joint
-/// `StopRamp` that `cascade_group_stop` builds for each member of an
-/// interrupted group.
+/// default limits, and the per-joint `StopRamp` that `cascade_group_stop`
+/// builds for each member of an interrupted group.
 ///
-/// That cascade case is why this exists rather than two global constants.
-/// A group move's limits are *Cartesian* (mm/s² of TCP), but the cascade
-/// applies a deceleration in **joint** space. While every axis is linear
-/// and every group is Cartesian those are numerically the same thing, so
-/// the confusion is invisible; the moment a group has non-identity
-/// kinematics, feeding a mm/s² number to a rotary joint's ramp is a silent
-/// unit error on the exact path that runs when something has already gone
-/// wrong.
+/// The cascade is why these are separate from the group limits. A group move's
+/// limits are *Cartesian* (mm/s² of TCP), but the cascade applies a
+/// deceleration in **joint** space. With identity kinematics the two coincide;
+/// with a rotary joint, feeding it a mm/s² number would be a unit error.
 ///
-/// Deliberately one flat struct, not an enum over axis kinds. What varies
-/// between a linear axis and a rotary joint is the *numbers*, a display
-/// *label*, and whether travel is bounded — not the operations performed on
-/// them, and `motion-core` is unit-agnostic `f64` throughout. An
-/// `AxisKind` enum earns its place when some axis type needs different
-/// *math* (a continuous rotary axis wanting shortest-path wraparound inside
-/// `TrapezoidalProfile`, say), not merely different values.
+/// This is one flat struct rather than an enum over axis kinds: a linear axis
+/// and a rotary joint differ in numbers, a display label, and whether travel
+/// is bounded, not in the operations performed on them.
 ///
-/// Compile-time like `AXIS_GROUPS`, for the same reason: this is machine
-/// configuration, and there's no runtime-config infrastructure to hang it
-/// on yet. The shape deserializes unchanged if that ever arrives.
-///
-/// These are the **startup** values. `setlimits` edits the control loop's
-/// own copy (`RuntimeLimits`) rather than this table, so a change lasts
-/// until exit and nothing here is ever mutated. Read these for "what the
-/// machine boots as", not "what it is limited to right now".
+/// These are the **startup** values, compiled in. `setlimits` edits the
+/// control loop's own copy (`RuntimeLimits`), so nothing here is mutated and a
+/// change lasts until exit.
 struct AxisConfig {
     /// This axis's own dynamic capability, in its own units.
     limits: MotionLimits,
     /// Display only — `motion-core` never sees units. Used by `status` and
-    /// the heartbeat so a rotary joint doesn't print "mm".
+    /// the heartbeat.
     units: &'static str,
-    /// Soft travel limits, as `(min, max)` inclusive. `None` means
-    /// unbounded — a continuous rotary axis, or an axis whose limits simply
-    /// aren't modelled yet. Checked when a move target is commanded; see
-    /// `check_target_in_limits`.
+    /// Soft travel limits, as `(min, max)` inclusive. `None` means unbounded.
+    /// Checked when a move target is commanded; see `check_target_in_limits`.
     position_limits: Option<(f64, f64)>,
 }
 
@@ -230,22 +196,19 @@ const AXIS_CONFIGS: &[AxisConfig] = &[
     },
     // axis2/axis3: the SCARA arm's shoulder and elbow (see
     // `SCARA_KINEMATICS`). Rotary, and in **radians** — `ScaraKinematics`
-    // does trigonometry on these values directly, and `motion-core` has no
-    // unit conversions in it. So `move axis3 0.5` means 0.5 rad ≈ 28.6°.
+    // does trigonometry on these values directly. So `move axis3 0.5` means
+    // 0.5 rad ≈ 28.6°.
     //
-    // `position_limits: None` — joint travel limits are deferred (T4); the
-    // arm's real constraint today is workspace reachability, which the
-    // group move's install-time IK check covers, and which says nothing
-    // about a raw single-axis jog anyway.
+    // `position_limits: None`: there are no joint travel limits. The group
+    // move's install-time IK check covers workspace reachability, but not a
+    // raw single-axis jog.
     AxisConfig {
         limits: MotionLimits {
             max_speed: 2.0,
             max_acceleration: 8.0,
             max_deceleration: 8.0,
-            // 160 rad/s^3 against 8 rad/s^2 is the same 50 ms window the
-            // linear axes get — the window is a *time*, so matching it
-            // across axes in different units is what keeps their smoothing
-            // comparable.
+            // 160 rad/s^3 against 8 rad/s^2 is the same 50 ms filter window
+            // the linear axes get.
             max_jerk: Some(160.0), // rad/s^3
         },
         units: "rad",
@@ -264,9 +227,8 @@ const AXIS_CONFIGS: &[AxisConfig] = &[
 ];
 
 /// One group's Cartesian sample converted into joint space for this cycle:
-/// `(position, velocity, acceleration)`. Computed once per group and read
-/// per member — the conversion is a whole-vector operation, so doing it per
-/// axis would be both wrong and N times the work.
+/// `(position, velocity, acceleration)`. Computed once per group and read per
+/// member, since the conversion is a whole-vector operation.
 type GroupJointSample = (
     motion_core::KinematicVector,
     motion_core::KinematicVector,
@@ -276,11 +238,11 @@ type GroupJointSample = (
 /// The control loop's live copy of every axis's and group's limits, seeded
 /// from the compile-time tables and mutable by `setlimits`.
 ///
-/// Lives here rather than in the `const` tables because those are shared,
-/// immutable, and read from the stdin thread as well. It is deliberately
-/// *not* shared back to the parser: a command carries what the user typed
+/// It is not shared with the parser: a command carries what the user typed
 /// (`Option<f64>` per limit) and this fills the gaps at handling time, so a
-/// `setlimits` always affects the very next command rather than racing it.
+/// `setlimits` affects the very next command rather than racing it. Resolving
+/// in the parser, on the stdin thread, would pin every command to the
+/// compile-time values.
 struct RuntimeLimits {
     axes: Vec<MotionLimits>,
     groups: Vec<MotionLimits>,
@@ -296,15 +258,10 @@ impl RuntimeLimits {
 
     /// Fill in whatever the command didn't specify.
     ///
-    /// Note `dmax` falls back to the configured deceleration, **not** to
-    /// whatever `amax` resolved to, which is what it used to do. That old
-    /// rule pre-dated per-axis config and meant a configured
-    /// `max_deceleration` was silently ignored by every `move` — visible the
-    /// moment `setlimits` lets someone set one and watch it not apply.
-    /// `stop` and the group cascade always used the configured value, so
-    /// this also makes the two agree.
+    /// `dmax` falls back to the configured deceleration, not to whatever
+    /// `amax` resolved to, matching `stop` and the group cascade.
     /// `max_jerk` has no command-line form, so it always comes from
-    /// configuration — see the `move` command's docs.
+    /// configuration.
     fn resolve(
         limits: &MotionLimits,
         given: (Option<f64>, Option<f64>, Option<f64>),
@@ -320,11 +277,9 @@ impl RuntimeLimits {
 
 /// Rejects a single-axis move target outside the axis's soft travel limits.
 ///
-/// Deliberately narrow: this checks a *commanded endpoint* only. It says
-/// nothing about the interior of a path, nor about where a group move's
-/// Cartesian target lands once mapped through kinematics into joint space —
-/// both of which need the whole-path plausibility checking that is still
-/// deferred. An unlimited axis (`position_limits: None`) always passes.
+/// This checks a *commanded endpoint* only. It says nothing about the
+/// interior of a path, or about where a group move's Cartesian target lands in
+/// joint space. An unlimited axis (`position_limits: None`) always passes.
 fn check_target_in_limits(axis: usize, target: f64) -> Result<(), String> {
     match AXIS_CONFIGS[axis].position_limits {
         Some((min, max)) if target < min || target > max => Err(format!(
@@ -344,57 +299,45 @@ const HISTORY_SECONDS: f64 = 60.0;
 /// axes — everything else is `Vec`-driven.
 const NUM_AXES: usize = 4;
 
-/// A hard-coded axis group: a named Cartesian pair/triple/etc. that can be
-/// driven by the same `enable`/`disable`/`reset`/`stop`/`move` commands as a
-/// single axis, just fanned out to (or coordinated across) its members.
-/// Groups are **not** created or removed at runtime — a fixed,
-/// known-at-compile-time table by design.
+/// A hard-coded axis group: a named set of axes driven by the same
+/// `enable`/`disable`/`reset`/`stop`/`move` commands as a single axis, fanned
+/// out to (or coordinated across) its members. Groups are a fixed
+/// compile-time table, not created or removed at runtime.
 struct AxisGroupDef {
     name: &'static str,
     axes: &'static [usize],
     /// How this group's *task-space* (Cartesian) coordinates map to its
     /// members' joint positions. Every group has one, including groups of
-    /// plain linear stages whose axes already are Cartesian coordinates —
-    /// those use `IdentityKinematics`, so there is exactly one code path
-    /// through the move builders, the control loop and status/viz rather
-    /// than a kinematic/non-kinematic fork.
+    /// linear stages, which use `IdentityKinematics`, so the move builders,
+    /// the control loop and status/viz have one code path.
     ///
-    /// `&'static dyn` rather than a generic parameter: the table is
-    /// heterogeneous (different models per group) and the dispatch happens
-    /// once per group per cycle, which is nothing next to the trig it
-    /// guards.
+    /// `&'static dyn` because the table is heterogeneous (different models per
+    /// group).
     kinematics: &'static dyn motion_core::KinematicModel,
     /// The group's *task-space* (TCP) dynamic limits, and the defaults a
-    /// `move`/`movepath` on this group uses when the command doesn't
-    /// override them. Per group rather than one global set: an arm's TCP
-    /// capability is not a gantry's, even measured in the same mm/s.
+    /// `move`/`movepath` on this group uses when the command doesn't override
+    /// them.
     limits: MotionLimits,
 }
 
-/// The pass-through model for 2-axis Cartesian groups. Carries its own DOF
-/// so `main()`'s arity assertion means something for identity groups too.
+/// The pass-through model for 2-axis Cartesian groups.
 static IDENTITY_KINEMATICS_2: motion_core::IdentityKinematics =
     motion_core::IdentityKinematics::new(2);
 
-/// The 2-link planar arm driven by `axisGroup1`. Equal links, deliberately:
-/// unequal links would put the fold-back singularity on the boundary of an
-/// unreachable inner hole, where install-time rejection catches it for free,
-/// but equal links collapse that hole to a single point **at the origin** —
-/// so the singularity is reachable, and a straight move from `(x, y)` to
-/// `(-x, -y)` crosses it with both endpoints validating cleanly. That is
-/// handled reactively (the per-cycle `NearSingular` → cascade stop), not
-/// prevented; until whole-path plausibility checking exists, "don't cross
-/// the origin" is a convention that tests and demo targets observe, not a
-/// property of the geometry.
+/// The 2-link planar arm driven by `axisGroup1`. The links are equal, which
+/// collapses the inner unreachable hole to a single point **at the origin**.
+/// The fold-back singularity is therefore reachable: a straight move from
+/// `(x, y)` to `(-x, -y)` crosses it with both endpoints validating cleanly.
+/// It is handled only reactively (the per-cycle `NearSingular` → cascade
+/// stop); avoiding the origin is left to the operator.
 static SCARA_KINEMATICS: motion_core::ScaraKinematics =
     motion_core::ScaraKinematics::new(100.0, 100.0);
 
 /// `axisGroup0` = `axis0` (X) + `axis1` (Y), a Cartesian pair.
 /// `axisGroup1` = `axis2` (shoulder) + `axis3` (elbow), a SCARA arm — same
-/// commands, same Cartesian move semantics, different model. Add more
-/// entries here to define more groups; `main()` asserts every referenced
-/// axis index is `< NUM_AXES` and that each group's arity matches its
-/// kinematic model's DOF.
+/// commands, same Cartesian move semantics, different model. `main()` asserts
+/// every referenced axis index is `< NUM_AXES` and that each group's arity
+/// matches its kinematic model's DOF.
 const AXIS_GROUPS: &[AxisGroupDef] = &[
     AxisGroupDef {
         name: "axisGroup0",
@@ -410,31 +353,25 @@ const AXIS_GROUPS: &[AxisGroupDef] = &[
     },
 ];
 
-/// Dispatch policy for a move when the target is already busy. `Aborting`/
-/// `Buffered` apply to every move target (`move`/`movegroup`/`movepath`);
-/// `Blend` is `movepath`-only (see `Command::MovePath`'s docs) — a narrower,
-/// `movepath`-specific thing: smoothly transitioning the path's own
-/// *geometry* onto a new one, not blending across two independent move
-/// segments in general.
+/// Dispatch policy for a move when the target is already busy. `Aborting` and
+/// `Buffered` apply to every move target; `Blend` is `movepath`-only and
+/// transitions the path's own *geometry* onto a new one. It is not PLCopen's
+/// blending between independent move segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferMode {
     /// Takes effect immediately regardless of idle/busy: clears anything
-    /// queued and replaces whatever's active right now, built from the
-    /// axis's *actual* current position/velocity (backend feedback, not a
-    /// commanded setpoint) via `TrapezoidalProfile::new_with_start_velocity`.
+    /// queued and replaces whatever's active, built from the axis's commanded
+    /// position and velocity via `TrapezoidalProfile::new_with_start_velocity`.
     Aborting,
-    /// Queues behind the current move if the axis is busy (FIFO — every
-    /// buffered move queued eventually runs, in order); starts immediately
-    /// if idle. The default, so omitting a mode keeps today's behavior.
+    /// Queues behind the current move if the axis is busy (FIFO; every queued
+    /// move runs, in order), and starts immediately if idle. The default.
     Buffered,
-    /// `movepath` only: like `Aborting` (takes effect immediately), but
-    /// built via `motion_core::PathProfile::new_blended` instead of
-    /// `new_with_start_velocity` — the new path's own start tangent leans
-    /// toward the group's actual incoming velocity direction (via
-    /// `WaypointPath::new_with_start_direction`), instead of assuming a
-    /// straight approach toward its own first waypoint, so the transition
-    /// is smoother than `Aborting`'s hard redirect. Not exact velocity
-    /// continuity — see `PathProfile::new_blended`'s docs.
+    /// `movepath` only: like `Aborting` (takes effect immediately), but built
+    /// via `motion_core::PathProfile::new_blended`. The new path's start
+    /// tangent leans toward the group's incoming velocity direction instead of
+    /// assuming a straight approach to its first waypoint, which is smoother
+    /// than `Aborting`'s hard redirect. Velocity is not exactly continuous; see
+    /// `PathProfile::new_blended`.
     Blend,
 }
 
@@ -484,19 +421,16 @@ enum Command {
     },
     /// A multi-waypoint move for a group, smoothly blended through every
     /// waypoint via `motion_core::PathProfile` (centripetal Catmull-Rom).
-    /// `waypoints` are the points *after* the group's current position —
-    /// the actual current position (and velocity, via whichever of
+    /// `waypoints` are the points *after* the group's current position: the
+    /// current commanded position (and velocity, via whichever of
     /// `PathProfile::new_with_start_velocity`/`new_blended` `buffer_mode`
-    /// picks) is always prepended as the path's own start (see
-    /// `install_path_move_impl`), the same "start is the axes' actual
-    /// state" rule every other move here follows. `buffer_mode`:
-    /// `Buffered` queues FIFO behind a busy group, same as `MoveGroup`;
-    /// `Aborting` and `Blend` both redirect immediately and only differ in
-    /// *how* the new path's geometry is built — `Aborting` via
-    /// `install_path_move` (assumes a straight approach to the new path's
-    /// first waypoint), `Blend` via `install_path_move_blended` (leans the
-    /// new path's own start tangent toward the actual incoming velocity
-    /// direction instead, for a visibly smoother transition).
+    /// picks) is prepended as the path's start (see
+    /// `install_path_move_impl`). `Buffered` queues FIFO behind a busy group,
+    /// as `MoveGroup` does. `Aborting` and `Blend` both redirect immediately
+    /// and differ in how the new path's geometry is built: `Aborting` via
+    /// `install_path_move` (a straight approach to the first waypoint),
+    /// `Blend` via `install_path_move_blended` (the start tangent leans toward
+    /// the incoming velocity direction).
     MovePath {
         group: usize,
         waypoints: Vec<Vec<f64>>,
@@ -508,10 +442,9 @@ enum Command {
     /// Change some of an axis's or a group's dynamic limits at runtime, and
     /// report the result. An empty `update` reports without changing.
     ///
-    /// Takes effect on the *next* move built, not on one already running —
-    /// a profile is constructed once at install and is a pure function of
-    /// time thereafter, so there is nowhere for a mid-flight limit change to
-    /// land. Stopping and re-commanding is how you apply one immediately.
+    /// Takes effect on the *next* move built, not on one already running: a
+    /// profile is constructed once at install and is a pure function of time
+    /// thereafter. Stop and re-command to apply a change immediately.
     SetLimits {
         axis: usize,
         update: LimitsUpdate,
@@ -568,19 +501,16 @@ fn main() {
     let capacity = (CONTROL_RATE_HZ * HISTORY_SECONDS) as usize;
     let history = Arc::new(Mutex::new(History::new(NUM_AXES, capacity)));
 
-    // Headless: no window, so the control loop runs right here on the main
-    // thread and the process ends when it does. `RecordingAxisGroup` still
-    // wraps the backend and still records — the recording tap is at the
-    // `AxisGroup` seam and has nothing to do with whether anything is
-    // drawing it, and keeping it means headless and windowed runs execute
-    // the identical loop, which is the point of the mode.
+    // Headless: no window, so the control loop runs on the main thread and the
+    // process ends when it does. The loop, including its `RecordingAxisGroup`
+    // tap, is identical to the windowed run.
     if headless {
         run_control_loop(rx, history);
         return;
     }
 
-    // Set once the control loop exits (via `quit` or stdin EOF) — the viz
-    // window has no controls of its own, so this is its cue to close too.
+    // Set once the control loop exits (via `quit` or stdin EOF), which closes
+    // the viz window.
     let shutdown = Arc::new(AtomicBool::new(false));
 
     {
@@ -592,17 +522,14 @@ fn main() {
         });
     }
 
-    // eframe/winit need the GUI event loop on the main thread, so it runs
-    // here while the control loop (moved above) and stdin reader each run
-    // on their own thread. This call blocks until the viz window closes.
+    // eframe/winit need the GUI event loop on the main thread, so it runs here
+    // while the control loop and stdin reader each run on their own thread.
+    // This call blocks until the viz window closes.
     let native_options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
-        // eframe's default (unset) inner size is too short to fit the XY
-        // plots + status boxes row *and* the per-axis position/velocity
-        // plots row without clipping — the content also scrolls (see
-        // viz.rs) so this is a starting size, not a hard requirement, but
-        // one generous enough that nothing needs to scroll for the common
-        // 2-axis / 1-group case.
+        // eframe's default inner size is too short to fit the XY plots and
+        // status boxes row plus the per-axis plots row. The content also
+        // scrolls (see viz.rs), so this is only a starting size.
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1000.0, 900.0]),
         ..Default::default()
     };
@@ -617,14 +544,8 @@ fn main() {
 /// Reads the one command-line flag this app has: `--headless`. Returns
 /// whether it was given, or an error message for anything else.
 ///
-/// Hand-rolled rather than pulling in a CLI crate: it's one boolean, and
-/// `app` is the only crate here with dependencies at all — adding an
-/// argument parser for this would be the most-dependencies-per-feature
-/// change in the workspace. Revisit if a third flag ever shows up.
-///
-/// Unknown arguments are an error, not ignored: a scripted session that
-/// typos `--headles` should fail loudly rather than silently opening a
-/// window nobody is watching and then hanging.
+/// Unknown arguments are an error, not ignored: a scripted session that typos
+/// `--headles` should fail rather than open a window nobody is watching.
 fn parse_args() -> Result<bool, String> {
     let mut headless = false;
     for arg in std::env::args().skip(1) {
@@ -681,9 +602,7 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
             Target::Axis(axis) => Ok(Some(Command::Reset { axis })),
             Target::Group(group) => Ok(Some(Command::ResetGroup { group })),
         },
-        // Accepts `setLimits` too: it reads naturally and is what this was
-        // first asked for as, even though every other verb here is
-        // lowercase.
+        // `setLimits` is accepted as an alias.
         ["setlimits" | "setLimits", rest @ ..] => parse_set_limits(rest, line),
         ["stop", target] => match parse_target(target)? {
             Target::Axis(axis) => Ok(Some(Command::Stop {
@@ -716,11 +635,9 @@ fn parse_command(line: &str) -> Result<Option<Command>, String> {
     }
 }
 
-/// Parses everything after `"move" <target>`: the target's coordinates (1
-/// for a single axis, `AXIS_GROUPS[g].axes.len()` for a group — always
-/// immediately after the target name), then the usual up-to-3 numeric
-/// kinematic-limit args and an optional trailing `aborting`/`buffered`
-/// keyword, unchanged from the single-axis-only syntax this replaces.
+/// Parses everything after `"move" <target>`: the target's coordinates (1 for
+/// a single axis, `AXIS_GROUPS[g].axes.len()` for a group), then up to 3
+/// numeric limit args and an optional trailing `aborting`/`buffered` keyword.
 fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>, String> {
     let target = parse_target(target)?;
     let coord_count = match target {
@@ -738,10 +655,7 @@ fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>
         .map(|c| parse_f64(c))
         .collect::<Result<_, _>>()?;
 
-    // A single-axis move defaults to that axis's own limits (which may be
-    // rad/s, not mm/s); a group move is Cartesian and defaults to that
-    // group's own TCP-space limits. See `MotionLimits`.
-    // Defaults are not applied here — see `parse_kinematic_limits`.
+    // Defaults are not applied here; see `parse_kinematic_limits`.
     let (buffer_mode, (max_speed, max_acceleration, max_deceleration)) =
         parse_buffer_mode_and_limits(rest, line)?;
 
@@ -765,15 +679,12 @@ fn parse_move(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>
     }
 }
 
-/// Parses everything after `"movepath" <target>`: either the inline form
-/// (a waypoint count, then that many waypoints' worth of coordinates — see
+/// Parses everything after `"movepath" <target>`: either the inline form (a
+/// waypoint count, then that many waypoints' worth of coordinates; see
 /// `parse_move_path_inline`) or, if the first token is the literal `"file"`,
-/// waypoints read from a file, one per line (see `parse_move_path_file`) —
-/// the inline form gets unwieldy past a handful of waypoints for an
-/// interactive line-based command, so this is the same `Command::MovePath`
-/// reached a second way. A single axis can't be a `movepath` target either
-/// way — a one-axis "path" is just what `move ... buffered` chaining
-/// already gives you.
+/// waypoints read from a file, one per line (see `parse_move_path_file`). Both
+/// produce the same `Command::MovePath`. A single axis can't be a `movepath`
+/// target; chain `move ... buffered` instead.
 fn parse_move_path(target: &str, rest: &[&str], line: &str) -> Result<Option<Command>, String> {
     let group = match parse_target(target)? {
         Target::Axis(_) => {
@@ -792,10 +703,8 @@ fn parse_move_path(target: &str, rest: &[&str], line: &str) -> Result<Option<Com
 }
 
 /// The inline `movepath` form: a required waypoint count, then that many
-/// waypoints' worth of coordinates (`coord_count` each), then the usual
-/// up-to-3 numeric kinematic-limit args and an optional trailing
-/// `aborting`/`buffered`/`blend` keyword — same shape `move`'s trailing
-/// args have, plus the `movepath`-only `blend` option.
+/// waypoints' worth of coordinates (`coord_count` each), then up to 3 numeric
+/// limit args and an optional trailing `aborting`/`buffered`/`blend` keyword.
 fn parse_move_path_inline(
     group: usize,
     coord_count: usize,
@@ -838,13 +747,9 @@ fn parse_move_path_inline(
 }
 
 /// The file `movepath` form: waypoints read from `path` (see
-/// `read_waypoints_file`), followed by the usual up-to-3 numeric
-/// kinematic-limit args and an optional trailing `aborting`/`buffered`/
-/// `blend` keyword — everything else is identical to the inline form.
-/// Reading happens here, on the stdin-reading thread (same as every other
-/// parse error), not in the control loop — `Command::MovePath` ends up
-/// identical either way, so nothing downstream needs to know which form
-/// was used.
+/// `read_waypoints_file`), followed by the same limit args and trailing
+/// keyword as the inline form. The file is read here, on the stdin thread, not
+/// in the control loop.
 fn parse_move_path_file(
     group: usize,
     coord_count: usize,
@@ -865,19 +770,16 @@ fn parse_move_path_file(
     }))
 }
 
-/// Reads `path` and delegates to `parse_waypoint_lines` — split out as its
-/// own thin wrapper so the actual line-parsing logic stays unit-testable
-/// without touching the filesystem.
+/// Reads `path` and delegates to `parse_waypoint_lines`, which is separate so
+/// it can be tested without the filesystem.
 fn read_waypoints_file(path: &str, coord_count: usize) -> Result<Vec<Vec<f64>>, String> {
     let contents =
         std::fs::read_to_string(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
     parse_waypoint_lines(&contents, coord_count).map_err(|e| format!("{path}: {e}"))
 }
 
-/// One waypoint per line, `coord_count` whitespace-separated numbers each;
-/// blank lines are skipped (so trailing newlines, and visual grouping in a
-/// hand-written file, don't need special treatment). No comment syntax —
-/// deliberately as simple as the file format needs to be for now.
+/// One waypoint per line, `coord_count` whitespace-separated numbers each.
+/// Blank lines are skipped. There is no comment syntax.
 fn parse_waypoint_lines(contents: &str, coord_count: usize) -> Result<Vec<Vec<f64>>, String> {
     let mut waypoints = Vec::new();
     for (i, raw_line) in contents.lines().enumerate() {
@@ -906,12 +808,11 @@ fn parse_waypoint_lines(contents: &str, coord_count: usize) -> Result<Vec<Vec<f6
     Ok(waypoints)
 }
 
-/// A trailing optional `aborting`/`buffered` keyword (always last,
-/// regardless of how many numeric args precede it) followed by the usual
-/// up-to-3 numeric kinematic-limit args — shared by `move`/`movegroup`.
-/// `blend` is deliberately not recognized here — it's meaningless for a
-/// straight-line move (see `parse_movepath_buffer_mode_and_limits`, which
-/// both `movepath` forms use instead).
+/// Splits off a trailing optional `aborting`/`buffered` keyword (always last,
+/// however many numeric args precede it) and parses the up-to-3 numeric limit
+/// args before it. Shared by `move` for axes and groups. `blend` is not
+/// recognized: it is meaningless for a straight-line move (see
+/// `parse_movepath_buffer_mode_and_limits`).
 fn parse_buffer_mode_and_limits(
     rest: &[&str],
     line: &str,
@@ -926,9 +827,8 @@ fn parse_buffer_mode_and_limits(
     Ok((buffer_mode, (max_speed, max_acceleration, max_deceleration)))
 }
 
-/// `movepath`'s own version of `parse_buffer_mode_and_limits` — identical
-/// except it also recognizes the trailing `blend` keyword
-/// (`BufferMode::Blend`, movepath-only; see `Command::MovePath`'s docs).
+/// `movepath`'s version of `parse_buffer_mode_and_limits`; it also recognizes
+/// the trailing `blend` keyword (`BufferMode::Blend`).
 fn parse_movepath_buffer_mode_and_limits(
     rest: &[&str],
     line: &str,
@@ -945,19 +845,14 @@ fn parse_movepath_buffer_mode_and_limits(
 }
 
 /// `(vmax, amax, dmax)` exactly as typed — `None` for each one omitted.
-/// Jerk is absent by design: it has no command-line form, only `setlimits`.
+/// Jerk has no command-line form; only `setlimits` sets it.
 type ParsedLimits = (Option<f64>, Option<f64>, Option<f64>);
 
-/// The trailing up-to-3 numeric kinematic-limit args shared by `move` and
-/// both `movepath` forms: `[vmax] [amax] [dmax]`, each `None` when the user
-/// didn't give it.
+/// The trailing up-to-3 numeric limit args shared by `move` and both
+/// `movepath` forms: `[vmax] [amax] [dmax]`, each `None` when omitted.
 ///
-/// **Deliberately does not apply defaults.** It reports what was *typed*;
-/// the control loop fills the gaps from its live limits table (see
-/// `RuntimeLimits::resolve`). That split exists because `setlimits` can
-/// change those limits at runtime, and this parser runs on the stdin thread
-/// with no access to loop state — resolving here would silently pin every
-/// command to the compile-time values.
+/// It does not apply defaults. The control loop fills the gaps from its live
+/// limits table (see `RuntimeLimits::resolve`).
 fn parse_kinematic_limits(rest: &[&str], line: &str) -> Result<ParsedLimits, String> {
     if rest.len() > 3 {
         return Err(format!("too many arguments: {line:?}"));
@@ -970,22 +865,16 @@ fn parse_kinematic_limits(rest: &[&str], line: &str) -> Result<ParsedLimits, Str
 
 /// A **partial** change to a target's limits: only the named ones move.
 ///
-/// Named rather than positional (`setlimits axis0 accel 100 jerk 500`, not
-/// `setlimits axis0 ,,100,500`). Position-counting on a comma form puts the
-/// wrong *valid* number into the wrong limit when you miscount — silently,
-/// on a parameter that governs machine motion. Names are also
-/// order-independent, readable back in a log, and survive a new limit being
-/// added (phase 2's lateral-acceleration bound would otherwise become a new
-/// column everyone has to count past).
+/// Limits are named rather than positional (`setlimits axis0 accel 100 jerk
+/// 500`, not `setlimits axis0 ,,100,500`): miscounting a comma form puts a
+/// valid number into the wrong limit without any error.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 struct LimitsUpdate {
     max_speed: Option<f64>,
     max_acceleration: Option<f64>,
     max_deceleration: Option<f64>,
-    /// Two levels, and both matter: the **outer** `None` means "not named,
-    /// leave it alone", while an inner `None` means "named as `none`, i.e.
-    /// no jerk limit at all". Collapsing them would make "don't touch jerk"
-    /// and "remove the jerk limit" the same command.
+    /// Two levels: the **outer** `None` means "not named, leave it alone",
+    /// while an inner `None` means "named as `none`, i.e. no jerk limit".
     max_jerk: Option<Option<f64>>,
 }
 
@@ -1016,18 +905,15 @@ impl LimitsUpdate {
 /// `setlimits axis0 accel 100 jerk 500`. With no pairs at all it reports
 /// the target's current limits and changes nothing.
 ///
-/// Each limit is accepted under two names: the `speed`/`accel`/`decel`/
-/// `jerk` spelling, and the `vmax`/`amax`/`dmax`/`jmax` one that `move`'s
-/// own positional arguments already use in `help`. Both vocabularies exist
-/// in this app already; refusing one would just be a trap.
+/// Each limit is accepted under two names: `speed`/`accel`/`decel`/`jerk`, and
+/// `vmax`/`amax`/`dmax`/`jmax`, which `move`'s positional arguments use in
+/// `help`.
 ///
-/// `jerk none` is the `max_jerk → ∞` case: no filtering, acceleration
-/// steps, exactly the trapezoidal profile. A word rather than a huge number
-/// because the limit genuinely isn't a number — see `MotionLimits`.
+/// `jerk none` is the `max_jerk → ∞` case: no filtering, exactly the
+/// trapezoidal profile.
 ///
-/// Validated here, where the user typed it, rather than at the next move —
-/// the same "fail where it was written" precedent `check_target_in_limits`
-/// follows.
+/// Values are validated here, where they are typed, rather than at the next
+/// move.
 fn parse_set_limits(rest: &[&str], line: &str) -> Result<Option<Command>, String> {
     let Some((target, pairs)) = rest.split_first() else {
         return Err(format!(
@@ -1083,9 +969,8 @@ enum Target {
 }
 
 /// Resolves a target token as a group name first (an exact match against
-/// `AXIS_GROUPS`), falling back to `parse_axis` — so `axisGroup0` and
-/// `axis0` are both valid wherever a `Target` is expected, with no
-/// ambiguity (group names and axis names can't collide by construction).
+/// `AXIS_GROUPS`), falling back to `parse_axis`. Group names and axis names
+/// can't collide.
 fn parse_target(s: &str) -> Result<Target, String> {
     if let Some(g) = AXIS_GROUPS.iter().position(|g| g.name == s) {
         return Ok(Target::Group(g));
@@ -1123,21 +1008,16 @@ fn group_label(group: usize) -> &'static str {
     AXIS_GROUPS[group].name
 }
 
-/// Whether an axis is enabled and fault-free — the gate every business-logic
+/// Whether an axis is enabled and fault-free: the gate every business-logic
 /// decision in this loop checks (`move`/`stop` rejection, queue promotion,
-/// `enable`'s "already enabled"), instead of comparing `Ds402State` directly
-/// (see `AxisRuntime::ds402_state`'s docs for why). `AxisState::Disabled`
-/// covers every DS402 substate short of fully `OperationEnabled`, so this is
-/// exactly equivalent to comparing `Ds402State::OperationEnabled` directly
-/// — just expressed at the layer `app` is supposed to reason in.
+/// `enable`'s "already enabled"). `app` reasons about `AxisState` only, never
+/// `Ds402State` (see `AxisRuntime::ds402_state`). `AxisState::Disabled` covers
+/// every DS402 substate short of `OperationEnabled`.
 fn axis_operational(state: AxisState) -> bool {
     !matches!(state, AxisState::Disabled | AxisState::ErrorStop)
 }
 
-/// Deliberately terse — one line per command with a short description, not
-/// the detailed per-command usage notes this used to accumulate. Detailed
-/// per-command help (e.g. `help move`) is a natural future addition, not
-/// built yet: this just needs to stay a quick-glance list.
+/// One line per command with a short description.
 fn print_help() {
     println!(
         "motion-project online app — {NUM_AXES} independent axes, control rate {CONTROL_RATE_HZ} Hz"
@@ -1185,9 +1065,6 @@ fn print_help() {
     cmd_line("help", "show this message");
     cmd_line("quit", "exit");
     println!();
-    // Worth saying explicitly now that a group's coordinates and its
-    // members' units genuinely differ, rather than coinciding as they do
-    // for a Cartesian group.
     println!("  a group move's coordinates are Cartesian (mm); a single-axis");
     println!("  move is raw joint space in that axis's own units:");
     for (axis, config) in AXIS_CONFIGS.iter().enumerate() {
@@ -1197,75 +1074,60 @@ fn print_help() {
 }
 
 /// State shared by every member of an active group move: the underlying
-/// straight-line profile (see `motion_core::LinearMove`), which axes
-/// participate (in the same order the profile's per-axis samples come out
-/// in — always `AXIS_GROUPS[group].axes`, so this is a zero-alloc pointer,
-/// not a clone).
+/// straight-line profile (see `motion_core::LinearMove`) and which axes
+/// participate, in the order the profile's per-axis samples come out
+/// (`AXIS_GROUPS[group].axes`).
 ///
-/// Deliberately does *not* carry the group move's `max_deceleration`: it
-/// used to, for `cascade_group_stop` to reuse, but that value is Cartesian
-/// and the cascade's ramps are built in joint space, so each sibling now
-/// decelerates at its own `AxisConfig::max_deceleration` instead.
+/// It does not carry a deceleration for `cascade_group_stop`: the cascade's
+/// ramps are in joint space, so each sibling decelerates at its own
+/// `AxisConfig` deceleration.
 ///
-/// The profile itself is entirely **Cartesian** — kinematics converts into
-/// it once at install (start state) and out of it once per cycle (setpoints).
+/// The profile is entirely **Cartesian**. Kinematics converts into it once at
+/// install (start state) and out of it once per cycle (setpoints).
 struct SharedGroupMove {
     profile: LinearMove,
     axes: &'static [usize],
     group: usize,
     /// Which IK solution branch this move runs on, resolved once from the
-    /// group's *commanded* joint pose at install and then held for the
-    /// move's whole duration.
+    /// group's *commanded* joint pose at install and held for the move's whole
+    /// duration.
     ///
-    /// Per-move, not per-instance and not per-cycle. Per-instance would
-    /// fight raw single-axis jogging: jog a joint into the other branch and
-    /// a fixed-branch model jumps back to its own on the next move's first
-    /// cycle. Per-*cycle* reselection ("nearest solution to last cycle")
-    /// would make IK's output depend on its own previous output, breaking
-    /// the "trajectory is a pure function of elapsed time" rule. Held here,
-    /// IK stays a pure function of Cartesian position for the whole move,
-    /// and the branch persists across moves for free: commanded joints came
-    /// out of IK on this branch, so resolving from them next time returns
-    /// it again.
+    /// Per-move rather than per-cycle: reselecting the nearest solution each
+    /// cycle would make IK's output depend on its own previous output, so a
+    /// sample at a given time would depend on history. Held here, IK is a pure
+    /// function of Cartesian position for the whole move. The branch persists
+    /// across moves because commanded joints came out of IK on this branch, so
+    /// resolving from them next time returns it again. It is not fixed per
+    /// model, because a raw single-axis jog can put the arm on the other
+    /// branch.
     branch: motion_core::KinematicBranch,
-    /// The move's endpoint in **joint** space — IK of the Cartesian target
-    /// on `branch`, computed at install as the reachability check. Kept so
-    /// `status` can report each member's own target instead of a Cartesian
-    /// coordinate that means nothing for a rotary joint.
+    /// The move's endpoint in **joint** space: IK of the Cartesian target on
+    /// `branch`, computed at install as the reachability check. `status`
+    /// reports it as each member's own target.
     joint_target: motion_core::KinematicVector,
 }
 
-/// The path-move analog of `SharedGroupMove` — same shape (a shared
-/// profile, participating axes, group index), just wrapping
-/// `motion_core::PathProfile` instead of
-/// `LinearMove`. Kept as a distinct type (not a generalized
-/// `SharedGroupMove<P>`) since the two profile types don't share a common
-/// trait and nothing outside `Profile`'s own match arms needs to treat them
-/// uniformly — see `ActiveGroupMove` for the one place that does.
+/// The path-move analog of `SharedGroupMove`, wrapping
+/// `motion_core::PathProfile` instead of `LinearMove`. The two profile types
+/// share no trait; see `ActiveGroupMove` for the one place that treats them
+/// uniformly.
 struct SharedPathMove {
     profile: PathProfile,
     axes: &'static [usize],
     group: usize,
-    /// Same role as `SharedGroupMove::branch` — see there.
+    /// See `SharedGroupMove::branch`.
     branch: motion_core::KinematicBranch,
-    /// Same role as `SharedGroupMove::joint_target` — IK of the *final*
-    /// waypoint. The intermediate waypoints are IK'd at install too, as a
-    /// reachability check, but only the endpoint is worth keeping.
+    /// IK of the *final* waypoint. The intermediate waypoints are IK'd at
+    /// install as a reachability check, but only the endpoint is kept.
     joint_target: motion_core::KinematicVector,
 }
 
-/// Whichever motion profile is currently driving an axis: a commanded
-/// move, a commanded stop, or (this axis's slice of) an active group move
-/// or path move. All are pure functions of elapsed time with the same
-/// shape (`sample`/`phase_at`/`target`), but aren't the same *type* —
-/// `TrapezoidalProfile` always starts and ends at rest, `StopRamp` starts
-/// wherever the axis actually is right now (see its own docs for why
-/// that's a separate type, not a generalization of `TrapezoidalProfile`),
-/// and `Group`/`Path` don't own a profile at all — they index into one
-/// shared across every participating axis. This enum is what lets the rest
-/// of the control loop treat "whatever's currently active" uniformly
-/// without caring which one it is — except where it does care (`is_stop`),
-/// for messages that should read differently for a stop than for a move.
+/// Whichever motion profile is currently driving an axis: a commanded move, a
+/// commanded stop, or this axis's slice of an active group or path move. All
+/// have the same shape (`sample`/`phase_at`/`target`) but are different types:
+/// `TrapezoidalProfile` ends at rest, `StopRamp` has no target, and
+/// `Group`/`Path` index into a profile shared across every participating
+/// axis. Code that needs to distinguish a stop from a move uses `is_stop`.
 enum Profile {
     Move(JerkFilteredProfile),
     Stop(StopRamp),
@@ -1312,11 +1174,9 @@ impl Profile {
         }
     }
 
-    /// This axis's own endpoint, always in **joint** space — which for a
-    /// group/path member means the stored IK of the Cartesian target, not
-    /// the Cartesian target's matching component. Those coincide only under
-    /// identity kinematics; on an arm the Cartesian target is millimetres
-    /// and this axis is a rotary joint.
+    /// This axis's own endpoint, always in **joint** space. For a group/path
+    /// member that is the stored IK of the Cartesian target, not the matching
+    /// component of it; the two coincide only under identity kinematics.
     fn target(&self) -> f64 {
         match self {
             Profile::Move(p) => p.target(),
@@ -1327,9 +1187,9 @@ impl Profile {
     }
 
     /// `(group index, this axis's position within the group)` for a group or
-    /// path move — the control loop's key into its per-group cache of
+    /// path move: the key into the control loop's per-group cache of
     /// IK-converted joint setpoints. `None` for a single-axis profile, which
-    /// is already joint-space and needs no conversion.
+    /// is already in joint space.
     fn group_and_index(&self) -> Option<(usize, usize)> {
         match self {
             Profile::Group { shared, index } => Some((shared.group, *index)),
@@ -1342,10 +1202,8 @@ impl Profile {
         matches!(self, Profile::Stop(_))
     }
 
-    /// The group name this profile belongs to, if it's a `Group` or `Path`
-    /// — purely for `status`'s benefit, so a group/path move reads as one
-    /// rather than looking like an ordinary single-axis move to a value
-    /// that happens to match another axis's target.
+    /// The group name this profile belongs to, if it's a `Group` or `Path`.
+    /// Used by `status`.
     fn group_membership(&self) -> Option<&'static str> {
         match self {
             Profile::Group { shared, .. } => Some(group_label(shared.group)),
@@ -1356,17 +1214,14 @@ impl Profile {
 }
 
 /// Clears any queued moves and replaces whatever's active on `ax` with a
-/// fresh profile built from its current *commanded* position/velocity —
-/// shared by `stop` (builds a `StopRamp`) and an `aborting` move (builds a
+/// fresh profile built from its current *commanded* position/velocity. Used by
+/// `stop` (builds a `StopRamp`) and an `aborting` move (builds a
 /// `TrapezoidalProfile` via `new_with_start_velocity`). `build` receives
-/// (position, velocity), does its own success printing (it alone knows the
-/// right message and has the built profile's `duration()` to hand), and
-/// returns the `Profile` to install or a `TrajectoryError` to report the
-/// same way regardless of which case triggered it.
+/// (position, velocity), prints its own success message, and returns the
+/// `Profile` to install or a `TrajectoryError`, which is reported here.
 ///
-/// Commanded, not actual: the replacement profile has to pick up the
-/// commanded stream exactly where the superseded one left it, or the
-/// redirect itself becomes a step input. See
+/// The commanded state is used so the replacement picks up the commanded
+/// stream where the superseded profile left it. See
 /// `AxisRuntime::commanded_position`.
 fn abort_into(
     ax: &mut AxisRuntime,
@@ -1387,11 +1242,10 @@ fn abort_into(
     }
 }
 
-/// A `Profile::Group` or `Profile::Path`'s shared state, abstracted just
-/// enough for `cascade_group_stop` to treat both uniformly — the two
-/// underlying profile types (`LinearMove`, `PathProfile`) don't share a
-/// trait, so this is a thin enum over the two `Rc`s rather than a generic
-/// `SharedGroupMove<P>`, kept private to the cascade mechanism.
+/// A `Profile::Group` or `Profile::Path`'s shared state, so
+/// `cascade_group_stop` can treat both uniformly. `LinearMove` and
+/// `PathProfile` share no trait, so this is an enum over the two `Rc`s. A new
+/// kind of group move extends this enum.
 enum ActiveGroupMove {
     Group(Rc<SharedGroupMove>),
     Path(Rc<SharedPathMove>),
@@ -1412,14 +1266,13 @@ impl ActiveGroupMove {
         }
     }
 
-    /// This move's Cartesian `(position, velocity)` at `t`, plus the IK
-    /// branch it was installed on — everything the control loop needs to
-    /// convert one shared task-space sample into joint setpoints, from
-    /// either profile type.
+    /// This move's Cartesian `(position, velocity, acceleration)` at `t`, plus
+    /// the IK branch it was installed on: what the control loop needs to
+    /// convert one shared task-space sample into joint setpoints.
     ///
-    /// Infallible in the vector construction: both profiles sample within
-    /// `MAX_GROUP_AXES` and produce finite values from finite inputs, which
-    /// the install-time construction already guaranteed.
+    /// The vector construction cannot fail: both profiles sample within
+    /// `MAX_GROUP_AXES` and produce finite values from the finite inputs
+    /// validated at install.
     fn sample(
         &self,
         t: f64,
@@ -1457,10 +1310,9 @@ impl ActiveGroupMove {
         )
     }
 
-    /// Whether `profile` is still actively driven by *this specific* shared
-    /// move instance (identity, via `Rc::ptr_eq` within the matching
-    /// variant — a `Group` can never alias a `Path`, so a variant mismatch
-    /// is simply `false`, same as no active move at all).
+    /// Whether `profile` is still driven by *this specific* shared move
+    /// instance (`Rc::ptr_eq` within the matching variant). A variant mismatch
+    /// is `false`.
     fn still_drives(&self, profile: &Profile) -> bool {
         match (self, profile) {
             (ActiveGroupMove::Group(target), Profile::Group { shared, .. }) => {
@@ -1474,12 +1326,10 @@ impl ActiveGroupMove {
     }
 }
 
-/// If `profile` is a `Profile::Group` or `Profile::Path`, returns its
-/// shared state (cloning the `Rc`, not the underlying move) — used to
-/// detect group membership when a single member is about to be
-/// replaced/cleared, so every other member can be cascaded into a stop too
-/// (a group/path move missing one of its members no longer means
-/// anything).
+/// If `profile` is a `Profile::Group` or `Profile::Path`, returns its shared
+/// state (cloning the `Rc`, not the move). Used to detect group membership when
+/// a single member is about to be replaced or cleared, so every other member
+/// can be cascaded into a stop.
 fn group_of(profile: &Profile) -> Option<ActiveGroupMove> {
     match profile {
         Profile::Group { shared, .. } => Some(ActiveGroupMove::Group(Rc::clone(shared))),
@@ -1490,21 +1340,15 @@ fn group_of(profile: &Profile) -> Option<ActiveGroupMove> {
 
 /// Cascades a group (or path) interruption: every member of `shared` other
 /// than `except` gets its own `StopRamp` from its own commanded
-/// position/velocity, via the same `abort_into` mechanism a direct
-/// single-axis `stop` uses — no new profile-building logic, just invoked
-/// once per sibling. Guarded by `ActiveGroupMove::still_drives` (identity,
-/// via `Rc::ptr_eq`) so a member that's no longer actually part of *this*
-/// specific move (it already moved on to something else, including a
-/// different group/path move) is left alone: this is what makes
-/// double-interruption-in-the-same-cycle and asymmetric disable/fault
-/// timing between members both come out correct rather than double-firing
-/// or clobbering unrelated state.
-/// `except` is the axis that caused the interruption and has already been
-/// given its own new profile — `None` when nothing is to blame in
-/// particular and *every* member should be stopped, which is what a runtime
-/// IK failure does. `reason` is the parenthetical in each member's stop
-/// message, so a kinematic failure doesn't report itself as an ordinary
-/// group interruption.
+/// position/velocity, via the `abort_into` mechanism a single-axis `stop`
+/// uses. Guarded by `ActiveGroupMove::still_drives` (`Rc::ptr_eq`), so a member
+/// that already moved on to something else is left alone. That keeps a double
+/// interruption in one cycle, or asymmetric disable/fault timing between
+/// members, from double-firing or clobbering unrelated state.
+///
+/// `except` is the axis that caused the interruption and already has its own
+/// new profile; `None` stops *every* member, as a runtime IK failure does.
+/// `reason` is the parenthetical in each member's stop message.
 fn cascade_group_stop(
     axes: &mut [AxisRuntime],
     group_pending: &mut [VecDeque<PendingGroupMove>],
@@ -1512,15 +1356,13 @@ fn cascade_group_stop(
     except: Option<usize>,
     reason: &str,
 ) {
-    // A group/path move missing one of its members no longer means
-    // anything, so neither do any of *its own* queued follow-up moves —
-    // same "seizing/losing control clears anything queued" precedent as
-    // `abort_into`.
+    // Losing control clears anything queued, as in `abort_into`: the group's
+    // queued follow-up moves are dropped too.
     group_pending[shared.group()].clear();
     for &other in shared.axes() {
-        // Each sibling decelerates at *its own* limit, not the group move's.
-        // The group's `max_deceleration` is a Cartesian TCP quantity, and
-        // this ramp is built in joint space — see `AxisConfig`.
+        // Each sibling decelerates at its own limit, not the group's: the
+        // group's deceleration is a Cartesian TCP quantity and this ramp is in
+        // joint space (see `AxisConfig`).
         let decel = AXIS_CONFIGS[other].limits.max_deceleration;
         let units = AXIS_CONFIGS[other].units;
         if Some(other) == except {
@@ -1551,10 +1393,9 @@ fn cascade_group_stop(
     }
 }
 
-/// Gathers one value per group member into a `KinematicVector` — the
-/// commanded joint position or velocity, ready to hand to the group's
-/// kinematic model. Fails only on a non-finite value or an over-long group,
-/// both of which `KinematicVector::from_slice` checks.
+/// Gathers one value per group member into a `KinematicVector` for the
+/// group's kinematic model. Fails only on a non-finite value or an over-long
+/// group, both checked by `KinematicVector::from_slice`.
 fn commanded_vector(
     axes: &[AxisRuntime],
     members: &[usize],
@@ -1564,14 +1405,9 @@ fn commanded_vector(
     motion_core::KinematicVector::from_slice(&values)
 }
 
-/// Why a group or path move couldn't be installed: either the profile
-/// construction rejected the geometry/limits, or the kinematic model
-/// rejected the target (unreachable, or a dimension mismatch that means the
-/// group and its model disagree on arity).
-///
-/// One enum over all three because the call sites only ever print whichever
-/// they got — they already funnelled `LinearMoveError` and
-/// `PathProfileError` through `.to_string()` for exactly that reason.
+/// Why a group or path move couldn't be installed: the profile construction
+/// rejected the geometry/limits, or the kinematic model rejected the target
+/// (unreachable, or a group/model arity mismatch). Call sites only print it.
 #[derive(Debug)]
 enum GroupMoveError {
     LinearMove(LinearMoveError),
@@ -1608,22 +1444,21 @@ impl From<motion_core::KinematicsError> for GroupMoveError {
 }
 
 /// Attempts to build a `LinearMove` for `group`'s `members` from their
-/// current *commanded* position/velocity (see
-/// `AxisRuntime::commanded_position`), mapped through the group's kinematic
-/// model into Cartesian task space — the profile it builds is Cartesian
-/// throughout, and the per-cycle inverse conversion back to joint setpoints
-/// happens in the control loop. Only on success — including the target's
-/// reachability, checked by a dry-run `inverse_position` — installs it
-/// atomically as `Profile::Group` on every member (also clearing each
-/// member's own individual pending queue, same as `abort_into`). On
-/// failure nothing is touched, so a rejected group move never leaves one
-/// member half-redirected. Returns the built profile's duration for the
-/// caller's own success message — wording differs between an immediate
-/// move and one just promoted off the group's queue, so this doesn't print
-/// anything itself. Deliberately does **not** touch `group_pending` itself
-/// (unlike `cascade_group_stop`) — the group-promotion loop below is
-/// already draining that queue via `pop_front`, and clearing it here would
-/// wrongly discard whatever's still queued behind the move just promoted.
+/// current *commanded* position/velocity (see `AxisRuntime::commanded_position`),
+/// mapped through the group's kinematic model into Cartesian task space. The
+/// profile is Cartesian throughout; the control loop converts back to joint
+/// setpoints each cycle. Only on success, including the target's reachability
+/// (a dry-run `inverse_position`), it installs the move atomically as
+/// `Profile::Group` on every member, also clearing each member's own pending
+/// queue. On failure nothing is touched, so a rejected group move never leaves
+/// one member half-redirected. It is installed as a whole rather than through
+/// `abort_into` because it is one fallible construction across all members.
+///
+/// Returns the profile's duration for the caller's success message (the
+/// wording differs between an immediate move and one promoted from the queue).
+/// It does **not** touch `group_pending`: the promotion loop is already
+/// draining that queue, and clearing it here would discard what is queued
+/// behind the move just promoted.
 fn install_group_move(
     axes: &mut [AxisRuntime],
     group: usize,
@@ -1635,21 +1470,20 @@ fn install_group_move(
     let joint_start = commanded_vector(axes, members, |ax| ax.commanded_position)?;
     let joint_velocity = commanded_vector(axes, members, |ax| ax.commanded_velocity)?;
 
-    // Branch first, from the commanded joint pose — everything below is
-    // built on it, including the target's reachability check.
+    // Branch first, from the commanded joint pose; the target's reachability
+    // check below uses it.
     let branch = model.resolve_branch(joint_start);
     let start = model.forward_position(joint_start);
     let start_velocity = model.forward_velocity(joint_start, joint_velocity);
 
-    // Dry-run IK on the target before building anything: an unreachable or
-    // singular endpoint is rejected here, where the user typed it, rather
-    // than surfacing mid-move as a cascade stop.
+    // Dry-run IK on the target before building anything, so an unreachable
+    // endpoint is rejected here rather than surfacing mid-move as a cascade
+    // stop.
     let joint_target =
         model.inverse_position(motion_core::KinematicVector::from_slice(&targets)?, branch)?;
 
-    // `limits` is already resolved against the group's live configuration
-    // (see `RuntimeLimits::resolve`) and is task-space throughout, jerk
-    // included.
+    // `limits` is already resolved (see `RuntimeLimits::resolve`) and is
+    // task-space.
     let profile = LinearMove::new_with_start_velocity(
         start.as_slice().to_vec(),
         start_velocity.as_slice().to_vec(),
@@ -1682,25 +1516,16 @@ fn install_group_move(
     Ok(duration)
 }
 
-/// The path-move analog of `install_group_move`: attempts to build a
-/// `PathProfile` for `group`'s `members`, prepending their current
-/// *commanded* position as the path's own start waypoint (`waypoints` is everything
-/// *after* that — see `Command::MovePath`'s docs), and — only on success —
-/// installs it atomically as `Profile::Path` on every member. On failure
-/// nothing is touched, same "never half-redirect a member" guarantee
-/// `install_group_move` gives. Every segment is a smooth spline blending
-/// through every waypoint — `motion_core::WaypointPath` no longer offers a
-/// per-segment straight-line override (see its module docs).
+/// The path-move analog of `install_group_move`: builds a `PathProfile` for
+/// `group`'s `members`, prepending their current *commanded* position as the
+/// path's start waypoint (`waypoints` is everything after it; see
+/// `Command::MovePath`), and only on success installs it atomically as
+/// `Profile::Path` on every member. On failure nothing is touched.
 ///
-/// `build` is which `PathProfile` constructor to use — always given each
-/// member's current *commanded* velocity, exactly like `install_group_move`
-/// always uses `LinearMove::new_with_start_velocity` (an idle group's
-/// velocity is simply 0, which reduces to ordinary rest-to-rest behavior,
-/// so there's no separate idle-only code path). `install_path_move` and
-/// `install_path_move_blended` are both thin callers of this, differing
-/// only in which constructor they pass — `Aborting` vs `Blend` is entirely
-/// a choice of geometry-building strategy, not a different installation
-/// mechanism.
+/// `build` is the `PathProfile` constructor to use. It is always given each
+/// member's commanded velocity; an idle group's velocity is 0, which reduces
+/// to rest-to-rest behavior. `install_path_move` and
+/// `install_path_move_blended` differ only in which constructor they pass.
 fn install_path_move_impl(
     axes: &mut [AxisRuntime],
     group: usize,
@@ -1724,13 +1549,11 @@ fn install_path_move_impl(
     let start = model.forward_position(joint_start);
     let start_velocity = model.forward_velocity(joint_start, joint_velocity);
 
-    // Every explicitly-given waypoint is IK'd up front, not just the final
-    // target: a few extra calls, once, at install time, and an obviously
-    // unreachable path is rejected before it starts rather than cascading
-    // to a stop somewhere in the middle of it. All on the one resolved
-    // branch — a path that would need the elbow to flip partway isn't a
-    // path this can run. Says nothing about the *interior* of a segment;
-    // that needs whole-path plausibility checking, still unbuilt.
+    // Every given waypoint is IK'd up front, not just the final target, so an
+    // unreachable path is rejected before it starts rather than cascading to a
+    // stop partway through. All use the one resolved branch, so a path that
+    // would need the elbow to flip can't run. The interior of a segment is not
+    // checked.
     let mut joint_target = joint_start;
     for waypoint in &waypoints {
         joint_target =
@@ -1772,8 +1595,8 @@ fn install_path_move_impl(
     Ok(duration)
 }
 
-/// `BufferMode::Aborting` (and idle/`Buffered`) path installation: built via
-/// `PathProfile::new_with_start_velocity` — see `install_path_move_impl`.
+/// `BufferMode::Aborting` (and idle/`Buffered`) path installation, built via
+/// `PathProfile::new_with_start_velocity`.
 fn install_path_move(
     axes: &mut [AxisRuntime],
     group: usize,
@@ -1791,8 +1614,7 @@ fn install_path_move(
     )
 }
 
-/// `BufferMode::Blend` path installation: built via `PathProfile::new_blended`
-/// instead — see `install_path_move_impl`.
+/// `BufferMode::Blend` path installation, built via `PathProfile::new_blended`.
 fn install_path_move_blended(
     axes: &mut [AxisRuntime],
     group: usize,
@@ -1810,17 +1632,12 @@ fn install_path_move_blended(
     )
 }
 
-/// Per-axis command handlers, extracted so a hard-coded axis group (see
-/// `AXIS_GROUPS`) can fan the same logic out to each of its members with a
-/// simple loop, instead of duplicating it. Called once each from the
-/// single-axis `Command::Enable`/`Disable`/`Reset`/`Stop` arms below — pure
-/// relocation, not a behavior change.
+/// Per-axis command handlers, shared by the single-axis commands and by the
+/// group commands, which fan the same logic out to each member.
 fn handle_enable(ax: &mut AxisRuntime, axis: usize) {
     if ax.axis_state == AxisState::ErrorStop {
-        // Must refuse outright, not just leave `want_enabled` false and
-        // hope — an `enable` that arrives anywhere during the fault window
-        // must not "stick" and silently fire the instant a later `reset`
-        // clears the fault, without a fresh `enable` after it.
+        // Refuse outright: an `enable` that arrives during the fault window
+        // must not stick and fire when a later `reset` clears the fault.
         println!(
             "  ! {}: cannot enable: axis has a fault — reset it first",
             axis_label(axis)
@@ -1855,9 +1672,8 @@ fn handle_stop(ax: &mut AxisRuntime, axis: usize, max_deceleration: Option<f64>)
     if !axis_operational(ax.axis_state) {
         println!("  ! {}: stop rejected: axis is disabled", axis_label(axis));
     } else if ax.active.is_none() && ax.commanded_velocity.abs() < AT_REST_EPS {
-        // Nothing queued survives this either way (see abort_into), but
-        // there's genuinely nothing to decelerate — short-circuit before
-        // building a zero-duration StopRamp just to say so.
+        // Nothing queued survives a stop (see abort_into), and there is
+        // nothing to decelerate, so skip building a zero-duration StopRamp.
         ax.pending.clear();
         println!("  -> {}: already at rest", axis_label(axis));
     } else {
@@ -1877,9 +1693,8 @@ fn handle_stop(ax: &mut AxisRuntime, axis: usize, max_deceleration: Option<f64>)
 }
 
 /// An in-progress move (or stop): the profile plus the wall-clock instant it
-/// began. Profiles themselves only know relative/elapsed time (see the
-/// `NOTE (dt seam)` comment in motion-core) — the loop is what anchors them
-/// to wall-clock time.
+/// began. Profiles only know elapsed time (see `NOTE (dt seam)` in
+/// motion-core); the loop anchors them to wall-clock time.
 struct ActiveMove {
     profile: Profile,
     started_at: Instant,
@@ -1887,20 +1702,15 @@ struct ActiveMove {
 
 struct PendingMove {
     target: f64,
-    /// Resolved when the command was accepted, not when it is promoted:
-    /// a queued move runs under the limits in force when it was issued,
-    /// so a later `setlimits` cannot retroactively rewrite it.
+    /// Resolved when the command was accepted, not when it is promoted, so a
+    /// later `setlimits` cannot rewrite a queued move.
     limits: MotionLimits,
 }
 
-/// The group-level analog of `PendingMove` — one entry in a hard-coded
-/// group's own FIFO queue (`run_control_loop`'s `group_pending`, not part
-/// of `AxisRuntime`: a group's queued move needs every member
-/// simultaneously idle to promote, which doesn't fit inside any single
-/// axis's own state). An enum, not a single struct, so a group's queue can
-/// mix `move`s and `movepath`s in the order they were issued — the
-/// promotion loop matches on the variant to call `install_group_move` or
-/// `install_path_move` as appropriate.
+/// The group-level analog of `PendingMove`: one entry in a group's own FIFO
+/// queue (`run_control_loop`'s `group_pending`). It is not part of
+/// `AxisRuntime` because promoting it needs every member idle at once. The
+/// queue can mix `move`s and `movepath`s in the order issued.
 enum PendingGroupMove {
     Move {
         targets: Vec<f64>,
@@ -1913,78 +1723,64 @@ enum PendingGroupMove {
 }
 
 /// All runtime state for one axis. Axes are independent: each has its own
-/// position, its own in-progress move (if any), and its own single-slot
-/// pending queue — nothing here is shared across axes.
+/// position, its own in-progress move (if any), and its own pending queue.
 struct AxisRuntime {
-    // Last-known *actual* position/velocity, from backend feedback — not
-    // the raw trajectory sample. Updated once per control cycle after the
-    // backend exchange. Used for *reporting only* (`status`, the heartbeat
-    // print, move-completion messages) and for the enable-time resync
-    // below — never to seed a profile. See `commanded_position`.
+    // Last-known *actual* position/velocity, from backend feedback, updated
+    // once per control cycle after the backend exchange. Used for reporting
+    // (`status`, the heartbeat, move-completion messages) and for the
+    // enable-time resync below, never to seed a profile. See
+    // `commanded_position`.
     position: f64,
     velocity: f64,
-    /// Measured acceleration — reporting only, and an estimate rather
-    /// than ground truth (see `axis_backend::AxisFeedback::acceleration`).
+    /// Measured acceleration — reporting only, and an estimate (see
+    /// `axis_backend::AxisFeedback::acceleration`).
     acceleration: f64,
-    // The *commanded* (model) position/velocity: exactly what was sent as
-    // this axis's `AxisSetpoint` last cycle. This — not feedback — is what
-    // every profile is seeded from: a new move, an aborting redirect, a
-    // `StopRamp`, a queue promotion, a group/path move's start state.
+    // The *commanded* (model) position/velocity: exactly what was sent as this
+    // axis's `AxisSetpoint` last cycle. Every profile is seeded from this: a
+    // new move, an aborting redirect, a `StopRamp`, a queue promotion, a
+    // group/path move's start state.
     //
-    // Why the model and not feedback: seeding from actual injects a step
-    // into the commanded stream. If the previous move ended commanding
-    // 100.000 while the axis actually sits at 99.980 (following error), a
-    // new move seeded from 99.980 steps the commanded position backward
-    // 0.020 mm in one cycle — a step input to the drive. It also destroys
-    // repeatability (the same command sequence produces a different
-    // trajectory depending on measured error) and quietly launders
-    // following error into the plan instead of leaving it visible to the
-    // drive's own following-error detection, which is the mechanism
-    // designed to catch it.
+    // Seeding from feedback would inject a step into the commanded stream: if
+    // the previous move ended commanding 100.000 while the axis sits at 99.980
+    // (following error), a new move seeded from 99.980 steps the commanded
+    // position back 0.020 mm in one cycle. It would also make the same command
+    // sequence produce different trajectories depending on measured error, and
+    // hide following error from the drive's own detection.
     //
-    // Accepted consequence: if an axis physically can't keep up (jam,
-    // overload), the model runs away from reality and following error
-    // grows until the drive faults. That's correct — that fault is the
-    // designed detector.
+    // If an axis physically can't keep up, the model runs away from reality
+    // and following error grows until the drive faults.
     //
-    // Resynced from feedback at exactly one place: the transition from
-    // non-operational to operational (see the feedback fold in the control
-    // loop). Every path that stops accepting moves — disable, fault —
-    // leaves the axis `Disabled`/`ErrorStop`, and `axis_operational` gates
-    // every move/stop/promotion, so nothing can be commanded again without
-    // crossing that transition first. Homing, when it exists, will be the
-    // second resync point.
+    // Commanded state is resynced from feedback at one place: the transition
+    // from non-operational to operational (see the feedback fold in the
+    // control loop). Disable and fault both leave the axis
+    // `Disabled`/`ErrorStop`, and `axis_operational` gates every
+    // move/stop/promotion, so nothing can be commanded again without crossing
+    // that transition.
     commanded_position: f64,
     commanded_velocity: f64,
     active: Option<ActiveMove>,
     // FIFO queue of buffered moves waiting for the current one (and each
-    // other) to finish, in order. An `aborting` move bypasses this
-    // entirely — see `BufferMode` and `abort_into`.
+    // other) to finish. An `aborting` move bypasses it; see `BufferMode` and
+    // `abort_into`.
     pending: VecDeque<PendingMove>,
     last_status_print: Instant,
     last_phase: Option<MotionPhase>,
-    // What the user last asked for via `enable`/`disable` — sent to the
-    // backend every cycle as `AxisSetpoint::enabled` (see axis-backend's
-    // docs on why that's a cyclic field, not a one-off command).
+    // What the user last asked for via `enable`/`disable`, sent to the backend
+    // every cycle as `AxisSetpoint::enabled`.
     want_enabled: bool,
-    // This axis's coarser status, updated from feedback
-    // every cycle. Every business-logic gate in this loop
-    // (`move`/`stop`/queue-promotion rejection, `enable`/`disable`'s
-    // "already ..." checks, fault recovery) checks *this*, not
-    // `ds402_state` below — keeps `app` backend-agnostic, the same view a
-    // `backend-ethercat` swap-in would still report even with different
-    // internal DS402 timing/quirks than `backend-sim`'s.
+    // This axis's coarser status, updated from feedback every cycle. Every
+    // business-logic gate in this loop (`move`/`stop`/queue-promotion
+    // rejection, `enable`/`disable`'s "already ..." checks, fault recovery)
+    // checks this, not `ds402_state`, so `app` depends only on the `AxisState`
+    // the backend reports.
     axis_state: AxisState,
-    // The backend-confirmed DS402 state, updated from feedback each cycle
-    // — kept *only* to detect and print transitions for traceability (the
-    // "     axisN: State -> State" lines below, and `status`'s trailing
-    // `[Ds402State]`). Deliberately not read by any decision in this loop;
-    // see `axis_state` above for why.
+    // The backend-confirmed DS402 state, updated from feedback each cycle.
+    // Used only to detect and print transitions (the "axisN: State -> State"
+    // lines, and `status`'s trailing `[Ds402State]`). No decision reads it.
     ds402_state: Ds402State,
-    // A one-shot pulse: set true when `reset` is issued, sent as
-    // `AxisSetpoint::fault_reset` for exactly one cycle, then cleared —
-    // mirrors DS402's edge-triggered "Fault Reset" controlword bit, which
-    // isn't a held/level state like `enabled`.
+    // A one-shot pulse: set when `reset` is issued, sent as
+    // `AxisSetpoint::fault_reset` for exactly one cycle, then cleared, like
+    // DS402's edge-triggered "Fault Reset" controlword bit.
     pending_fault_reset: bool,
 }
 
@@ -2011,35 +1807,30 @@ impl AxisRuntime {
 fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
     let dt = Duration::from_secs_f64(1.0 / CONTROL_RATE_HZ);
     let mut axes: Vec<AxisRuntime> = (0..NUM_AXES).map(|_| AxisRuntime::new()).collect();
-    // One FIFO queue per hard-coded group (see `PendingGroupMove`'s docs
-    // for why this can't just live inside `AxisRuntime`).
+    // One FIFO queue per group (see `PendingGroupMove`).
     let mut group_pending: Vec<VecDeque<PendingGroupMove>> =
         (0..AXIS_GROUPS.len()).map(|_| VecDeque::new()).collect();
     // Live limits, seeded from the compile-time tables and editable via
     // `setlimits`.
     let mut runtime_limits = RuntimeLimits::new();
-    // Recording is a passive tap at the AxisGroup seam (see recording.rs) —
-    // everything below this line is unchanged from before viz existed.
+    // Recording is a passive tap at the AxisGroup seam (see recording.rs).
     let mut backend =
         RecordingAxisGroup::new(SimAxisGroup::new(NUM_AXES, dt.as_secs_f64()), history);
 
-    // Fixed schedule anchored to a single start instant, so ticks don't
-    // drift from accumulated sleep-call overhead.
+    // Fixed schedule anchored to a single start instant, so ticks don't drift
+    // from accumulated sleep overhead.
     let schedule_start = Instant::now();
     let mut cycle: u64 = 0;
 
-    // Gates only the periodic per-cycle position/phase heartbeat (see
-    // step 4 below) — every other message (move started/finished/aborted,
-    // enable/disable, faults, DS402 transitions) always prints regardless.
+    // Gates only the periodic position/phase heartbeat (see step 4 below).
+    // Every other message always prints.
     let mut verbose = false;
 
     loop {
-        // 1. If idle and moves are queued, start the next one now. A
-        //    rejected candidate (bad kinematic params) is dropped and the
-        //    next queued item is tried in the same cycle, rather than
-        //    retrying the same bad one forever; an axis that's no longer
-        //    enabled drops the whole queue at once with one message,
-        //    instead of one drop-message per item per cycle.
+        // 1. If idle and moves are queued, start the next one now. A rejected
+        //    candidate (bad kinematic params) is dropped and the next queued
+        //    item is tried in the same cycle. An axis that's no longer enabled
+        //    drops the whole queue at once with one message.
         for (i, ax) in axes.iter_mut().enumerate() {
             if ax.active.is_some() || ax.pending.is_empty() {
                 continue;
@@ -2084,10 +1875,10 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             }
         }
 
-        // 1b. Same promotion, one level up: if a *group* is idle — every
-        //     member simultaneously, not just one axis — and has a queued
-        //     move, start it now via install_group_move (atomic across the
-        //     whole group, unlike the per-axis loop above).
+        // 1b. The same promotion for groups: if every member of a group is
+        //     idle and the group has a queued move, start it via
+        //     install_group_move or install_path_move, which are atomic across
+        //     the whole group.
         for (g, group) in AXIS_GROUPS.iter().enumerate() {
             if group_pending[g].is_empty() {
                 continue;
@@ -2112,9 +1903,6 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                 continue;
             }
             while let Some(p) = group_pending[g].pop_front() {
-                // Both install_* return different error types (LinearMoveError
-                // vs PathProfileError) — .to_string() unifies them, since the
-                // caller only ever needs to print whichever it got.
                 let result = match p {
                     PendingGroupMove::Move { targets, limits } => {
                         install_group_move(&mut axes, g, members, targets, &limits)
@@ -2138,35 +1926,25 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
         }
 
         // 1c. Kinematics, once per active group: sample the group's shared
-        //     *Cartesian* profile and convert it into joint position and
-        //     velocity for its members. Done here, ahead of the per-axis
-        //     setpoint pass, for two reasons — the conversion is per group,
-        //     not per axis (an arm's joint 1 setpoint depends on the whole
-        //     Cartesian point, not on one coordinate of it), and every
-        //     member is then sampled at exactly the same instant rather than
-        //     each at its own `elapsed()`.
+        //     *Cartesian* profile and convert it into joint position,
+        //     velocity and acceleration for its members. This happens ahead of
+        //     the per-axis setpoint pass because the conversion is per group (an
+        //     arm's joint 1 setpoint depends on the whole Cartesian point), and
+        //     so every member is sampled at the same instant.
         //
-        //     Under `IdentityKinematics` this is a pass-through, so a
-        //     Cartesian group's setpoints are unchanged.
+        //     Under `IdentityKinematics` this is a pass-through.
         //
-        //     The branch comes from the move — resolved once at install,
-        //     never re-resolved here. See `SharedGroupMove::branch`.
+        //     The branch comes from the move, resolved once at install. See
+        //     `SharedGroupMove::branch`.
         let mut group_joint: Vec<Option<GroupJointSample>> = vec![None; AXIS_GROUPS.len()];
-        // A failed conversion can't cascade from inside this pass (that
-        // needs `&mut` across the whole slice while this loop is reading
-        // it), so failures are collected here and applied in 1d — the same
-        // collect-then-apply shape the feedback fold below uses.
-        //
-        // 1d, not after the setpoint pass: the ramps it builds start from
-        // each member's `commanded_velocity`, and the setpoint pass is what
-        // overwrites that. See 1d for why the ordering matters.
+        // A failed conversion can't cascade from inside this pass (the cascade
+        // needs `&mut` across the whole slice while this loop reads it), so
+        // failures are collected here and applied in 1d.
         let mut ik_failures: Vec<(ActiveGroupMove, String)> = Vec::new();
         for (g, group) in AXIS_GROUPS.iter().enumerate() {
-            // Any member driving this group's move is a valid
-            // representative — they share one profile and one start
-            // instant, and only one shared move per group can be live at a
-            // time (installing a new one replaces every member; a cascade
-            // clears every member that's left).
+            // Any member driving this group's move is a valid representative:
+            // they share one profile and one start instant, and only one
+            // shared move per group can be live at a time.
             let Some(shared) = group
                 .axes
                 .iter()
@@ -2185,10 +1963,9 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             let (cartesian_position, cartesian_velocity, cartesian_acceleration, branch) =
                 shared.sample(elapsed);
 
-            // Position, then velocity, then acceleration — each needs the
-            // one before it. Joint acceleration additionally needs the
-            // joint *velocity* (the `J̇·q̇` term), which is why it can't be
-            // a second independent conversion of the Cartesian sample.
+            // Position, then velocity, then acceleration; each needs the one
+            // before it. Joint acceleration needs the joint velocity (the
+            // `J̇·q̇` term).
             let model = group.kinematics;
             let converted =
                 model
@@ -2205,29 +1982,25 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     });
             match converted {
                 Ok(pair) => group_joint[g] = Some(pair),
-                // Holding position next to a singularity is exactly what
-                // doesn't recover — zero velocity there stays there. Every
-                // member ramps down independently in joint space instead,
-                // which is singularity-free by construction.
+                // Holding position next to a singularity doesn't recover:
+                // zero velocity there stays there. Every member ramps down
+                // independently in joint space instead, which has no
+                // singularities.
                 Err(e) => ik_failures.push((shared, format!("kinematics failed: {e}"))),
             }
         }
 
-        // 1d. Apply any kinematic failure from 1c, *before* this cycle's
-        //     setpoints are built. Ordering matters and is not arbitrary:
-        //     each member's `StopRamp` starts from its `commanded_velocity`,
-        //     and the setpoint pass below is what overwrites that. Cascade
-        //     after it and every ramp starts from the zero velocity the
-        //     failing cycle just wrote — an instantaneous stop, which is the
-        //     step discontinuity the whole model-chain rule exists to
-        //     prevent, delivered at the worst possible moment. Cascading
-        //     first, the ramps are installed with `started_at` = now, and
-        //     the setpoint pass samples them at t ~= 0, which is exactly the
-        //     velocity the group was already commanding.
+        // 1d. Apply any kinematic failure from 1c *before* this cycle's
+        //     setpoints are built. Each member's `StopRamp` starts from its
+        //     `commanded_velocity`, which the setpoint pass below overwrites.
+        //     Cascading after it would build every ramp from the zero velocity
+        //     the failing cycle just wrote, an instantaneous stop. Cascading
+        //     first installs the ramps with `started_at` = now, and the
+        //     setpoint pass samples them at t ~= 0, the velocity the group was
+        //     already commanding.
         //
-        //     `except: None` — nothing is to blame in particular, so every
-        //     member ramps down. Double-firing is already guarded by
-        //     `still_drives`.
+        //     `except: None` because no axis is to blame, so every member
+        //     ramps down.
         for (shared, reason) in ik_failures {
             println!("  ! {}: {reason}", group_label(shared.group()));
             cascade_group_stop(
@@ -2239,30 +2012,25 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             );
         }
 
-        // 2. Build this cycle's commanded setpoint for every axis: sample
-        //    the active trajectory if there is one, otherwise hold at the
-        //    axis's last *commanded* position with zero velocity.
-        //
-        //    Holding at commanded rather than actual is what keeps the
-        //    commanded stream continuous across the gap between moves — an
-        //    idle axis must keep asking for the same place it last asked
-        //    for, not drift onto wherever the servo settled. Each setpoint
-        //    is written back to `commanded_position`/`commanded_velocity`
-        //    here, which is the single point where the model chain
-        //    advances; see `AxisRuntime::commanded_position`.
+        // 2. Build this cycle's commanded setpoint for every axis: sample the
+        //    active trajectory if there is one, otherwise hold at the axis's
+        //    last *commanded* position with zero velocity. Holding at the
+        //    commanded position keeps the commanded stream continuous between
+        //    moves. Each setpoint is written back to
+        //    `commanded_position`/`commanded_velocity`, the one place the
+        //    commanded state advances; see `AxisRuntime::commanded_position`.
         let setpoints: Vec<AxisSetpoint> = axes
             .iter_mut()
             .map(|ax| {
-                // Consume the one-shot reset pulse right here — it's sent
-                // in this cycle's setpoint and must not repeat next cycle.
+                // Consume the one-shot reset pulse: it is sent in this cycle's
+                // setpoint and must not repeat.
                 let fault_reset = std::mem::take(&mut ax.pending_fault_reset);
                 let setpoint = match &ax.active {
-                    // A group/path member takes its component from the
-                    // joint vector computed once for the whole group in
-                    // step 1c, rather than sampling the shared Cartesian
-                    // profile itself — that sample is task-space, and only
-                    // under identity kinematics is component `index` of it
-                    // also this axis's setpoint.
+                    // A group/path member takes its component from the joint
+                    // vector computed once for the whole group in step 1c. The
+                    // shared profile's own sample is task-space, and only
+                    // under identity kinematics is its component `index` also
+                    // this axis's setpoint.
                     Some(mv) => match mv.profile.group_and_index() {
                         Some((g, index)) => match &group_joint[g] {
                             Some((position, velocity, acceleration)) => AxisSetpoint {
@@ -2273,14 +2041,11 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                                 fault_reset,
                                 stopping: mv.profile.is_stop(),
                             },
-                            // Kinematics failed for this group and the
-                            // cascade in 1d couldn't even build this axis a
-                            // stop ramp (so it's still pointed at the dead
-                            // group move). Command what an idle axis
-                            // commands: hold at commanded
-                            // position, zero velocity. (Holding at
-                            // *feedback* would inject a step discontinuity
-                            // at the worst possible moment.)
+                            // Kinematics failed for this group and the cascade
+                            // in 1d couldn't build this axis a stop ramp, so
+                            // it still points at the dead group move. Hold
+                            // at the commanded position with zero velocity,
+                            // as an idle axis does.
                             None => AxisSetpoint {
                                 position: ax.commanded_position,
                                 velocity: 0.0,
@@ -2318,24 +2083,20 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             })
             .collect();
 
-        // 3. One combined cyclic exchange with the backend (sim today, real
-        //    drives later — see axis-backend). setpoints.len() always equals
-        //    NUM_AXES by construction above, so a count mismatch here would
-        //    be a bug in this loop, not bad input — hence expect(), not a
-        //    Result the caller has to handle.
+        // 3. One combined cyclic exchange with the backend (see axis-backend).
+        //    setpoints.len() always equals NUM_AXES, so a count mismatch would
+        //    be a bug in this loop, hence `expect`.
         let feedback = backend
             .exchange(&setpoints)
             .expect("setpoints always match backend's axis count");
 
         // 4. Fold feedback into each axis's state: update actual
-        //    position/velocity, report any backend fault, and detect
-        //    move completion / phase changes using the *actual* feedback
-        //    position (which may differ, by a tiny discretization amount,
-        //    from the trajectory's idealized target).
-        // Collected here (not applied until after the loop, since
-        // `axes.iter_mut()` below can't hold a `&mut` into one element
-        // while `cascade_group_stop` also needs to touch others by index)
-        // whenever a group member goes non-operational mid-loop.
+        //    position/velocity, report any backend fault, and detect move
+        //    completion and phase changes. Completion is judged from the
+        //    profile's phase; the feedback position is only reported.
+        // Collected whenever a group member goes non-operational, and applied
+        // after the loop: `cascade_group_stop` needs `&mut` access to other
+        // elements by index while `axes.iter_mut()` holds one.
         let mut group_cascades: Vec<(ActiveGroupMove, usize)> = Vec::new();
 
         for (i, ax) in axes.iter_mut().enumerate() {
@@ -2346,34 +2107,26 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             ax.axis_state = feedback[i].state;
 
             // The one resync point: coming back from non-operational
-            // (`Disabled`/`ErrorStop`) to operational. While the power
-            // stage was off the axis could have moved for reasons the
-            // model knows nothing about — coasting, gravity, a fault
-            // reaction, or a hand — so the commanded chain is stale and
-            // the only truth available is where the axis actually is.
-            // Everywhere else the model leads and feedback is reporting
-            // only; see `AxisRuntime::commanded_position`.
+            // (`Disabled`/`ErrorStop`) to operational. While the power stage
+            // was off the axis could have moved for reasons the model doesn't
+            // know about, so the commanded state is stale and the measured
+            // position is the only truth. See `AxisRuntime::commanded_position`.
             if !was_operational && axis_operational(ax.axis_state) {
                 ax.commanded_position = ax.position;
                 ax.commanded_velocity = ax.velocity;
             }
 
-            // A fault means the last enable request is void — recovery is
-            // an explicit reset, then a fresh enable, not an automatic
-            // re-enable once the fault clears. Checked every cycle (not
-            // just on the transition into ErrorStop) rather than
-            // edge-detected — simpler, and harmless to repeat while the
-            // fault persists.
+            // A fault voids the last enable request: recovery is an explicit
+            // reset, then a fresh enable. Checked every cycle, which is
+            // harmless to repeat while the fault persists.
             if ax.axis_state == AxisState::ErrorStop {
                 ax.want_enabled = false;
             }
 
-            // Surface DS402 transitions as they're confirmed by the
-            // backend — purely for traceability (see `ds402_state`'s
-            // docs on `AxisRuntime`); nothing here feeds a decision. At
-            // 250 Hz a full enable/disable sequence (3 transitions)
-            // finishes in ~12ms, so these prints arrive essentially
-            // back-to-back, not spread over noticeable time.
+            // Print DS402 transitions as the backend confirms them. This is
+            // for traceability only (see `AxisRuntime::ds402_state`). At 250 Hz
+            // a full enable/disable sequence finishes in ~12 ms, so the prints
+            // arrive back-to-back.
             if feedback[i].ds402_state != ax.ds402_state {
                 let was_fault = ax.ds402_state == Ds402State::Fault;
                 println!(
@@ -2402,9 +2155,8 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                 }
             }
 
-            // A move can't continue on an axis that isn't fully enabled —
-            // e.g. the user just disabled it, or a fault just knocked it
-            // out of OperationEnabled.
+            // A move can't continue on an axis that isn't fully enabled, e.g.
+            // after a disable or a fault.
             if !axis_operational(ax.axis_state) {
                 if let Some(mv) = &ax.active {
                     let word = if mv.profile.is_stop() { "stop" } else { "move" };
@@ -2471,8 +2223,7 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
             }
         }
 
-        // Apply any group cascades collected above, now that the borrow
-        // from `axes.iter_mut()` has ended.
+        // Apply the group cascades collected above.
         for (shared, faulted_axis) in group_cascades {
             cascade_group_stop(
                 &mut axes,
@@ -2494,9 +2245,8 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_deceleration,
                     buffer_mode,
                 } => {
-                    // Whatever the command didn't specify comes from the
-                    // *live* limits, so a `setlimits` applies from the very
-                    // next move onward.
+                    // Whatever the command didn't specify comes from the live
+                    // limits, so a `setlimits` applies from the next move on.
                     let limits = RuntimeLimits::resolve(
                         &runtime_limits.axes[axis],
                         (max_speed, max_acceleration, max_deceleration),
@@ -2508,24 +2258,19 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             axis_label(axis)
                         );
                     } else if let Err(e) = check_target_in_limits(axis, target) {
-                        // Checked when the command is accepted, so a
-                        // `buffered` move is rejected at the point the user
-                        // typed it rather than silently sitting in the queue
-                        // until promotion.
+                        // Checked when the command is accepted, so a `buffered`
+                        // move is rejected immediately rather than at
+                        // promotion.
                         println!("  ! {}: move rejected: {e}", axis_label(axis));
                     } else {
                         match buffer_mode {
-                            // Blend is movepath-only and never actually
-                            // produced by move's own parser (see
-                            // parse_buffer_mode_and_limits) — grouped with
-                            // Aborting here purely so this match stays
-                            // exhaustive over BufferMode's 3 variants;
-                            // genuinely unreachable via any real command.
+                            // `move`'s parser never produces Blend (see
+                            // parse_buffer_mode_and_limits); it is grouped
+                            // with Aborting only to keep the match exhaustive.
                             BufferMode::Aborting | BufferMode::Blend => {
                                 // If this axis was part of an active group
-                                // move, redirecting it alone leaves that
-                                // group meaning nothing — cascade the rest
-                                // of it into its own stop, same as a direct
+                                // move, redirecting it alone cascades the rest
+                                // of the group into its own stop, as a direct
                                 // `stop`/fault/disable would.
                                 let previous_group =
                                     ax.active.as_ref().and_then(|mv| group_of(&mv.profile));
@@ -2601,9 +2346,8 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     axis,
                     max_deceleration,
                 } => {
-                    // Same cascade reasoning as an Aborting move above: a
-                    // lone member being stopped directly still needs to
-                    // take the rest of its group down with it.
+                    // As with an Aborting move above, stopping a lone member
+                    // takes the rest of its group down with it.
                     let previous_group = axes[axis]
                         .active
                         .as_ref()
@@ -2647,13 +2391,10 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     group,
                     max_deceleration,
                 } => {
-                    // A stop cancels anything queued too, same as a
-                    // single-axis stop already does.
+                    // A stop cancels anything queued, as a single-axis stop does.
                     group_pending[group].clear();
-                    // Each member gets its own StopRamp from its own actual
-                    // position/velocity, just like a direct single-axis
-                    // stop — no shared "group stop ramp" is needed, a stop
-                    // doesn't need to trace any particular shape.
+                    // Each member gets its own StopRamp from its own commanded
+                    // position/velocity; a stop needs no shared shape.
                     for &axis in AXIS_GROUPS[group].axes {
                         handle_stop(&mut axes[axis], axis, max_deceleration);
                     }
@@ -2666,8 +2407,8 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     max_deceleration,
                     buffer_mode,
                 } => {
-                    // Group limits, not the members' own — a group move is
-                    // a TCP-space command. See `MotionLimits`.
+                    // Group limits, not the members' own: a group move is a
+                    // TCP-space command. See `MotionLimits`.
                     let limits = RuntimeLimits::resolve(
                         &runtime_limits.groups[group],
                         (max_speed, max_acceleration, max_deceleration),
@@ -2693,10 +2434,9 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                         );
                         group_pending[group].push_back(PendingGroupMove::Move { targets, limits });
                     } else {
-                        // Either idle, or Aborting redirecting a busy group
-                        // right now — either way, seizing control clears
-                        // anything this group had queued, same as
-                        // `abort_into` does for a single axis.
+                        // Either idle, or Aborting redirecting a busy group.
+                        // Seizing control clears anything this group had
+                        // queued, as `abort_into` does for a single axis.
                         group_pending[group].clear();
                         match install_group_move(&mut axes, group, members, targets, &limits) {
                             Ok(duration) => {
@@ -2744,12 +2484,9 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                             .push_back(PendingGroupMove::Path { waypoints, limits });
                     } else {
                         // Either idle, or Aborting/Blend redirecting a busy
-                        // group right now (mid-flight, from wherever it
-                        // actually is) — either way, seizing control clears
-                        // anything this group had queued, same as
-                        // MoveGroup. Only the choice of install function
-                        // differs between Aborting and Blend — see
-                        // install_path_move_impl's docs.
+                        // group. Seizing control clears anything this group
+                        // had queued, as in MoveGroup. Aborting and Blend
+                        // differ only in the install function.
                         group_pending[group].clear();
                         let result = if buffer_mode == BufferMode::Blend {
                             install_path_move_blended(&mut axes, group, members, waypoints, &limits)
@@ -2779,8 +2516,8 @@ fn run_control_loop(rx: Receiver<Command>, history: Arc<Mutex<History>>) {
                     );
                 }
                 Command::SetGroupLimits { group, update } => {
-                    // Groups are Cartesian regardless of what carries them,
-                    // so the units label is mm, not the members'.
+                    // Group limits are Cartesian, so the units are mm, not the
+                    // members'.
                     update.apply(&mut runtime_limits.groups[group]);
                     print_limits(
                         group_label(group),
@@ -2820,17 +2557,14 @@ fn print_status(axes: &[AxisRuntime]) {
         match &ax.active {
             Some(mv) => {
                 let elapsed = mv.started_at.elapsed().as_secs_f64();
-                // Position/velocity come from the last backend feedback
-                // (at most one cycle stale), not a fresh sample — matches
-                // what the heartbeat print shows, and what's actually true
-                // for the axis right now, not just what was commanded.
+                // Position/velocity are from the last backend feedback (at
+                // most one cycle stale), as in the heartbeat print.
                 let group_note = match mv.profile.group_membership() {
                     Some(name) => format!("  (group {name})"),
                     None => String::new(),
                 };
-                // `target()` is this axis's own joint-space endpoint — for
-                // a group member that's the stored IK of the Cartesian
-                // target, not one coordinate of it (see `Profile::target`).
+                // `target()` is this axis's own joint-space endpoint (see
+                // `Profile::target`).
                 println!(
                     "  status: {}: pos={:.3} {units}  vel={:.3} {units}/s  {}  (target {:.3} {units})  [{:?}]{group_note}",
                     axis_label(i),
@@ -2853,12 +2587,11 @@ fn print_status(axes: &[AxisRuntime]) {
     }
 
     for (g, group) in AXIS_GROUPS.iter().enumerate() {
-        // A group is "active" when one of its members is currently running
-        // *this* group's shared move (a group move or a path move — any
-        // member works as the representative, since they all share the
-        // same profile/timing) — both `LinearMove` and `PathProfile` expose
-        // the same `phase_at`/`target` shape, so this extracts a common
-        // (phase, target) pair regardless of which one is actually active.
+        // A group is "active" when one of its members is running *this*
+        // group's shared move (a group move or a path move). Any member works
+        // as the representative, since they share one profile. Both profile
+        // types expose `phase_at`/`target`, so this extracts a common
+        // (phase, target) pair.
         let active = group
             .axes
             .iter()
@@ -2888,11 +2621,9 @@ fn print_status(axes: &[AxisRuntime]) {
                 );
             }
             None => {
-                // A group's position is its *TCP* position, so this is the
-                // members' measured joint positions run through forward
-                // kinematics — not the raw joint values, which are what the
-                // per-axis lines above already report. Identical for a
-                // Cartesian group; the whole point for an arm.
+                // A group's position is its *TCP* position: the members'
+                // measured joint positions run through forward kinematics.
+                // The per-axis lines above report the raw joint values.
                 let joints: Vec<f64> = group.axes.iter().map(|&axis| axes[axis].position).collect();
                 let cartesian = motion_core::KinematicVector::from_slice(&joints)
                     .map(|j| group.kinematics.forward_position(j));
@@ -2906,9 +2637,8 @@ fn print_status(axes: &[AxisRuntime]) {
                             coords.join(", ")
                         );
                     }
-                    // Only reachable if feedback itself went non-finite,
-                    // which would be a backend bug — report it rather than
-                    // printing a plausible-looking wrong number.
+                    // Reachable only if feedback went non-finite (a backend
+                    // bug). Report it rather than print a wrong number.
                     Err(e) => println!("  status: {}: position unavailable: {e}", group.name),
                 }
             }
@@ -2916,12 +2646,9 @@ fn print_status(axes: &[AxisRuntime]) {
     }
 }
 
-/// Report a target's limits in its own units — after a `setlimits` changed
-/// some (`changed`), or as a plain query when it named none.
-///
-/// Always prints *all four*, not just the ones that moved: the useful
-/// question after a partial update is what the machine will now do, not
-/// which words were typed.
+/// Report a target's limits in its own units, after a `setlimits` changed some
+/// (`changed`), or as a plain query when it named none. Always prints all four
+/// limits, not just the changed ones.
 fn print_limits(label: &str, limits: &MotionLimits, units: &str, changed: bool) {
     let jerk = match limits.max_jerk {
         Some(j) => format!("{j:.3} {units}/s^3"),
@@ -2957,8 +2684,6 @@ mod tests {
         assert_eq!(parse_axis("axis1"), Ok(1));
     }
 
-    // Phrased against NUM_AXES rather than a literal, so adding axes
-    // doesn't turn this into a false failure the way it just did.
     #[test]
     fn parse_axis_rejects_out_of_range() {
         assert!(parse_axis(&format!("axis{NUM_AXES}")).is_err());
@@ -3021,10 +2746,8 @@ mod tests {
         );
     }
 
-    /// Unspecified limits stay `None` through parsing — the control loop
-    /// fills them from its *live* table, so `setlimits` can change what a
-    /// later bare `move` means. Resolving them here would pin every command
-    /// to the compile-time values.
+    /// Unspecified limits stay `None` through parsing; the control loop fills
+    /// them from its live table.
     #[test]
     fn parse_command_move_leaves_unspecified_limits_open() {
         assert_eq!(
@@ -3065,8 +2788,8 @@ mod tests {
         assert_eq!(limits.max_jerk, Some(500.0));
     }
 
-    /// "Don't touch jerk" and "remove the jerk limit" must not be the same
-    /// command — the two-level Option is what keeps them apart.
+    /// "Don't touch jerk" and "remove the jerk limit" are different commands;
+    /// the two-level Option keeps them apart.
     #[test]
     fn setlimits_distinguishes_unnamed_jerk_from_jerk_none() {
         let mut limits = MotionLimits {
@@ -3301,9 +3024,8 @@ mod tests {
 
     #[test]
     fn parse_command_move_does_not_accept_blend_keyword() {
-        // "blend" isn't a recognized keyword for plain move — it falls
-        // through to being parsed as a numeric kinematic-limit arg, and
-        // fails as "not a number", not as a buffer mode.
+        // "blend" isn't a keyword for plain move; it is parsed as a numeric
+        // limit arg and fails as "not a number".
         assert!(parse_command("move axis0 100 blend").is_err());
     }
 
@@ -3328,8 +3050,7 @@ mod tests {
         assert!(parse_command("movepath axisGroup0 1 5 5 10 20 30 40").is_err());
     }
 
-    // --- parse_waypoint_lines (the file form's line-parsing, no filesystem
-    // touched — see read_waypoints_file for the thin wrapper that does) ---
+    // --- parse_waypoint_lines (the file form's line parsing; no filesystem) ---
 
     #[test]
     fn parse_waypoint_lines_parses_one_waypoint_per_line() {

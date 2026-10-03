@@ -1,12 +1,10 @@
 //! A passive tap on the `AxisGroup` seam, for the viz window.
 //!
 //! [`RecordingAxisGroup`] wraps any backend and forwards `exchange()`
-//! straight through, unchanged — the control loop's behavior is identical
-//! with or without it. The only extra thing it does is copy each cycle's
-//! setpoint/feedback pair into a shared [`History`] buffer, which the viz
-//! window reads from its own thread to plot target vs. actual. This means
-//! viz needs zero changes to the control loop's decision logic: swapping
-//! in this wrapper at backend-construction time is the entire integration.
+//! unchanged, so the control loop behaves identically with or without it. It
+//! also copies each cycle's setpoint/feedback pair into a shared [`History`]
+//! buffer, which the viz window reads from its own thread to plot target vs.
+//! actual.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -15,9 +13,7 @@ use std::time::Instant;
 use axis_backend::{AxisFeedback, AxisGroup, AxisGroupError, AxisSetpoint};
 
 /// One control cycle's exchange for one axis: the setpoint sent and the
-/// feedback read back, verbatim — whatever fields `axis-backend` carries,
-/// this captures all of them, so a future addition to `AxisSetpoint`/
-/// `AxisFeedback` doesn't also need a matching edit here.
+/// feedback read back, verbatim.
 #[derive(Clone, Copy)]
 pub struct Sample {
     pub t: f64,
@@ -26,9 +22,8 @@ pub struct Sample {
 }
 
 /// Bounded per-axis sample history, shared between the control-loop thread
-/// (writer, via [`RecordingAxisGroup`]) and the viz thread (reader). Bounded
-/// so a long-running app doesn't grow this without limit — old samples are
-/// dropped once an axis's buffer is full.
+/// (writer, via [`RecordingAxisGroup`]) and the viz thread (reader). Old
+/// samples are dropped once an axis's buffer is full.
 pub struct History {
     start: Instant,
     capacity: usize,

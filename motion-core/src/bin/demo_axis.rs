@@ -1,15 +1,14 @@
-//! Watch a single-axis trapezoidal move happen, as numbers, at our control-loop
-//! rate. No GUI, no hardware — just the trajectory generator being sampled the
-//! way the real control loop will sample it.
+//! Prints a single-axis trapezoidal move as numbers, sampled at the 250 Hz
+//! control-loop rate. No GUI, no hardware.
 //!
 //! Run from the workspace root with:
 //!
 //!     cargo run -p motion-core --bin demo_axis
 //!
-//! This mimics the cyclic control loop: every cycle we compute the elapsed time
-//! and ask the profile "where should the axis be right now?". At 250 Hz that's
-//! one query every 4 ms. We print a subset of cycles (and always the phase
-//! boundaries) so the trapezoid is visible without flooding the terminal.
+//! Every cycle it computes the elapsed time and asks the profile where the
+//! axis should be, as the control loop does. It prints a subset of cycles (and
+//! always the phase boundaries) so the trapezoid is visible without flooding
+//! the terminal.
 
 use motion_core::{MotionPhase, TrapezoidalProfile};
 
@@ -35,17 +34,24 @@ fn main() {
     println!("  max speed        = {max_speed} mm/s");
     println!("  max acceleration = {max_acceleration} mm/s^2");
     println!("  max deceleration = {max_deceleration} mm/s^2");
-    println!("  control rate     = {rate_hz} Hz  (dt = {:.1} ms)", dt * 1000.0);
-    println!("  total duration   = {:.4} s  ({} cycles)", duration, (duration / dt).ceil() as u64);
+    println!(
+        "  control rate     = {rate_hz} Hz  (dt = {:.1} ms)",
+        dt * 1000.0
+    );
+    println!(
+        "  total duration   = {:.4} s  ({} cycles)",
+        duration,
+        (duration / dt).ceil() as u64
+    );
     println!();
     println!("   cycle      t (s)    pos (mm)   vel (mm/s)   phase");
     println!("  ------  ---------  ----------  -----------  --------");
 
-    // Run a few cycles past the end so you can see it settle at the target.
+    // Run a few cycles past the end to show it settle at the target.
     let total_cycles = (duration / dt).ceil() as u64 + 5;
 
-    // Print roughly every Nth cycle to keep output readable, but always print
-    // the first cycle, the last, and cycles near a phase change.
+    // Print roughly every Nth cycle, plus the first, the last, and every phase
+    // change.
     let print_every = ((total_cycles as f64) / 30.0).ceil().max(1.0) as u64;
 
     let mut prev_phase: Option<MotionPhase> = None;
@@ -54,7 +60,6 @@ fn main() {
         let sample = profile.sample(t);
         let phase = profile.phase_at(t);
 
-        // Always print when the phase changes, so every boundary is visible.
         let phase_changed = prev_phase != Some(phase);
         prev_phase = Some(phase);
 
@@ -74,7 +79,10 @@ fn main() {
     println!("Notice:");
     println!("  - velocity ramps up linearly (accel), flattens (cruise), ramps down (decel)");
     println!("  - position is the smooth integral of that velocity");
-    println!("  - after t = {:.4}s the axis holds exactly at {end} mm, at rest", duration);
+    println!(
+        "  - after t = {:.4}s the axis holds exactly at {end} mm, at rest",
+        duration
+    );
 }
 
 /// Short human-readable label for a phase, for the demo output only.
