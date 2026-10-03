@@ -3,6 +3,8 @@ name = "motion-core"
 version = "0.1.0"
 edition = "2024"
 description = "I/O-free motion planning and trajectory generation core"
+license = "MIT"
+publish = false
 
 # Dependency-free and I/O-free: only pure math.
 [dependencies]
